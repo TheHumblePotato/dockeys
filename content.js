@@ -1,4 +1,4 @@
-// Google Docs has // G// Google Docs has // Google Docs has moved from using editable HTML elements (textbox with contenteditable=true)
+// Google Docs has /// Google Docs has moved from using editable HTML elements (textbox with contenteditable=true)
 // to custom implementation with its own editing surface since 2015. (https://drive.googleblog.com/2010/05/whats-different-about-new-google-docs.html)
 // This means that each keystroke is captured and then fed into layout engine which 
 // then draws the text, cursor, selection, headings etc on seperate iframe.
@@ -140,8 +140,62 @@ modeIndicator.style.fontWeight = '500'
 modeIndicator.style.zIndex = '9999'
 document.body.appendChild(modeIndicator)
 
+// --- Best-effort per-mode cursor shape --------------------------------------
+// DocsKeys cannot read the document's text (see MISSING_VIM_FEATURES.md /
+// README "Why can't you read the line?"), and for the same underlying reason
+// -- Google Docs draws everything itself instead of using standard editable
+// DOM/CSS primitives -- there is no guaranteed, documented way to reshape its
+// native caret into a Vim-style block/underline. What follows is a *purely
+// additive, best-effort* attempt: we set a data attribute on <html> for the
+// current mode and ship CSS rules that try to restyle Google Docs' known
+// "kix" caret classes (kix-cursor, kix-cursor-caret) when they exist.
+//
+// This is deliberately implemented as CSS, not JS DOM manipulation of
+// unknown elements: an unmatched CSS selector is a silent no-op, never a
+// runtime error, so if Google renames these classes tomorrow this feature
+// just quietly stops doing anything instead of breaking the extension. The
+// floating mode badge (bottom-right) is kept as-is and remains the
+// guaranteed-to-work mode indicator; treat the caret restyling as a bonus.
+const cursorStyleEl = document.createElement('style')
+cursorStyleEl.id = 'docskeys-cursor-style'
+cursorStyleEl.textContent = `
+html[data-docskeys-mode="normal"] .kix-cursor,
+html[data-docskeys-mode="normal"] .kix-cursor-caret {
+    width: 0.6em !important;
+    opacity: 0.55 !important;
+    background-color: #1a73e8 !important;
+}
+html[data-docskeys-mode="visual"] .kix-cursor,
+html[data-docskeys-mode="visual"] .kix-cursor-caret,
+html[data-docskeys-mode="visualLine"] .kix-cursor,
+html[data-docskeys-mode="visualLine"] .kix-cursor-caret {
+    width: 0.6em !important;
+    opacity: 0.55 !important;
+    background-color: #fbbc04 !important;
+}
+html[data-docskeys-mode="replaceChar"] .kix-cursor,
+html[data-docskeys-mode="replaceChar"] .kix-cursor-caret,
+html[data-docskeys-mode="waitForFirstInput"] .kix-cursor,
+html[data-docskeys-mode="waitForFirstInput"] .kix-cursor-caret,
+html[data-docskeys-mode="waitForSecondInput"] .kix-cursor,
+html[data-docskeys-mode="waitForSecondInput"] .kix-cursor-caret,
+html[data-docskeys-mode="waitForRegister"] .kix-cursor,
+html[data-docskeys-mode="waitForRegister"] .kix-cursor-caret {
+    width: 0.6em !important;
+    opacity: 0.55 !important;
+    background-color: #ea4335 !important;
+}
+html[data-docskeys-mode="insert"] .kix-cursor,
+html[data-docskeys-mode="insert"] .kix-cursor-caret {
+    width: 2px !important;
+    opacity: 1 !important;
+}
+`
+document.head.appendChild(cursorStyleEl)
+
 function updateModeIndicator(currentMode) {
     modeIndicator.textContent = currentMode.toUpperCase()
+    document.documentElement.setAttribute('data-docskeys-mode', currentMode)
     switch(currentMode) {
         case 'normal':
             modeIndicator.style.backgroundColor = '#1a73e8'
@@ -159,6 +213,7 @@ function updateModeIndicator(currentMode) {
         case 'waitForFirstInput':
         case 'waitForSecondInput':
         case 'waitForVisualInput':
+        case 'waitForRegister':
         case 'replaceChar':
             modeIndicator.style.backgroundColor = '#ea4335'
             modeIndicator.style.color = 'white'
@@ -221,8 +276,123 @@ function switchModeToReplaceChar() {
     updateModeIndicator(mode)
 }
 
+// Enters the mode that waits for exactly one more keystroke naming a
+// register -- the character after `"`, e.g. the "a" in `"ayy`. See the
+// Registers section below.
+let waitForRegisterReturnMode = "normal"
+function switchModeToWaitForRegister() {
+    waitForRegisterReturnMode = mode
+    mode = "waitForRegister"
+    updateModeIndicator(mode)
+}
+
 let longStringOp = ""
 let operatorCount = 0 // pending count typed between an operator (c/d/y) and its motion, e.g. the "2" in "c2w"
+
+// --- Dot-repeat (`.`) -------------------------------------------------------
+// Real Vim's `.` replays the last *change*. For everything DocsKeys builds
+// out of plain cursor-movement + Edit-menu clicks (dw, d$, dd, D, x, J, p,
+// ...) that's just "call the same JS function again", so we record a
+// zero-arg closure for the last dot-repeatable command and replay it here.
+//
+// This intentionally does NOT cover insert-mode text (ciw, o, A, s, and c-
+// family operators only repeat their *deletion*, not what you typed
+// afterward) -- see MISSING_VIM_FEATURES.md for why: inserted characters are
+// real, trusted keystrokes DocsKeys never intercepts or records, so there is
+// nothing to replay. After a repeated change-operator you'll land in insert
+// mode and need to type the replacement text again, same as if you'd typed
+// the operator+motion yourself.
+//
+// Per real Vim semantics, yank (`y`, `Y`) is NOT a change and does not get
+// recorded here, and visual-mode operations are excluded entirely (visual
+// dot-repeat is approximate even in real Vim, and doubly so without the
+// ability to read text to judge selection sizes at the new cursor position).
+let lastChange = null
+
+function recordChange(fn) {
+    lastChange = fn
+}
+
+// Runs a (possibly operator-driven) change function and records it for `.`
+// unless op is "y" (yank never gets recorded, matching real Vim).
+function runDotRepeatable(fn, op) {
+    fn()
+    if (op !== "y") recordChange(fn)
+}
+
+// --- Registers ---------------------------------------------------------
+// DocsKeys cannot read the document's text (see MISSING_VIM_FEATURES.md /
+// README "Why can't you read the line?"), so the *only* way it ever gets
+// yanked/deleted text into JS-land at all is by asking Google Docs to put it
+// on the real OS clipboard (via its own Edit > Copy/Cut menu item) and then
+// reading that clipboard back with the async Clipboard API. That read is
+// inherently racy -- Docs performs the clipboard write asynchronously, off
+// the back of a simulated menu click, and there's no event we can await, so
+// we just wait a beat and hope -- and it depends on Clipboard API
+// permissions/behavior we can't fully verify without testing against a
+// live, focused Google Docs tab.
+//
+// Every clipboard-API call here is therefore wrapped in try/catch and
+// treated as *purely additive*: if it fails, the named register just
+// doesn't get populated/restored, and DocsKeys falls back to exactly its
+// old behavior (one implicit register, backed directly by the OS clipboard
+// via the Edit menu, which is what plain `y`/`d`/`c`/`p` without a `"reg`
+// prefix always use). Nothing about the pre-existing y/d/c/p behavior is
+// allowed to depend on the Clipboard API succeeding.
+let registers = {}
+let pendingRegister = null // register name captured via `"` prefix; applies to the NEXT y/d/c/p only
+const REGISTER_READ_DELAY_MS = 80 // heuristic; Docs' clipboard write from a simulated menu click isn't synchronous
+
+function waitForRegisterInput(key) {
+    if (/^[a-z0-9]$/i.test(key)) {
+        pendingRegister = key.toLowerCase()
+    }
+    // Any other key (Esc, punctuation, ...): silently cancel, matching Vim's
+    // behavior of treating an invalid register name as a no-op.
+    mode = waitForRegisterReturnMode
+    updateModeIndicator(mode)
+}
+
+async function captureClipboardIntoRegister(name) {
+    if (!name) return
+    try {
+        await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
+        const text = await navigator.clipboard.readText()
+        registers[name] = text
+    } catch (err) {
+        console.warn(`DocsKeys: couldn't read clipboard into register "${name}" (best-effort feature; the default clipboard-backed register is unaffected)`, err)
+    }
+}
+
+async function pasteRegister(name) {
+    if (!name) {
+        clickMenu(menuItems.paste)
+        return
+    }
+    const text = registers[name]
+    if (text === undefined) {
+        console.warn(`DocsKeys: register "${name}" is empty, nothing pasted`)
+        return
+    }
+    let previousClipboard = null
+    try {
+        previousClipboard = await navigator.clipboard.readText()
+    } catch (err) {
+        // We just won't be able to restore the clipboard afterward; the
+        // paste itself can still proceed below.
+    }
+    try {
+        await navigator.clipboard.writeText(text)
+        clickMenu(menuItems.paste)
+        if (previousClipboard !== null) {
+            await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
+            await navigator.clipboard.writeText(previousClipboard)
+        }
+    } catch (err) {
+        console.warn(`DocsKeys: couldn't paste from register "${name}", falling back to a normal paste`, err)
+        clickMenu(menuItems.paste)
+    }
+}
 
 
 function goToStartOfLine() {
@@ -249,12 +419,45 @@ function selectToEndOfWord() {
     sendKeyEvent("right", wordMods(true))
 }
 
+// NOTE: despite the name, this is Google Docs' Ctrl+Right (Alt+Right on Mac)
+// behavior, which Google's own docs describe as moving "to the next word" --
+// i.e. to the *beginning* of the next word, not the end of the current one.
+// This is exactly right for Vim's `w`, which is why it's used unmodified for
+// that. It is NOT the same as Vim's `e` -- see goToEndOfWordVim below.
 function goToEndOfWord() {
     sendKeyEvent("right", wordMods())
 }
 
 function goToStartOfWord() {
     sendKeyEvent("left", wordMods())
+}
+
+// Real Vim's `e` moves the cursor to the last character of the current (or
+// next, if already at a word's end) word. The only word-motion primitive
+// DocsKeys has is Ctrl+Right, which Google Docs documents as moving to the
+// *beginning* of the next word (confirmed against
+// support.google.com/docs/answer/179738), not to the end of the current
+// word. So to land on the last character of a word we jump to the start of
+// the next word and then step back left twice: once to undo landing on the
+// next word's first character, and once more to land immediately before the
+// last character of the word we actually wanted (DocsKeys' motions
+// consistently position the caret immediately before the "current"
+// character -- compare with how h/l work elsewhere in this file).
+//
+// This assumes a single space between words. Runs of multiple spaces/tabs,
+// or words butting up against punctuation, will land one or more characters
+// short of the true word end, because fixing that in general requires
+// reading line content -- see MISSING_VIM_FEATURES.md.
+function goToEndOfWordVim() {
+    sendKeyEvent("right", wordMods())
+    sendKeyEvent("left")
+    sendKeyEvent("left")
+}
+
+function selectToEndOfWordVim() {
+    sendKeyEvent("right", wordMods(true))
+    sendKeyEvent("left", { shift: true })
+    sendKeyEvent("left", { shift: true })
 }
 
 function goToDocStart(shift = false) {
@@ -303,23 +506,28 @@ function addLineBottom() {
 }
 
 function runLongStringOp(operation = longStringOp) {
+    const reg = pendingRegister
+    pendingRegister = null
     switch (operation) {
         case "c":
             clickMenu(menuItems.cut)
+            captureClipboardIntoRegister(reg)
             switchModeToInsert()
             break
         case "d":
             clickMenu(menuItems.cut)
+            captureClipboardIntoRegister(reg)
             sendKeyEvent('backspace')
             mode = 'normal'
             switchModeToNormal()
             break
         case "y":
             clickMenu(menuItems.copy)
+            captureClipboardIntoRegister(reg)
             switchModeToNormal()
             break
         case "p":
-            clickMenu(menuItems.paste)
+            pasteRegister(reg)
             switchModeToNormal()
             break
         case "v":
@@ -356,6 +564,7 @@ function waitForFirstInput(key) {
     }
     const count = operatorCount || 1
     operatorCount = 0
+    const op = longStringOp // captured now, so a later operator press can't retroactively change what a recorded dot-repeat replays
 
     switch (key) {
         case "i":
@@ -363,39 +572,38 @@ function waitForFirstInput(key) {
             switchModeToWait2()
             break
         case "w":
-            repeatMotion(selectToEndOfWord, count)
-            runLongStringOp()
+            runDotRepeatable(() => { repeatMotion(selectToEndOfWord, count); runLongStringOp(op) }, op)
+            break
+        case "e":
+            runDotRepeatable(() => { repeatMotion(selectToEndOfWordVim, count); runLongStringOp(op) }, op)
             break
         case "p":
-            repeatMotion(selectToEndOfPara, count)
-            runLongStringOp()
+            runDotRepeatable(() => { repeatMotion(selectToEndOfPara, count); runLongStringOp(op) }, op)
             break
         case "^":
         case "_":
         case "0":
-            selectToStartOfLine()
-            runLongStringOp()
+            runDotRepeatable(() => { selectToStartOfLine(); runLongStringOp(op) }, op)
             break
         case "$":
-            selectToEndOfLine()
-            runLongStringOp()
+            runDotRepeatable(() => { selectToEndOfLine(); runLongStringOp(op) }, op)
             break
 					case "G":
-            goToDocEnd(true)
-            runLongStringOp()
+            runDotRepeatable(() => { goToDocEnd(true); runLongStringOp(op) }, op)
             break
         case "g":
-            goToDocStart(true)
-            runLongStringOp()
+            runDotRepeatable(() => { goToDocStart(true); runLongStringOp(op) }, op)
             break
         case longStringOp:
-            goToStartOfLine()
-            selectToEndOfLine()
-            for (let i = 1; i < count; i++) {
-                sendKeyEvent("down", { shift: true })
-                sendKeyEvent("end", { shift: true })
-            }
-            runLongStringOp()
+            runDotRepeatable(() => {
+                goToStartOfLine()
+                selectToEndOfLine()
+                for (let i = 1; i < count; i++) {
+                    sendKeyEvent("down", { shift: true })
+                    sendKeyEvent("end", { shift: true })
+                }
+                runLongStringOp(op)
+            }, op)
             break
         default:
             switchModeToNormal()
@@ -502,6 +710,16 @@ function eventHandler(e) {
             // native input pipeline types the replacement character --
             // exactly like normal insert-mode typing elsewhere in this file,
             // which is why we return instead of calling preventDefault().
+            //
+            // Note this is also why `r` is intentionally NOT dot-repeatable
+            // (see the "Dot-repeat" section above): there is no live,
+            // trusted keystroke available to supply the replacement
+            // character when `.` is pressed later, and re-dispatching the
+            // character as a synthetic event wouldn't actually insert it
+            // (same restriction that keeps insert-mode typing itself from
+            // being replayable). A dot-repeat that silently deleted a
+            // character without actually replacing it would be more
+            // confusing than not having one at all.
             sendKeyEvent('delete')
             switchModeToNormal()
             if (tempnormal) {
@@ -534,6 +752,9 @@ function eventHandler(e) {
                 break
             case "waitForVisualInput":
                 waitForVisualInput(key)
+                break
+            case "waitForRegister":
+                waitForRegisterInput(key)
                 break
             case "multipleMotion":
                 handleMultipleMotion(key)
@@ -573,8 +794,11 @@ function handleKeyEventNormal(key) {
             goToStartOfWord()
             break
         case "e":
-            goToEndOfWord()
-            sendKeyEvent("right")
+            // See goToEndOfWordVim's comment: Google Docs' Ctrl+Right moves
+            // to the *start* of the next word, not the end of the current
+            // one, so `e` needs its own helper rather than reusing
+            // goToEndOfWord() (which is correct for `w`, not `e`).
+            goToEndOfWordVim()
             break
         case "w":
             goToEndOfWord()
@@ -593,22 +817,31 @@ function handleKeyEventNormal(key) {
             break
         case "D":
             // Delete to end of line, equivalent to "d$".
-            selectToEndOfLine()
-            runLongStringOp("d")
+            { const fn = () => { selectToEndOfLine(); runLongStringOp("d") }
+              fn(); recordChange(fn) }
             break
         case "C":
             // Change to end of line, equivalent to "c$".
-            selectToEndOfLine()
-            runLongStringOp("c")
+            { const fn = () => { selectToEndOfLine(); runLongStringOp("c") }
+              fn(); recordChange(fn) }
             break
         case "Y":
-            // Yank the whole line, equivalent to "yy".
+            // Yank the whole line, equivalent to "yy". Not dot-repeatable
+            // (yank is never a "change" in Vim's dot-repeat model).
             goToStartOfLine()
             selectToEndOfLine()
             runLongStringOp("y")
             break
+        case "\"":
+            // Register prefix: the next key names a register (a-z, 0-9) to
+            // use for the following y/d/c/p. See the Registers section above.
+            switchModeToWaitForRegister()
+            break
         case "p":
-            clickMenu(menuItems.paste)
+            { const reg = pendingRegister
+              pendingRegister = null
+              const fn = () => { pasteRegister(reg) }
+              fn(); recordChange(fn) }
             break
         case "a":
             sendKeyEvent("right")
@@ -655,22 +888,32 @@ function handleKeyEventNormal(key) {
             // eventHandler for the actual replacement.
             switchModeToReplaceChar()
             break
+        case ".":
+            // Dot-repeat: replay the last recorded change, if any. See the
+            // "Dot-repeat" section above for exactly what is and isn't
+            // recorded.
+            if (lastChange) lastChange()
+            break
         case "/":
             clickMenu(menuItems.find)
             break
         case "x":
-            sendKeyEvent("delete")
+            { const fn = () => { sendKeyEvent("delete") }
+              fn(); recordChange(fn) }
             break
 				case "s":
-            sendKeyEvent("delete")
-            switchModeToInsert()
+            { const fn = () => { sendKeyEvent("delete"); switchModeToInsert() }
+              fn(); recordChange(fn) }
             break
         case "J":
-            goToEndOfLine()
-            sendKeyEvent("delete")
-            // Real Vim's J leaves a single space at the join point rather
-            // than smashing the two lines together.
-            sendKeyEvent("space")
+            { const fn = () => {
+                goToEndOfLine()
+                sendKeyEvent("delete")
+                // Real Vim's J leaves a single space at the join point rather
+                // than smashing the two lines together.
+                sendKeyEvent("space")
+              }
+              fn(); recordChange(fn) }
             break
         default:
             return;
@@ -711,8 +954,13 @@ function handleKeyEventVisualLine(key) {
         case "l":
             sendKeyEvent("right", { shift: true })
             break
+        case "\"":
+            switchModeToWaitForRegister()
+            break
         case "p":
-            clickMenu(menuItems.paste)
+            { const reg = pendingRegister
+              pendingRegister = null
+              pasteRegister(reg) }
             switchModeToNormal()
             break
         case "}":
@@ -725,6 +973,8 @@ function handleKeyEventVisualLine(key) {
             selectToStartOfWord()
             break
         case "e":
+            selectToEndOfWordVim()
+            break
         case "w":
             selectToEndOfWord()
             break
@@ -745,6 +995,11 @@ function handleKeyEventVisualLine(key) {
         case "c":
         case "d":
         case "y":
+            // Visual-mode changes are intentionally not recorded for
+            // dot-repeat (see the "Dot-repeat" section above) -- selection
+            // size at a new cursor position can't be reliably re-derived
+            // without reading text, so a replay could easily delete/yank the
+            // wrong amount.
             runLongStringOp(key)
             break
         case "i":

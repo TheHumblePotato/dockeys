@@ -1,4 +1,4 @@
-<!DOCTY<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -267,6 +267,14 @@
                 <div class="description">Join line below with a space</div>
             </div>
             <div class="shortcut">
+                <div class="key">.</div>
+                <div class="description">Repeat last change (see below)</div>
+            </div>
+            <div class="shortcut">
+                <div class="key">"{reg}</div>
+                <div class="description">Use register a-z/0-9 for next y/d/c/p</div>
+            </div>
+            <div class="shortcut">
                 <div class="key">/</div>
                 <div class="description">Open Find dialog</div>
             </div>
@@ -279,6 +287,14 @@
                 <div class="description">Delete character and insert</div>
             </div>
         </div>
+        <div class="tip">
+             <div class="tip-title">About . and registers</div>
+             <div class="tip-content">
+                <b>.</b> repeats deletes/changes/paste, but can't retype text you typed during an insert-mode change (e.g. after <span class="key inline">cw</span> you'll need to type the replacement again). Yank and <span class="key inline">r</span> are never repeated by <b>.</b>
+                <br><br>
+                <b>"{reg}</b>, e.g. <span class="key inline">"ayy</span> then <span class="key inline">"ap</span>, uses a named register instead of the clipboard. Plain <span class="key inline">y</span>/<span class="key inline">d</span>/<span class="key inline">c</span>/<span class="key inline">p</span> always still use the clipboard directly. This is the newest, least-tested feature -- see MISSING_VIM_FEATURES.md.
+             </div>
+         </div>
     </div>
 
     <div class="tip">
