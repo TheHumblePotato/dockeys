@@ -134,15 +134,15 @@
                 <div class="description">Left, down, up, right</div>
             </div>
             <div class="shortcut">
-                <div class="key">w</div>
-                <div class="description">Next word</div>
+                <div class="key">w / W</div>
+                <div class="description">Next word (W/E/B currently alias w/e/b, see docs)</div>
             </div>
             <div class="shortcut">
-                <div class="key">b</div>
+                <div class="key">b / B</div>
                 <div class="description">Previous word</div>
             </div>
             <div class="shortcut">
-                <div class="key">e</div>
+                <div class="key">e / E</div>
                 <div class="description">End of word</div>
             </div>
             <div class="shortcut">
@@ -208,7 +208,7 @@
         <div class="shortcuts-grid">
             <div class="shortcut">
                 <div class="key">d + motion</div>
-                <div class="description">Delete </div>
+                <div class="description">Delete (h,l,j,k,w,W,e,E,b,B,{,},p,ip,0,^,_,$,g,G,and itself)</div>
             </div>
             <div class="shortcut">
                 <div class="key">c + motion</div>
@@ -217,6 +217,14 @@
             <div class="shortcut">
                 <div class="key">y + motion</div>
                 <div class="description">Yank/copy </div>
+            </div>
+            <div class="shortcut">
+                <div class="key">dj / dk</div>
+                <div class="description">Delete current line + line below/above (linewise, 2 lines)</div>
+            </div>
+            <div class="shortcut">
+                <div class="key">dl / dh</div>
+                <div class="description">Delete character(s) right/left of cursor</div>
             </div>
             <div class="shortcut">
                 <div class="key">D</div>
@@ -300,7 +308,7 @@
     <div class="tip">
         <div class="tip-title">Quick Tip</div>
         <div class="tip-content">
-            If you use Vimium/Surfing Keys, disable it for Google Docs
+            If you use Vimium/Surfing Keys, disable it for Google Docs. Also note: <span class="key inline">W</span>/<span class="key inline">E</span>/<span class="key inline">B</span> currently behave the same as <span class="key inline">w</span>/<span class="key inline">e</span>/<span class="key inline">b</span> -- see MISSING_VIM_FEATURES.md for why.
         </div>
     </div>
 

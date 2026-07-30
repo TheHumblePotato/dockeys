@@ -36,9 +36,10 @@ simulated click on one of Google Docs' own Edit-menu items (Copy/Cut/Paste/
 Undo/Redo/Find). It never touches document text directly -- it moves the
 cursor and drives the same menu commands you could click yourself. This is
 also why a handful of Vim features (search motions like `f`/`t`, `%`
-bracket-matching, true `iw`/`aw` whitespace handling, and Ex commands like
-`:s`) aren't implemented: they fundamentally require knowing what character
-or word is at a given position, which this architecture can't answer. See
+bracket-matching, true `iw`/`aw` whitespace handling, true word/WORD
+distinction for `w`/`W` etc., and Ex commands like `:s`) aren't implemented:
+they fundamentally require knowing what character or word is at a given
+position, which this architecture can't answer. See
 [MISSING_VIM_FEATURES.md](MISSING_VIM_FEATURES.md) for the full breakdown,
 including which of these are "not practical" vs. just "not done yet."
 
@@ -52,7 +53,14 @@ including which of these are "not practical" vs. just "not done yet."
 - `w` - Move to start of next word
 - `b` - Move to start of previous word
 - `e` - Move to end of current word (or next word's end, if already at one).
-  This is a single-space approximation -- see MISSING_VIM_FEATURES.md.
+  Repeated presses (`ee`/`2e`) correctly keep advancing word-by-word. Still a
+  single-space approximation around multi-space runs or punctuation directly
+  adjacent to a word -- see MISSING_VIM_FEATURES.md.
+- `W`, `E`, `B` - WORD-wise equivalents of `w`/`e`/`b`. **Currently behave
+  identically to their lowercase counterparts**: real Vim's WORD motions
+  ignore punctuation and only stop at whitespace, but telling that apart from
+  Google Docs' own word-jump requires reading line content, which DocsKeys
+  can't do. See MISSING_VIM_FEATURES.md.
 
 ### Numbered Prefixed Motions
 
@@ -60,9 +68,9 @@ including which of these are "not practical" vs. just "not done yet."
 - `{n}j` - Move cursor down n times
 - `{n}k` - Move cursor up n times
 - `{n}l` - Move cursor right n times
-- `{n}w` - Move to start of n words
-- `{n}b` - Move to start of n previous word
-- `{n}e` - Move to end of n word
+- `{n}w` / `{n}W` - Move to start of n words
+- `{n}b` / `{n}B` - Move to start of n previous word
+- `{n}e` / `{n}E` - Move to end of n word
 
 A count also works immediately before an operator, e.g. `3dw` deletes 3
 words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
@@ -94,12 +102,17 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
   command, then automatically return to insert mode)
 
 #### Text Manipulation
-- `d` + motion - Delete (supports `dw`, `de`, `diw`, `dp`, `dip`, `dd`, `d_`,
-  `d0`, `d^`, `d$`, `dg`, `dG`)
-- `c` + motion - Change (supports `cw`, `ce`, `ciw`, `cp`, `cip`, `cc`, `c_`,
-  `c0`, `c^`, `c$`, `cg`, `cG`)
-- `y` + motion - Yank/copy (supports `yw`, `ye`, `yiw`, `yp`, `yip`, `yy`,
-  `y_`, `y0`, `y^`, `y$`, `yg`, `yG`)
+- `d` + motion - Delete. Supports `dw`/`dW`, `de`/`dE`, `db`/`dB`, `dh`, `dl`,
+  `dj`, `dk`, `diw`, `dp`, `dip`, `d{`, `d}`, `dd`, `d_`, `d0`, `d^`, `d$`,
+  `dg`, `dG`.
+  - `dj`/`dk` are **linewise**, matching real Vim exactly: `dj` deletes the
+    current line and the line below (2 lines total), `dk` deletes the
+    current line and the line above (2 lines total), and a count extends
+    this the same way `dd`'s count does (e.g. `d2j` deletes 3 lines).
+  - `dh`/`dl` are charwise: `dl` deletes the character(s) at/after the
+    cursor (same as `x`), `dh` deletes the character(s) before the cursor.
+- `c` + motion - Change (same motion set as `d` above)
+- `y` + motion - Yank/copy (same motion set as `d` above)
 - `D` - Delete to end of line (equivalent to `d$`)
 - `C` - Change to end of line (equivalent to `c$`)
 - `Y` - Yank the whole line (equivalent to `yy`)
@@ -134,8 +147,8 @@ detect without reading line content. See MISSING_VIM_FEATURES.md.
 
 ### Visual Mode Commands
 When in visual mode (`v` or `V`):
-- All movement keys (`h`, `j`, `k`, `l`, `w`, `e`, `b`, `{`, `}`, `g`, `G`,
-  `0`/`^`/`_`, `$`) extend the selection
+- All movement keys (`h`, `j`, `k`, `l`, `w`/`W`, `e`/`E`, `b`/`B`, `{`, `}`,
+  `g`, `G`, `0`/`^`/`_`, `$`) extend the selection
 - `iw`/`aw`, `ip`/`ap` - extend the selection to the current word/paragraph
 - `"{register}` - use a named register for the following `d`/`c`/`y`/`p`
 - `d` - Delete selected text
@@ -149,11 +162,15 @@ Visual-mode changes are not dot-repeatable (see MISSING_VIM_FEATURES.md).
 
 A floating badge in the bottom-right corner always shows the current mode
 (NORMAL, INSERT, VISUAL, etc.) -- this is the reliable indicator. DocsKeys
-also makes a best-effort attempt to restyle Google Docs' own text cursor into
-a block shape for normal/visual/pending-input modes and a thin bar for
-insert mode, via injected CSS. This part is unverified against a live Google
-Docs page and may not visibly do anything depending on Docs' current
-internals -- if it doesn't work for you, the floating badge is unaffected.
+also makes a best-effort attempt to restyle Google Docs' own text cursor:
+a block cursor (sized to `1ch`, i.e. roughly one character's width in the
+surrounding font, rather than a fixed guess) for normal/visual mode, a thin
+bar for insert mode, and a distinct **underscore-shaped** cursor for any
+mode that's waiting on one more keystroke (after `d`/`c`/`y`/`r`/`"`, or the
+`i`/`a` text-object prefix in visual mode). This part is unverified against
+a live Google Docs page and may not visibly do anything depending on Docs'
+current internals -- if it doesn't work for you, the floating badge is
+unaffected.
 
 ## Installation
 
@@ -196,12 +213,11 @@ register) if clipboard access doesn't work in your browser.
 ## Known Limitations
 
 - Most advanced Vim features like marks, macros, search motions (`f`/`t`/
-  `/`), true `iw`/`aw` whitespace handling, and Ex commands (`:s`, `:g`) are
-  not supported, because DocsKeys has no way to read the document's text --
-  it only drives cursor movement and the clipboard. See
-  [MISSING_VIM_FEATURES.md](MISSING_VIM_FEATURES.md) for the full list,
-  sorted by how practical each would be to add, plus a couple of known bugs
-  that were found but not yet fixed.
+  `/`), true `iw`/`aw` whitespace handling, true word/WORD distinction, and
+  Ex commands (`:s`, `:g`) are not supported, because DocsKeys has no way to
+  read the document's text -- it only drives cursor movement and the
+  clipboard. See [MISSING_VIM_FEATURES.md](MISSING_VIM_FEATURES.md) for the
+  full list, sorted by how practical each would be to add.
 - Dot-repeat (`.`) can't replay text you typed during an insert-mode change
   (see above), and named registers depend on the async Clipboard API and
   haven't been tested against a live Google Docs page -- see

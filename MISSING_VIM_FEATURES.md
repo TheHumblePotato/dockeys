@@ -47,86 +47,110 @@ commands entry below for the most extreme version of that same call.
 
 ## Implemented in this pass
 
+- **`e` bug fix (gets stuck on repeat).** `e` previously computed the exact
+  same "next word start via Ctrl+Right" both on a fresh press and on a
+  repeated press, so `ee`/`2e` never advanced past the first word -- visibly
+  wrong, since Vim's own docs state "In Vim `ee` and `2e` are the same."
+  Root cause and fix: Ctrl+Right always jumps to the start of the *next*
+  word regardless of where inside the current word the cursor already sits,
+  so "jump word, then step back 2" recomputes the same target if the cursor
+  was already at an end-of-word position. Fixed by nudging the cursor
+  forward two plain characters *before* the word-jump, which forces the
+  jump to skip past the current word's boundary on a repeated press while
+  leaving a fresh in-word press unaffected. Still a single-space
+  approximation around multi-space runs / punctuation directly touching a
+  word (e.g. hyphens) -- that part needs line content and isn't fixed here.
+- **`d<Esc>` (and any operator-cancel, and every yank) moving the cursor
+  left by one character.** `switchModeToNormal()` unconditionally sent an
+  extra `left` arrow whenever `mode == "waitForFirstInput"`. The only
+  legitimate reason for this appears to have been compensating cursor
+  position for whole-line deletes -- but the `dd`/`d`-operator call site
+  already explicitly sets `mode = 'normal'` *before* calling
+  `switchModeToNormal()`, specifically to dodge this exact branch. That left
+  the branch dead for its one intended case and live for three unintended
+  ones: cancelling an operator with Escape, cancelling with an invalid key,
+  and completing any yank (`yw`, `yy`, `y$`, ...) -- all of which reach
+  `switchModeToNormal()` while `mode` is still `"waitForFirstInput"`. Fixed
+  by removing the branch entirely (the `visualLine` branch is untouched and
+  still needed).
+- **Unconditional extra-Backspace bug on every non-linewise `d`-motion.**
+  Previously flagged here but left unfixed: `runLongStringOp`'s `"d"` case
+  did `Cut` and then an *unconditional* extra `Backspace`. That backspace is
+  only correct for whole-line deletes, where Home-to-End selection
+  deliberately excludes the trailing newline and needs one more Backspace to
+  merge the resulting empty line away. Every other `d`-motion's selection
+  (e.g. `selectToEndOfWord`'s Ctrl+Shift+Right, which already includes the
+  trailing space) doesn't leave anything to merge, so the same unconditional
+  backspace was silently deleting one extra, unrelated character before the
+  target on `dw`, `D`, `diw`, `d$`, and friends. Fixed by adding a
+  `linewise` parameter to `runLongStringOp`, defaulting to `false`, and only
+  passing `true` from the actually-linewise call sites (`dd`/`2dd`-style
+  repeated-operator deletes, and the new `dj`/`dk` below). This also
+  incidentally fixes `D`, which shares this code path and was getting the
+  bogus extra backspace before.
+- **`dh`, `dl`, `dj`, `dk`, `db`/`dB`** (and the `c`/`y` equivalents) as
+  operator-pending motions -- previously, only `w`/`e`/paragraph/line-start/
+  line-end/`g`/`G`/the doubled-operator (`dd`) were recognized after an
+  operator, so e.g. `dl`, despite `l` being a perfectly normal motion, did
+  nothing. `dh`/`dl` are implemented charwise (select `count` characters
+  left/right, then cut/copy/change) matching Vim's `dl` ≡ `x` and `dh` ≡
+  Backspace equivalence. `dj`/`dk` are implemented **linewise**, matching
+  real Vim exactly: `dj` deletes the current line and the line below (2
+  lines total), `dk` deletes the current line and the line above (2 lines
+  total), and a leading count extends this the same way `dd`'s count does
+  (`d2j` deletes 3 lines: current + 2 below).
+- **`d{` / `d}`** added as operator motions, in addition to the pre-existing
+  `p`/`ip` paragraph aliases (kept for backwards compatibility). Implemented
+  the same way as the existing `p`-based paragraph select (charwise, not
+  the special exclusive-to-linewise promotion real Vim applies to `}` when
+  standing on a paragraph's first non-blank -- see the "Known limitations"
+  entry below for why that specific edge case isn't replicated).
+- **`W`, `E`, `B`** (WORD motions) added for normal mode, visual mode, and
+  as operator-pending motions. **These are currently honest aliases of
+  `w`/`e`/`b`.** Real Vim's WORD motions differ from word motions by
+  ignoring punctuation and only treating whitespace as a boundary; telling
+  that apart requires knowing what character is at the boundary, which this
+  architecture cannot do (see "The core constraint" above). Rather than
+  silently shipping W/E/B as identical without saying so, this is called out
+  explicitly here and in the README.
+- **Cursor sizing.** The block cursor's width was previously a flat `0.6em`,
+  which doesn't track the actual character/font size and looked wrong across
+  different font sizes (e.g. headings vs. body text). Switched to `1ch`, a
+  CSS unit defined as the width of the "0" character in the element's own
+  font -- still an approximation (not every character is exactly "0"-width),
+  but one that actually responds to the surrounding font/size instead of
+  being a constant. Still unverified against a live Docs page, same caveat
+  as before.
+- **Underscore cursor for pending-input modes.** Per user preference, all
+  "waiting on one more keystroke" modes (`waitForFirstInput` after `d`/`c`/
+  `y`, `waitForSecondInput` after the `i`/`a` text-object prefix,
+  `replaceChar` after `r`, `waitForRegister` after `"`, `waitForVisualInput`
+  after `i`/`a` in visual mode) now get a distinct underscore-shaped cursor
+  (`transform: scaleY(0.18)` anchored to the bottom) instead of sharing the
+  full block cursor with normal/visual mode. Implemented as a CSS transform
+  on whatever height Docs' own element already has, rather than a hardcoded
+  pixel height, so it doesn't need to know the actual line-height/font-size
+  to look roughly right.
+
+## Implemented in prior passes
+
 - **`D`** -- delete to end of line (`d$`).
 - **`C`** -- change to end of line (`c$`).
 - **`Y`** -- yank the whole line (`yy`).
 - **`r{char}`** -- replace the character under the cursor with one keystroke,
-  without leaving normal mode. `r` previously performed Redo, which is not
-  Vim's binding for `r` (Vim's `r` is character-replace; redo is `Ctrl+r`).
-- **`Ctrl+r`** -- redo, now bound to Vim's actual redo key.
-- **Count-before-operator fix** -- `2dw`, `3cw`, `5yy`, etc. (a count typed
-  *before* the operator) now work.
-- **`J`** -- now inserts a single space at the join point (Vim's default
-  `nojoinspaces` behavior) instead of smashing the two lines together with no
-  separator. It does not strip existing leading whitespace from the line
-  being joined up (see Known limitations below) since that requires reading
-  line content.
-- **`e` bug fix.** `e` was landing one character into the *next* word instead
-  of on the last character of the current word. Root cause: the only
-  word-motion primitive available is Ctrl+Right, and Google's own docs
-  (support.google.com/docs/answer/179738) describe that as moving "to the
-  next word" -- i.e. to the *start* of the next word, not the end of the
-  current one. That's the right behavior for `w` (which is why `w` was never
-  broken), but `e` was implemented as "do that, then move one more character
-  right," which overshoots by a full word-start-plus-one. Fixed by jumping to
-  the start of the next word and stepping back left twice instead. This is a
-  single-space approximation (see Known limitations) since exact behavior
-  around multi-space runs or punctuation needs line content.
-- **`.` (dot-repeat)** for operator+motion commands and simple changes: `dw`,
-  `d$`, `dd`, `de`, `D`, `x`, `s`, `J`, `p` (plain and register-aware), and
-  the change-operator family (`cw`, `cc`, `C`, ...) with the caveat below.
-  Implemented by recording the actual JS closure used to perform the last
-  change and re-invoking it, rather than replaying raw keystrokes.
-  - Consistent with real Vim, yank (`y`, `Y`) is never recorded for dot-repeat
-    -- `.` only repeats changes.
-  - **Still not possible: replaying the *typed text* of an insert-mode
-    change** (`ciw` + typing + `Esc`, or `s`/`o`/`a` + typing). Dot-repeating
-    a change-operator will redo the deletion and drop you into insert mode,
-    same as the original command did, but it will not retype what you typed
-    last time -- there is nothing to replay, because insert-mode keystrokes
-    are real, trusted browser events DocsKeys never intercepts or records.
-    This is visibly different from doing nothing (you land in insert mode
-    and can see you need to type), which is why it's implemented despite the
-    caveat -- unlike `r{char}` below.
-  - `r{char}` is deliberately **not** dot-repeatable, for a related but
-    distinct reason: the replacement character itself can't be replayed
-    (same trusted-keystroke restriction), and unlike a change-operator,
-    dot-repeating `r` wouldn't visibly leave you anywhere to fix it -- it
-    would just silently delete a character without actually replacing it.
-    That's worse than not offering it.
-  - Visual-mode `d`/`c`/`y` are excluded entirely -- see Known limitations.
+  without leaving normal mode.
+- **`Ctrl+r`** -- redo, bound to Vim's actual redo key.
+- **Count-before-operator fix** -- `2dw`, `3cw`, `5yy`, etc.
+- **`J`** -- inserts a single space at the join point (Vim's default
+  `nojoinspaces` behavior). Does not strip existing leading whitespace from
+  the line being joined up (see Known limitations) since that requires
+  reading line content.
+- **`.` (dot-repeat)** for operator+motion commands and simple changes.
+  Consistent with real Vim, yank (`y`, `Y`) is never recorded for dot-repeat.
+  Still not possible: replaying the *typed text* of an insert-mode change.
+  `r{char}` is deliberately not dot-repeatable.
 - **Named/numbered registers**, with the default (unnamed) register still
-  being the plain OS/Docs clipboard exactly as before. `"a` before a
-  `y`/`d`/`c`/`p` command targets register `a` for that one command; `a`-`z`
-  and `0`-`9` are supported. Implemented by asking Docs to put yanked/deleted
-  text on the real clipboard (the only way DocsKeys ever gets text at all),
-  then reading it back into a JS object via `navigator.clipboard.readText()`,
-  and temporarily swapping the OS clipboard for a `writeText()`/paste/
-  restore dance when pasting from a named register. See the caveats below --
-  this is the least-tested feature in this pass.
-  - **Caveats, stated plainly:** this relies on the async Clipboard API,
-    which (a) requires a short, heuristic delay after a simulated Copy/Cut
-    menu click because there's no event to await for "Docs finished writing
-    to the clipboard," and (b) may be subject to permission/focus behavior
-    in Chrome/Firefox that couldn't be verified without live testing in a
-    real, focused Google Docs tab. Every clipboard-API call is wrapped in
-    try/catch and is purely additive: if any of it fails, the named register
-    just silently doesn't populate/restore, and plain `y`/`d`/`c`/`p`
-    (without a `"reg` prefix) keep working exactly as before, since those
-    never depended on this code path succeeding.
-  - Not implemented: append-registers (`"A` to append to `a`), the
-    black-hole register (`"_`), and the numbered-register yank/delete
-    history (`"0`-`"9` auto-population) -- all plausible follow-ups, kept out
-    of this pass to limit the size of an already-hard-to-verify change.
-- **Best-effort per-mode cursor shape.** `<html>` gets a
-  `data-docskeys-mode` attribute, and injected CSS tries to restyle Google
-  Docs' `.kix-cursor`/`.kix-cursor-caret` elements into a block for
-  normal/visual/pending-input modes and a thin bar for insert mode. This is
-  implemented as CSS rather than JS DOM manipulation specifically so that if
-  those class names are wrong or change in a future Docs release, the rules
-  just don't match anything -- a silent no-op, not a runtime error. The
-  floating mode badge (bottom-right) is unaffected and remains the
-  guaranteed indicator either way.
+  being the plain OS/Docs clipboard.
 
 ## Not implemented, sorted by practicality
 
@@ -138,8 +162,8 @@ commands entry below for the most extreme version of that same call.
   can't reliably match Vim's actual whitespace-aware behavior without reading
   the line.
 - **Register append (`"A`) and black-hole register (`"_`).** Natural
-  extensions of the registers work above; deferred to keep this pass's
-  riskiest feature (registers) as small as possible.
+  extensions of the existing registers work; deferred to keep that
+  (already-least-tested) feature's surface area small.
 
 ### Low practicality
 
@@ -158,10 +182,8 @@ commands entry below for the most extreme version of that same call.
   substitute but isn't Vim's incremental search-and-jump.
 - **`%`** (matching bracket/paren) -- needs text content.
 - **Macros** (`q{register}`, `@{register}`) -- theoretically buildable by
-  recording our own function calls (same mechanism as dot-repeat above:
-  works for motions/operators, not for insert-mode typing), but lower value
-  than the items above for the effort involved. Could plausibly reuse the
-  `lastChange`-style recording infrastructure added for `.` in this pass.
+  recording our own function calls (same mechanism as dot-repeat), but lower
+  value than the items above for the effort involved.
 - **Ex commands** (`:s/.../.../`, `:g/pattern/d`, ranges) -- would require
   building an independent text model of the document via DOM-scraping, which
   is a different (and much larger) project than "Vim motions for Docs." See
@@ -174,11 +196,30 @@ commands entry below for the most extreme version of that same call.
 - **Counted text objects** (`d2aw`) -- not worth building on top of an
   already-approximate text-object implementation.
 - **Dot-repeat for visual-mode changes.** Vim's own dot-repeat for visual
-  operations is already a bit approximate (it repeats on "the same size
-  selection" at the new cursor position). Doing that here would additionally
-  require knowing where the selection boundary landed, which needs text
-  content -- so it's excluded rather than shipped as a worse approximation
-  of an already-approximate Vim feature.
+  operations is already a bit approximate; doing that here would
+  additionally require knowing where the selection boundary landed, which
+  needs text content -- excluded rather than shipped as a worse
+  approximation of an already-approximate Vim feature.
+- **True word/WORD distinction for `w`/`W`, `e`/`E`, `b`/`B`.** See "W, E, B"
+  above -- currently honest aliases, since this needs to read text to
+  distinguish punctuation from whitespace boundaries.
+- **`gg` as a true double-`g` prefix.** Real Vim's `gg` (go to top) requires
+  two `g` presses, with a single `g` being a pending prefix for a family of
+  `g`-commands (`ge`, `gE`, `g_`, ...). This project binds a single `g` press
+  directly to "go to document start" as a simplification. Left as-is in this
+  pass: changing it to a genuine two-key prefix is a bigger state-machine
+  change than it looks (needs its own pending-input mode, interacts with
+  operator-pending `dg`/`dgg`, counts like `42gg`, and dot-repeat) and isn't
+  something that can be safely verified without live testing against Docs, so
+  it wasn't touched to avoid trading a known, harmless simplification for an
+  untested behavior change.
+- **`d}`'s exclusive-to-linewise promotion.** Real Vim: if `}` is used with an
+  operator and the cursor started at or before the first non-blank character
+  of a paragraph that begins with blank lines, the motion is promoted from
+  exclusive-charwise to linewise, sweeping up the leading blank lines too.
+  This needs to know whether the cursor is at/before the first non-blank of
+  the current line, which needs line content -- `d{`/`d}` here are plain
+  charwise selects instead.
 
 ## Known limitations / inconsistencies (not bugs per se)
 
@@ -199,20 +240,22 @@ commands entry below for the most extreme version of that same call.
   practice.
 - **`e`'s fix is a single-space approximation.** See "Implemented in this
   pass" above -- multiple spaces/tabs between words, or words directly
-  adjacent to punctuation, can land `e` one or more characters short of the
-  true end of word.
+  adjacent to punctuation, can still land `e` one or more characters short of
+  the true end of word.
+- **`W`/`E`/`B` are aliases of `w`/`e`/`b`,** not true WORD motions. See
+  above.
 - **Registers are the least-tested feature in this codebase.** The
-  Clipboard-API timing/permission caveats above are real; if named registers
+  Clipboard-API timing/permission caveats are real; if named registers
   misbehave in your browser, plain `y`/`d`/`c`/`p` (no `"reg` prefix) are
-  unaffected and behave exactly as before this pass.
+  unaffected and behave exactly as before.
 - **Cursor-shape restyling is unverified against a live Google Docs page.**
   It's pure CSS keyed off class names that were not directly confirmed by
   testing (see "The core constraint" above for why introspecting Docs'
   internals is inherently uncertain); if the classes don't match, you'll
   just see the existing floating mode badge and no shape change, not an
-  error.
+  error. This includes the new `1ch` sizing and underscore transform.
 
-## Known bugs found during this review (flagged, not all fixed)
+## Known bugs found during review (flagged, not all fixed)
 
 - **`tempnormal` (the `Ctrl+o` flag) can go stale.** `Ctrl+o` followed by `v`
   or `V` correctly stays in visual mode instead of snapping back to insert
@@ -223,29 +266,16 @@ commands entry below for the most extreme version of that same call.
   `Ctrl+o` followed by an operator (`d`/`c`/`y`): entering `waitForFirstInput`
   isn't excluded from the tempnormal auto-revert, so `Ctrl+o` then `d` then a
   motion currently reverts to insert mode before the motion is even
-  processed. This was **not fixed in this pass** beyond the narrow case of the
-  new `r{char}` command (which does correctly consume `tempnormal` on
-  completion), because a correct general fix means threading "command actually
-  completed" signals through every multi-keystroke mode
-  (`waitForFirstInput`/`waitForSecondInput`/`waitForVisualInput`/
-  `multipleMotion`/`waitForRegister`), and getting that wrong without the
-  ability to test live against Google Docs risks breaking working `Ctrl+o`
-  behavior rather than fixing it. `waitForRegister` (new in this pass) was
-  written consistently with the existing (buggy) pattern rather than trying
-  to fix it in passing, to avoid touching more of this fragile area than
-  necessary.
-- **`runLongStringOp`'s `"d"` case does `cut` then an unconditional
-  `backspace`.** For whole-line deletes (`dd`, and now `D`/`Y`'s sibling
-  `C`... actually `Y` doesn't hit this path, but `dd`/`D` do) the selection
-  intentionally excludes the trailing newline, so the extra backspace is what
-  actually removes the now-empty line by merging it into the previous line.
-  But this exact same `runLongStringOp("d")` path is shared by **every**
-  `d`-motion (`dw`, `d$`, `diw`, `dip`, `dG`, ...), where cut already leaves
-  the cursor at the start of the (now shorter) selection with no leftover
-  empty line to clean up -- so the same unconditional backspace looks like it
-  would delete one extra character before the deleted text in those cases.
-  This is flagged rather than changed because it's long-standing,
-  load-bearing behavior for `dd`/`D`, and altering the shared function without
-  being able to test live against Google Docs risks trading a
-  hard-to-diagnose bug for an easy-to-diagnose one. Worth a dedicated,
-  testable pass.
+  processed. Not fixed in this pass either, for the same reason as before: a
+  correct general fix means threading "command actually completed" signals
+  through every multi-keystroke mode, and doing that without the ability to
+  test live against Google Docs risks breaking working `Ctrl+o` behavior
+  rather than fixing it. The newly-added `h`/`j`/`k`/`l`/`b`/`B`/`W`/`E`/
+  `{`/`}` operator-pending cases were written consistent with the existing
+  pattern (they complete and return via `runLongStringOp`/`switchModeTo*`
+  same as `w`/`e` did before), so they don't make this particular bug worse,
+  but they don't fix it either.
+- **`runLongStringOp`'s old unconditional `"d"`-case Backspace bug is now
+  fixed** (see "Implemented in this pass" above) rather than just flagged --
+  this entry is kept here as a historical note in case any custom mapping
+  elsewhere still assumes the old (buggy) behavior.

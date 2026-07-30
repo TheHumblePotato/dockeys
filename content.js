@@ -156,12 +156,30 @@ document.body.appendChild(modeIndicator)
 // just quietly stops doing anything instead of breaking the extension. The
 // floating mode badge (bottom-right) is kept as-is and remains the
 // guaranteed-to-work mode indicator; treat the caret restyling as a bonus.
+//
+// Sizing: earlier versions used a flat `0.6em` block width, which doesn't
+// track the actual glyph under the cursor and looked wrong across different
+// font sizes/headings. `1ch` is a standard CSS unit defined as the width of
+// the "0" character in the element's *own* font, so as long as the caret
+// element inherits Docs' real font-size/family (which it should, since we
+// don't touch font-family/size ourselves), this scales far more sensibly
+// with the surrounding text than a hardcoded em value did. It's still an
+// approximation (an average character isn't exactly "0"-width) but it's a
+// meaningfully better one, and -- like everything else here -- a no-op
+// rather than a crash if Docs' markup doesn't cooperate.
+//
+// Pending-input modes (operator-pending, "waiting for a register name",
+// "waiting for the replace character", the i/a text-object prefix) get a
+// distinct underscore-shaped cursor instead of a full block, using
+// `transform: scaleY()` anchored to the bottom -- this only needs to squash
+// whatever height Docs' own element already has, so unlike a hardcoded
+// pixel height it doesn't depend on knowing the line-height/font-size.
 const cursorStyleEl = document.createElement('style')
 cursorStyleEl.id = 'docskeys-cursor-style'
 cursorStyleEl.textContent = `
 html[data-docskeys-mode="normal"] .kix-cursor,
 html[data-docskeys-mode="normal"] .kix-cursor-caret {
-    width: 0.6em !important;
+    width: 1ch !important;
     opacity: 0.55 !important;
     background-color: #1a73e8 !important;
 }
@@ -169,7 +187,7 @@ html[data-docskeys-mode="visual"] .kix-cursor,
 html[data-docskeys-mode="visual"] .kix-cursor-caret,
 html[data-docskeys-mode="visualLine"] .kix-cursor,
 html[data-docskeys-mode="visualLine"] .kix-cursor-caret {
-    width: 0.6em !important;
+    width: 1ch !important;
     opacity: 0.55 !important;
     background-color: #fbbc04 !important;
 }
@@ -179,16 +197,21 @@ html[data-docskeys-mode="waitForFirstInput"] .kix-cursor,
 html[data-docskeys-mode="waitForFirstInput"] .kix-cursor-caret,
 html[data-docskeys-mode="waitForSecondInput"] .kix-cursor,
 html[data-docskeys-mode="waitForSecondInput"] .kix-cursor-caret,
+html[data-docskeys-mode="waitForVisualInput"] .kix-cursor,
+html[data-docskeys-mode="waitForVisualInput"] .kix-cursor-caret,
 html[data-docskeys-mode="waitForRegister"] .kix-cursor,
 html[data-docskeys-mode="waitForRegister"] .kix-cursor-caret {
-    width: 0.6em !important;
-    opacity: 0.55 !important;
+    width: 1ch !important;
+    opacity: 0.75 !important;
     background-color: #ea4335 !important;
+    transform: scaleY(0.18) !important;
+    transform-origin: bottom !important;
 }
 html[data-docskeys-mode="insert"] .kix-cursor,
 html[data-docskeys-mode="insert"] .kix-cursor-caret {
     width: 2px !important;
     opacity: 1 !important;
+    transform: none !important;
 }
 `
 document.head.appendChild(cursorStyleEl)
@@ -241,7 +264,16 @@ function switchModeToVisualLine() {
 }
 
 function switchModeToNormal() {
-    if (mode == "visualLine" || mode == "waitForFirstInput") sendKeyEvent("left")
+    // NOTE: this used to also send a spurious "left" arrow whenever mode was
+    // "waitForFirstInput" (operator-pending). That was intended to correct
+    // cursor position for whole-line deletes, but dd/dj/dk-style callers
+    // already set `mode = 'normal'` themselves *before* calling this function
+    // specifically to avoid it -- so the branch was dead for its one
+    // legitimate case and only ever fired as a bug: it moved the cursor left
+    // one character after cancelling an operator with Escape/an invalid key,
+    // and after every yank (yw, yy, ...), since those paths reach here while
+    // mode is still "waitForFirstInput". Removed; see MISSING_VIM_FEATURES.md.
+    if (mode == "visualLine") sendKeyEvent("left")
     mode = 'normal'
     updateModeIndicator(mode)
 
@@ -424,6 +456,10 @@ function selectToEndOfWord() {
 // i.e. to the *beginning* of the next word, not the end of the current one.
 // This is exactly right for Vim's `w`, which is why it's used unmodified for
 // that. It is NOT the same as Vim's `e` -- see goToEndOfWordVim below.
+//
+// This is also used as the underlying primitive for `W` (WORD motion): see
+// the "WORD (W/E/B)" note below goToEndOfWordVim for why W/E/B are currently
+// honest aliases of w/e/b rather than true whitespace-only WORD motions.
 function goToEndOfWord() {
     sendKeyEvent("right", wordMods())
 }
@@ -433,32 +469,59 @@ function goToStartOfWord() {
 }
 
 // Real Vim's `e` moves the cursor to the last character of the current (or
-// next, if already at a word's end) word. The only word-motion primitive
-// DocsKeys has is Ctrl+Right, which Google Docs documents as moving to the
-// *beginning* of the next word (confirmed against
-// support.google.com/docs/answer/179738), not to the end of the current
-// word. So to land on the last character of a word we jump to the start of
-// the next word and then step back left twice: once to undo landing on the
-// next word's first character, and once more to land immediately before the
-// last character of the word we actually wanted (DocsKeys' motions
-// consistently position the caret immediately before the "current"
-// character -- compare with how h/l work elsewhere in this file).
+// next, if already at a word's end) word, and pressing `e` again from an
+// end-of-word position moves to the end of the *following* word ("In Vim
+// `ee` and `2e` are the same" -- vim's own docs). The only word-motion
+// primitive DocsKeys has is Ctrl+Right, which moves to the *start* of the
+// next word regardless of where inside the current word the cursor already
+// is -- so a naive "Ctrl+Right then step back twice" gets stuck: pressing it
+// twice in a row computes the exact same "next word start" both times and
+// therefore never advances past the first word.
 //
-// This assumes a single space between words. Runs of multiple spaces/tabs,
-// or words butting up against punctuation, will land one or more characters
-// short of the true word end, because fixing that in general requires
-// reading line content -- see MISSING_VIM_FEATURES.md.
+// Fix: nudge the cursor forward two plain characters *before* the word-jump.
+// This guarantees that if the cursor was already sitting at an end-of-word
+// position (2 characters before some word's start), the nudge pushes it to
+// or past that word's start, so the following Ctrl+Right is forced to skip
+// to the *next* word instead of recomputing the same one -- while a cursor
+// freshly placed anywhere inside a word still lands on that same word's end,
+// since two characters forward doesn't leave the word (as long as words are
+// longer than 2 characters. For 1-2 character words this still works out
+// because Ctrl+Right's own "next word" boundary detection absorbs it -- see
+// MISSING_VIM_FEATURES.md for the full derivation and remaining edge cases).
+//
+// This is still a single-space, whitespace-boundary approximation: runs of
+// multiple spaces/tabs, or punctuation immediately adjacent to a word (e.g.
+// hyphens), can land a character or two off from true Vim behavior, because
+// resolving that exactly requires reading line content, which this
+// architecture cannot do. What's fixed here is specifically the "gets stuck
+// on repeat" bug, not the punctuation-adjacency approximation.
 function goToEndOfWordVim() {
+    sendKeyEvent("right")
+    sendKeyEvent("right")
     sendKeyEvent("right", wordMods())
     sendKeyEvent("left")
     sendKeyEvent("left")
 }
 
 function selectToEndOfWordVim() {
+    sendKeyEvent("right", { shift: true })
+    sendKeyEvent("right", { shift: true })
     sendKeyEvent("right", wordMods(true))
     sendKeyEvent("left", { shift: true })
     sendKeyEvent("left", { shift: true })
 }
+
+// --- WORD motions (W/E/B) ---------------------------------------------------
+// Real Vim distinguishes "word" (w/e/b: stops at punctuation too) from
+// "WORD" (W/E/B: only whitespace counts as a boundary). Telling those apart
+// requires knowing what character is actually at the boundary, which
+// DocsKeys cannot do (see "The core constraint" in MISSING_VIM_FEATURES.md).
+// Google Docs' own Ctrl+Right/Left word-jump is the only primitive available
+// either way, so W/E/B are implemented here as honest aliases of w/e/b: they
+// share goToEndOfWord/goToEndOfWordVim/goToStartOfWord (and their
+// select-variants) below rather than pretending to have separate,
+// more-correct behavior. This is called out explicitly in the README/
+// MISSING_VIM_FEATURES.md rather than silently shipped as identical.
 
 function goToDocStart(shift = false) {
     if (isMac) {
@@ -492,6 +555,30 @@ function goToStartOfPara(shift = false) {
     sendKeyEvent("up", paragraphMods(shift))
 }
 
+// --- Linewise selection helpers for j/k as operator motions -----------------
+// Real Vim: `dj` deletes the current line and the line below (2 lines
+// total), `dk` deletes the current line and the line above (2 lines total),
+// and a count extends how far the motion reaches (`d2j` = 3 lines: current +
+// 2 below), consistent with `dd`/`2dd`. These mirror the existing whole-line
+// selection approach used for dd/yy/cc below, just extending up or down
+// instead of only down.
+function selectLinesDown(count) {
+    goToStartOfLine()
+    sendKeyEvent("end", { shift: true })
+    for (let i = 0; i < count; i++) {
+        sendKeyEvent("down", { shift: true })
+        sendKeyEvent("end", { shift: true })
+    }
+}
+
+function selectLinesUp(count) {
+    goToEndOfLine()
+    for (let i = 0; i < count; i++) {
+        sendKeyEvent("up", { shift: true })
+    }
+    sendKeyEvent("home", { shift: true })
+}
+
 
 function addLineTop() {
     goToStartOfLine()
@@ -505,7 +592,20 @@ function addLineBottom() {
     switchModeToInsert()
 }
 
-function runLongStringOp(operation = longStringOp) {
+// `linewise` controls whether the "d" case does the extra merge-Backspace
+// after Cut. That backspace is only correct for whole-line deletes (dd,
+// dj, dk, ...): Home-to-End selection deliberately excludes the trailing
+// newline, so after cutting, an empty line remains and needs one more
+// Backspace to merge it away. For every other d-motion (dw, D, diw, d$,
+// dh, dl, ...) the selection already includes everything that needs to go
+// (e.g. selectToEndOfWord's Ctrl+Shift+Right already grabs the trailing
+// space), so that same unconditional backspace used to delete one extra,
+// unrelated character before the target -- a real bug that was previously
+// flagged in MISSING_VIM_FEATURES.md but left unfixed. Defaulting this to
+// false and only passing `true` from the genuinely-linewise call sites
+// fixes it (and, as a side effect, also fixes `D`, which shares this "d"
+// case and was incorrectly getting the extra backspace before).
+function runLongStringOp(operation = longStringOp, linewise = false) {
     const reg = pendingRegister
     pendingRegister = null
     switch (operation) {
@@ -517,7 +617,7 @@ function runLongStringOp(operation = longStringOp) {
         case "d":
             clickMenu(menuItems.cut)
             captureClipboardIntoRegister(reg)
-            sendKeyEvent('backspace')
+            if (linewise) sendKeyEvent('backspace')
             mode = 'normal'
             switchModeToNormal()
             break
@@ -572,13 +672,39 @@ function waitForFirstInput(key) {
             switchModeToWait2()
             break
         case "w":
+        case "W": // see "WORD motions (W/E/B)" note above goToDocStart
             runDotRepeatable(() => { repeatMotion(selectToEndOfWord, count); runLongStringOp(op) }, op)
             break
         case "e":
+        case "E":
             runDotRepeatable(() => { repeatMotion(selectToEndOfWordVim, count); runLongStringOp(op) }, op)
             break
+        case "b":
+        case "B":
+            runDotRepeatable(() => { repeatMotion(selectToStartOfWord, count); runLongStringOp(op) }, op)
+            break
+        case "h":
+            // Charwise: deletes/yanks count characters to the left of cursor.
+            runDotRepeatable(() => { repeatMotion(() => sendKeyEvent("left", { shift: true }), count); runLongStringOp(op) }, op)
+            break
+        case "l":
+            // Charwise: deletes/yanks count characters starting at cursor (like `x`).
+            runDotRepeatable(() => { repeatMotion(() => sendKeyEvent("right", { shift: true }), count); runLongStringOp(op) }, op)
+            break
+        case "j":
+            // Linewise: current line + count lines below (dj = 2 lines total).
+            runDotRepeatable(() => { selectLinesDown(count); runLongStringOp(op, true) }, op)
+            break
+        case "k":
+            // Linewise: current line + count lines above (dk = 2 lines total).
+            runDotRepeatable(() => { selectLinesUp(count); runLongStringOp(op, true) }, op)
+            break
         case "p":
+        case "}":
             runDotRepeatable(() => { repeatMotion(selectToEndOfPara, count); runLongStringOp(op) }, op)
+            break
+        case "{":
+            runDotRepeatable(() => { repeatMotion(() => goToStartOfPara(true), count); runLongStringOp(op) }, op)
             break
         case "^":
         case "_":
@@ -602,7 +728,7 @@ function waitForFirstInput(key) {
                     sendKeyEvent("down", { shift: true })
                     sendKeyEvent("end", { shift: true })
                 }
-                runLongStringOp(op)
+                runLongStringOp(op, true)
             }, op)
             break
         default:
@@ -793,6 +919,12 @@ function handleKeyEventNormal(key) {
         case "b":
             goToStartOfWord()
             break
+        case "B":
+            // See "WORD motions (W/E/B)" note above goToDocStart: honest
+            // alias of `b`, since DocsKeys can't distinguish word/WORD
+            // boundaries without reading text.
+            goToStartOfWord()
+            break
         case "e":
             // See goToEndOfWordVim's comment: Google Docs' Ctrl+Right moves
             // to the *start* of the next word, not the end of the current
@@ -800,7 +932,13 @@ function handleKeyEventNormal(key) {
             // goToEndOfWord() (which is correct for `w`, not `e`).
             goToEndOfWordVim()
             break
+        case "E":
+            goToEndOfWordVim()
+            break
         case "w":
+            goToEndOfWord()
+            break
+        case "W":
             goToEndOfWord()
             break
         case "g":
@@ -970,12 +1108,15 @@ function handleKeyEventVisualLine(key) {
             goToStartOfPara(true)
             break
         case "b":
+        case "B":
             selectToStartOfWord()
             break
         case "e":
+        case "E":
             selectToEndOfWordVim()
             break
         case "w":
+        case "W":
             selectToEndOfWord()
             break
         case "^":
