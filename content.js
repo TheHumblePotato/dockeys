@@ -42,6 +42,70 @@ const keyCodes = {
     "delete": 46,
 };
 
+// --- Programmer Dvorak support ---------------------------------------------
+// DocsKeys reads e.key, which already reflects whatever OS keyboard layout is
+// active. If that layout is Programmer Dvorak, e.key for the physical h/j/k/l
+// (etc.) keys will report Dvorak's characters, not "h"/"j"/"k"/"l", so none of
+// the switch-case commands below would ever match.
+//
+// To fix this we translate e.key back to the QWERTY letter that lives at that
+// same physical key position before it's used as a command, mirroring the
+// `langmap` trick used for Neovim. The tables below are a direct port of the
+// unshifted/shifted tables in the init.lua langmap config (label = QWERTY key,
+// value = character Programmer Dvorak produces at that physical key).
+//
+// Set DVORAK_MODE to false to disable this and use raw QWERTY-style DocsKeys.
+const DVORAK_MODE = true;
+
+const dvorakUnshifted = {
+    "`": "$", "1": "&", "2": "[", "3": "{", "4": "}",
+    "5": "(", "6": "=", "7": "*", "8": ")", "9": "+",
+    "0": "]", "-": "!", "=": "#",
+    q: ";", w: ",", e: ".", r: "p", t: "y", y: "f", u: "g",
+    i: "c", o: "r", p: "l", "[": "/", "]": "@", "\\": "|",
+    a: "a", s: "o", d: "e", f: "u", g: "i", h: "d", j: "h",
+    k: "t", l: "n", ";": "s", "'": "-",
+    z: "'", x: "q", c: "j", v: "k", b: "x", n: "b", m: "m",
+    ",": "w", ".": "v", "/": "z",
+};
+const dvorakShifted = {
+    "~": "~", "!": "1", "@": "2", "#": "3", "$": "4",
+    "%": "5", "^": "6", "&": "7", "*": "8", "(": "9",
+    ")": "0", "_": "%", "+": "`",
+    Q: ":", W: "<", E: ">", R: "P", T: "Y", Y: "F", U: "G", I: "C", O: "R", P: "L", "{": "?", "}": "^", "|": "\\",
+    A: "A", S: "O", D: "E", F: "U", G: "I", H: "D", J: "H", K: "T", L: "N", ":": "S", "\"": "_",
+    Z: "\"", X: "Q", C: "J", V: "K", B: "X", N: "B", M: "M",
+    "<": "W", ">": "V", "?": "Z",
+};
+
+// Reverse map: character Dvorak actually produces -> QWERTY label DocsKeys expects.
+// Digit-row entries are skipped on purpose so that typing an actual digit (e.g. for
+// DocsKeys' "3dd"-style repeat counts) is never remapped into a punctuation command.
+const dvorakToQwerty = (() => {
+    const isDigitish = (s) => /[0-9]/.test(s);
+    const out = {};
+    for (const tbl of [dvorakUnshifted, dvorakShifted]) {
+        for (const label of Object.keys(tbl)) {
+            const sent = tbl[label];
+            if (sent === label) continue;
+            if (isDigitish(label) || isDigitish(sent)) continue;
+            if (out[sent] !== undefined && out[sent] !== label) {
+                console.warn(`DocsKeys dvorak map: '${sent}' claimed by both '${out[sent]}' and '${label}'`);
+            }
+            out[sent] = label;
+        }
+    }
+    return out;
+})();
+
+// Translates a single key character produced under Programmer Dvorak back into
+// the QWERTY letter that occupies the same physical key. Multi-char key names
+// (e.g. "Escape", "Shift") and untranslated characters pass through unchanged.
+function translateKey(key) {
+    if (!DVORAK_MODE || key.length !== 1) return key;
+    return dvorakToQwerty[key] !== undefined ? dvorakToQwerty[key] : key;
+}
+
 const wordModifierKey = isMac ? 'alt' : 'control'
 const paragraphModifierKey = isMac ? 'alt' : 'control'
 
@@ -357,7 +421,9 @@ function eventHandler(e) {
     ) return
         
     
-    if (e.ctrlKey && mode=='insert' && e.key=='o' ){
+    const key = translateKey(e.key)
+
+    if (e.ctrlKey && mode=='insert' && key=='o' ){
         e.preventDefault()
         e.stopImmediatePropagation()
         switchModeToNormal()
@@ -379,23 +445,23 @@ function eventHandler(e) {
         e.preventDefault()
         switch (mode) {
             case "normal":
-                handleKeyEventNormal(e.key)
+                handleKeyEventNormal(key)
                 break
             case "visual":
             case "visualLine":
-                handleKeyEventVisualLine(e.key)
+                handleKeyEventVisualLine(key)
                 break
             case "waitForFirstInput":
-                waitForFirstInput(e.key)
+                waitForFirstInput(key)
                 break
             case "waitForSecondInput":
-                waitForSecondInput(e.key)
+                waitForSecondInput(key)
                 break
             case "waitForVisualInput":
-                waitForVisualInput(e.key)
+                waitForVisualInput(key)
                 break
             case "multipleMotion":
-                handleMultipleMotion(e.key)
+                handleMultipleMotion(key)
                 break
         }
     }
