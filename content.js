@@ -1,4 +1,4 @@
-// Google Docs has // Google Docs has moved from using editable HTML elements (textbox with contenteditable=true)
+// Google Docs has // G// Google Docs has // Google Docs has moved from using editable HTML elements (textbox with contenteditable=true)
 // to custom implementation with its own editing surface since 2015. (https://drive.googleblog.com/2010/05/whats-different-about-new-google-docs.html)
 // This means that each keystroke is captured and then fed into layout engine which 
 // then draws the text, cursor, selection, headings etc on seperate iframe.
@@ -32,6 +32,7 @@ const isMac = /Mac/.test(navigator.platform || navigator.userAgent);
 const keyCodes = {
     backspace: 8,
     enter: 13,
+    space: 32,
     esc: 27,
     end: 35,
     home: 36,
@@ -158,6 +159,7 @@ function updateModeIndicator(currentMode) {
         case 'waitForFirstInput':
         case 'waitForSecondInput':
         case 'waitForVisualInput':
+        case 'replaceChar':
             modeIndicator.style.backgroundColor = '#ea4335'
             modeIndicator.style.color = 'white'
             break
@@ -210,6 +212,13 @@ function switchModeToWait2() {
     mode = "waitForSecondInput"
     updateModeIndicator(mode)
     // define cursor style
+}
+
+// Enters the mode that waits for exactly one more keystroke -- the
+// replacement character for the "r" command (see handleKeyEventNormal).
+function switchModeToReplaceChar() {
+    mode = "replaceChar"
+    updateModeIndicator(mode)
 }
 
 let longStringOp = ""
@@ -414,17 +423,40 @@ function handleMultipleMotion(key) {
         return
     }
 
-    switch (multipleMotion.mode) {
+    const times = multipleMotion.times || 1
+    const targetMode = multipleMotion.mode
+
+    // A count typed *before* an operator (e.g. "3dw") is equivalent, per Vim
+    // semantics, to giving the same count to the motion that follows the
+    // operator (e.g. "d3w"). Route it through the existing operatorCount
+    // mechanism rather than literally replaying "d" three times, which would
+    // just re-enter waitForFirstInput redundantly and (previously) get its
+    // mode clobbered back to "normal" below before the motion ever arrived.
+    if (targetMode === "normal" && (key === "c" || key === "d" || key === "y")) {
+        operatorCount = times
+        handleKeyEventNormal(key)
+        multipleMotion.times = 0
+        return
+    }
+
+    switch (targetMode) {
         case "normal":
-            repeatMotion(handleKeyEventNormal,multipleMotion.times,key)
+            repeatMotion(handleKeyEventNormal, times, key)
             break
         case "visualLine":
         case "visual":
-            repeatMotion(handleKeyEventVisualLine,multipleMotion.times,key)
+            repeatMotion(handleKeyEventVisualLine, times, key)
             break
     }
 
-    mode = multipleMotion.mode
+    // Only fall back to the mode we started counting from if the repeated
+    // action didn't itself transition to a new mode (e.g. an "i"/"a"/"o"
+    // entering insert mode, or "v" entering visual mode). Unconditionally
+    // resetting here used to clobber those transitions.
+    if (mode === "multipleMotion") {
+        mode = targetMode
+    }
+    multipleMotion.times = 0
 }
 
 
@@ -446,12 +478,41 @@ function eventHandler(e) {
         tempnormal = true
         return;
     }
+    if (e.ctrlKey && mode=='normal' && key=='r') {
+        // Vim's redo is Ctrl+r (bare "r" is reserved for the "replace
+        // character" command, see handleKeyEventNormal).
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        clickMenu(menuItems.redo)
+        return;
+    }
     if (e.altKey || e.ctrlKey || e.metaKey) return;
     if (e.key == 'Escape') {
         e.preventDefault()
         if (mode == 'visualLine' || mode == 'visual') {
             sendKeyEvent("right")
         }
+        switchModeToNormal()
+        return;
+    }
+    if (mode == 'replaceChar') {
+        if (key.length === 1) {
+            // Delete the character under the cursor, then let this real,
+            // trusted keystroke fall through untouched so the browser's
+            // native input pipeline types the replacement character --
+            // exactly like normal insert-mode typing elsewhere in this file,
+            // which is why we return instead of calling preventDefault().
+            sendKeyEvent('delete')
+            switchModeToNormal()
+            if (tempnormal) {
+                tempnormal = false
+                switchModeToInsert()
+            }
+            return;
+        }
+        // Any other key (Tab, arrows, etc.) cancels replace-mode without
+        // making an edit, same as Escape.
+        e.preventDefault()
         switchModeToNormal()
         return;
     }
@@ -530,6 +591,22 @@ function handleKeyEventNormal(key) {
             longStringOp = key
             mode = "waitForFirstInput"
             break
+        case "D":
+            // Delete to end of line, equivalent to "d$".
+            selectToEndOfLine()
+            runLongStringOp("d")
+            break
+        case "C":
+            // Change to end of line, equivalent to "c$".
+            selectToEndOfLine()
+            runLongStringOp("c")
+            break
+        case "Y":
+            // Yank the whole line, equivalent to "yy".
+            goToStartOfLine()
+            selectToEndOfLine()
+            runLongStringOp("y")
+            break
         case "p":
             clickMenu(menuItems.paste)
             break
@@ -572,7 +649,11 @@ function handleKeyEventNormal(key) {
             clickMenu(menuItems.undo)
             break
         case "r":
-            clickMenu(menuItems.redo)
+            // Real Vim's "r" waits for exactly one more keystroke and uses it
+            // to replace the character under the cursor, staying in normal
+            // mode throughout. See the "replaceChar" handling in
+            // eventHandler for the actual replacement.
+            switchModeToReplaceChar()
             break
         case "/":
             clickMenu(menuItems.find)
@@ -587,16 +668,23 @@ function handleKeyEventNormal(key) {
         case "J":
             goToEndOfLine()
             sendKeyEvent("delete")
+            // Real Vim's J leaves a single space at the join point rather
+            // than smashing the two lines together.
+            sendKeyEvent("space")
             break
         default:
             return;
     }
     // Check if operation is occuring in temperory normal mode after ctrl-o
     if (tempnormal) {
-        tempnormal = false
-        if (mode != 'visual' && mode != 'visualLine'){  // Switch back to insert 
-            switchModeToInsert()                        // after operation
-            }
+        // Don't snap back to insert mode while a command is still "in
+        // progress" (waiting on a motion or another keystroke) -- only once
+        // a command has actually run to completion. waitForFirstInput et al.
+        // consume `tempnormal` themselves once *they* finish.
+        if (mode != 'visual' && mode != 'visualLine' && mode != 'replaceChar') {
+            tempnormal = false
+            switchModeToInsert()
+        }
     }
 }
 
