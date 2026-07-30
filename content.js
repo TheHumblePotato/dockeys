@@ -1,4 +1,4 @@
-// Google Docs has moved from using editable HTML elements (textbox with contenteditable=true)
+// Google Docs has // Google Docs has moved from using editable HTML elements (textbox with contenteditable=true)
 // to custom implementation with its own editing surface since 2015. (https://drive.googleblog.com/2010/05/whats-different-about-new-google-docs.html)
 // This means that each keystroke is captured and then fed into layout engine which 
 // then draws the text, cursor, selection, headings etc on seperate iframe.
@@ -79,16 +79,16 @@ const dvorakShifted = {
 };
 
 // Reverse map: character Dvorak actually produces -> QWERTY label DocsKeys expects.
-// Digit-row entries are skipped on purpose so that typing an actual digit (e.g. for
-// DocsKeys' "3dd"-style repeat counts) is never remapped into a punctuation command.
+// Programmer Dvorak puts symbols on the unshifted number row and digits on the
+// shifted number row, so this table also takes care of digits: pressing the
+// physical, unshifted "1" key produces "&" under Dvorak, and that reverse-maps
+// back to "1" here -- which is exactly what's needed for DocsKeys' repeat counts.
 const dvorakToQwerty = (() => {
-    const isDigitish = (s) => /[0-9]/.test(s);
     const out = {};
     for (const tbl of [dvorakUnshifted, dvorakShifted]) {
         for (const label of Object.keys(tbl)) {
             const sent = tbl[label];
             if (sent === label) continue;
-            if (isDigitish(label) || isDigitish(sent)) continue;
             if (out[sent] !== undefined && out[sent] !== label) {
                 console.warn(`DocsKeys dvorak map: '${sent}' claimed by both '${out[sent]}' and '${label}'`);
             }
@@ -213,6 +213,7 @@ function switchModeToWait2() {
 }
 
 let longStringOp = ""
+let operatorCount = 0 // pending count typed between an operator (c/d/y) and its motion, e.g. the "2" in "c2w"
 
 
 function goToStartOfLine() {
@@ -338,17 +339,26 @@ function waitForSecondInput(key) {
 }
 
 function waitForFirstInput(key) {
+    // Accumulate a count before the motion (e.g. the "2" in "c2w"). A bare "0"
+    // typed before any other digit is the "start of line" motion, not a count.
+    if (/[1-9]/.test(key) || (operatorCount > 0 && key === "0")) {
+        operatorCount = operatorCount * 10 + Number(key)
+        return
+    }
+    const count = operatorCount || 1
+    operatorCount = 0
+
     switch (key) {
         case "i":
         case "a":
             switchModeToWait2()
             break
         case "w":
-            selectToEndOfWord()
+            repeatMotion(selectToEndOfWord, count)
             runLongStringOp()
             break
         case "p":
-            selectToEndOfPara()
+            repeatMotion(selectToEndOfPara, count)
             runLongStringOp()
             break
         case "^":
@@ -361,7 +371,7 @@ function waitForFirstInput(key) {
             selectToEndOfLine()
             runLongStringOp()
             break
-				case "G":
+					case "G":
             goToDocEnd(true)
             runLongStringOp()
             break
@@ -372,6 +382,10 @@ function waitForFirstInput(key) {
         case longStringOp:
             goToStartOfLine()
             selectToEndOfLine()
+            for (let i = 1; i < count; i++) {
+                sendKeyEvent("down", { shift: true })
+                sendKeyEvent("end", { shift: true })
+            }
             runLongStringOp()
             break
         default:
