@@ -9,10 +9,56 @@
 // before sending to layout engine and interpret them into respective vim motion/command.
 // Then implement those motions by sending relevant keystrokes. Essentially doing a keystroke to keystroke remapping. 
 
-const iframe = document.getElementsByTagName('iframe')[0]   // https://stackoverflow.com/a/4388829
-iframe.contentDocument.addEventListener('keydown', eventHandler, true)
+// --- Startup robustness ------------------------------------------------
+// Google Docs builds its editing surface (the keystroke-target iframe, the
+// "kix-cursor-top" cursor element) asynchronously after the page itself has
+// loaded. Grabbing these the instant content.js runs assumes they already
+// exist, which isn't always true (e.g. a slow-loading doc, a large
+// document, or a slower machine) -- when it isn't, `iframe` comes back
+// `undefined` and `iframe.contentDocument` throws, or `cursorTop` comes
+// back `undefined` and any later `cursorTop.style...` throws. Polling for
+// the element to appear (with a generous timeout so we don't loop forever
+// on a page that isn't actually a doc) makes startup resilient to that
+// instead of assuming a specific load order.
+function waitForElement(getElement, callback, { interval = 200, timeoutMs = 20000 } = {}) {
+    const start = Date.now()
+    const attempt = () => {
+        const el = getElement()
+        if (el) {
+            callback(el)
+            return
+        }
+        if (Date.now() - start > timeoutMs) {
+            console.warn("DocsKeys: gave up waiting for a required Google Docs element to appear; DocsKeys may not activate on this page.")
+            return
+        }
+        setTimeout(attempt, interval)
+    }
+    attempt()
+}
 
-const cursorTop = document.getElementsByClassName("kix-cursor-top")[0] // element to edit to show normal vs insert mode
+waitForElement(
+    () => {
+        const el = document.getElementsByTagName('iframe')[0]   // https://stackoverflow.com/a/4388829
+        return (el && el.contentDocument) ? el : null
+    },
+    (iframe) => {
+        iframe.contentDocument.addEventListener('keydown', eventHandler, true)
+    },
+)
+
+// Element to edit to show normal vs insert mode. This is looked up lazily
+// via getCursorTop() (below) rather than cached once here, since it's
+// subject to the same "may not exist yet" timing issue as the iframe above,
+// and re-querying is cheap.
+let cursorTop = null
+function getCursorTop() {
+    if (!cursorTop || !cursorTop.isConnected) {
+        cursorTop = document.getElementsByClassName("kix-cursor-top")[0] || null
+    }
+    return cursorTop
+}
+
 let mode = 'normal'
 let tempnormal = false // State variable for indicating temperory normal mode
 let multipleMotion = {
@@ -140,85 +186,8 @@ modeIndicator.style.fontWeight = '500'
 modeIndicator.style.zIndex = '9999'
 document.body.appendChild(modeIndicator)
 
-// --- Best-effort per-mode cursor shape --------------------------------------
-// DocsKeys cannot read the document's text (see MISSING_VIM_FEATURES.md /
-// README "Why can't you read the line?"), and for the same underlying reason
-// -- Google Docs draws everything itself instead of using standard editable
-// DOM/CSS primitives -- there is no guaranteed, documented way to reshape its
-// native caret into a Vim-style block/underline. What follows is a *purely
-// additive, best-effort* attempt: we set a data attribute on <html> for the
-// current mode and ship CSS rules that try to restyle Google Docs' known
-// "kix" caret classes (kix-cursor, kix-cursor-caret) when they exist.
-//
-// This is deliberately implemented as CSS, not JS DOM manipulation of
-// unknown elements: an unmatched CSS selector is a silent no-op, never a
-// runtime error, so if Google renames these classes tomorrow this feature
-// just quietly stops doing anything instead of breaking the extension. The
-// floating mode badge (bottom-right) is kept as-is and remains the
-// guaranteed-to-work mode indicator; treat the caret restyling as a bonus.
-//
-// Sizing: earlier versions used a flat `0.6em` block width, which doesn't
-// track the actual glyph under the cursor and looked wrong across different
-// font sizes/headings. `1ch` is a standard CSS unit defined as the width of
-// the "0" character in the element's *own* font, so as long as the caret
-// element inherits Docs' real font-size/family (which it should, since we
-// don't touch font-family/size ourselves), this scales far more sensibly
-// with the surrounding text than a hardcoded em value did. It's still an
-// approximation (an average character isn't exactly "0"-width) but it's a
-// meaningfully better one, and -- like everything else here -- a no-op
-// rather than a crash if Docs' markup doesn't cooperate.
-//
-// Pending-input modes (operator-pending, "waiting for a register name",
-// "waiting for the replace character", the i/a text-object prefix) get a
-// distinct underscore-shaped cursor instead of a full block, using
-// `transform: scaleY()` anchored to the bottom -- this only needs to squash
-// whatever height Docs' own element already has, so unlike a hardcoded
-// pixel height it doesn't depend on knowing the line-height/font-size.
-const cursorStyleEl = document.createElement('style')
-cursorStyleEl.id = 'docskeys-cursor-style'
-cursorStyleEl.textContent = `
-html[data-docskeys-mode="normal"] .kix-cursor,
-html[data-docskeys-mode="normal"] .kix-cursor-caret {
-    width: 1ch !important;
-    opacity: 0.55 !important;
-    background-color: #1a73e8 !important;
-}
-html[data-docskeys-mode="visual"] .kix-cursor,
-html[data-docskeys-mode="visual"] .kix-cursor-caret,
-html[data-docskeys-mode="visualLine"] .kix-cursor,
-html[data-docskeys-mode="visualLine"] .kix-cursor-caret {
-    width: 1ch !important;
-    opacity: 0.55 !important;
-    background-color: #fbbc04 !important;
-}
-html[data-docskeys-mode="replaceChar"] .kix-cursor,
-html[data-docskeys-mode="replaceChar"] .kix-cursor-caret,
-html[data-docskeys-mode="waitForFirstInput"] .kix-cursor,
-html[data-docskeys-mode="waitForFirstInput"] .kix-cursor-caret,
-html[data-docskeys-mode="waitForSecondInput"] .kix-cursor,
-html[data-docskeys-mode="waitForSecondInput"] .kix-cursor-caret,
-html[data-docskeys-mode="waitForVisualInput"] .kix-cursor,
-html[data-docskeys-mode="waitForVisualInput"] .kix-cursor-caret,
-html[data-docskeys-mode="waitForRegister"] .kix-cursor,
-html[data-docskeys-mode="waitForRegister"] .kix-cursor-caret {
-    width: 1ch !important;
-    opacity: 0.75 !important;
-    background-color: #ea4335 !important;
-    transform: scaleY(0.18) !important;
-    transform-origin: bottom !important;
-}
-html[data-docskeys-mode="insert"] .kix-cursor,
-html[data-docskeys-mode="insert"] .kix-cursor-caret {
-    width: 2px !important;
-    opacity: 1 !important;
-    transform: none !important;
-}
-`
-document.head.appendChild(cursorStyleEl)
-
 function updateModeIndicator(currentMode) {
     modeIndicator.textContent = currentMode.toUpperCase()
-    document.documentElement.setAttribute('data-docskeys-mode', currentMode)
     switch(currentMode) {
         case 'normal':
             modeIndicator.style.backgroundColor = '#1a73e8'
@@ -278,15 +247,19 @@ function switchModeToNormal() {
     updateModeIndicator(mode)
 
     //caret indicating visual mode 
-    cursorTop.style.opacity = 1
-    cursorTop.style.display = "block"
-    cursorTop.style.backgroundColor = "black"
+    const ct = getCursorTop()
+    if (ct) {
+        ct.style.opacity = 1
+        ct.style.display = "block"
+        ct.style.backgroundColor = "black"
+    }
 }
 
 function switchModeToInsert() {
     mode = 'insert'
     updateModeIndicator(mode)
-    cursorTop.style.opacity = 0
+    const ct = getCursorTop()
+    if (ct) ct.style.opacity = 0
 }
 
 function switchModeToWait() {
@@ -374,6 +347,38 @@ function runDotRepeatable(fn, op) {
 let registers = {}
 let pendingRegister = null // register name captured via `"` prefix; applies to the NEXT y/d/c/p only
 const REGISTER_READ_DELAY_MS = 80 // heuristic; Docs' clipboard write from a simulated menu click isn't synchronous
+const REGISTER_STORAGE_KEY = "docskeys-registers"
+
+// --- Register persistence -----------------------------------------------
+// `registers` used to live only in this content script's in-memory JS
+// object, so it was reset every time the tab (and with it, this script)
+// reloaded -- closing/reloading the Docs tab silently threw away anything
+// stored in a named register. chrome.storage.local persists across reloads
+// and even browser restarts, and (like the clipboard access above) this is
+// wired up as purely additive: if a load/save fails for any reason,
+// registers just behave as they did before (in-memory only for this tab),
+// they don't stop working.
+chrome.storage.local.get(REGISTER_STORAGE_KEY, (result) => {
+    if (chrome.runtime.lastError) {
+        console.warn("DocsKeys: couldn't load saved registers", chrome.runtime.lastError)
+        return
+    }
+    if (result && result[REGISTER_STORAGE_KEY]) {
+        registers = result[REGISTER_STORAGE_KEY]
+    }
+})
+
+function saveRegisters() {
+    try {
+        chrome.storage.local.set({ [REGISTER_STORAGE_KEY]: registers }, () => {
+            if (chrome.runtime.lastError) {
+                console.warn("DocsKeys: couldn't save registers", chrome.runtime.lastError)
+            }
+        })
+    } catch (err) {
+        console.warn("DocsKeys: couldn't save registers", err)
+    }
+}
 
 function waitForRegisterInput(key) {
     if (/^[a-z0-9]$/i.test(key)) {
@@ -391,6 +396,7 @@ async function captureClipboardIntoRegister(name) {
         await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
         const text = await navigator.clipboard.readText()
         registers[name] = text
+        saveRegisters()
     } catch (err) {
         console.warn(`DocsKeys: couldn't read clipboard into register "${name}" (best-effort feature; the default clipboard-backed register is unaffected)`, err)
     }

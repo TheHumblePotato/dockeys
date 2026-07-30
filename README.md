@@ -161,16 +161,14 @@ Visual-mode changes are not dot-repeatable (see MISSING_VIM_FEATURES.md).
 ### Mode indicators
 
 A floating badge in the bottom-right corner always shows the current mode
-(NORMAL, INSERT, VISUAL, etc.) -- this is the reliable indicator. DocsKeys
-also makes a best-effort attempt to restyle Google Docs' own text cursor:
-a block cursor (sized to `1ch`, i.e. roughly one character's width in the
-surrounding font, rather than a fixed guess) for normal/visual mode, a thin
-bar for insert mode, and a distinct **underscore-shaped** cursor for any
-mode that's waiting on one more keystroke (after `d`/`c`/`y`/`r`/`"`, or the
-`i`/`a` text-object prefix in visual mode). This part is unverified against
-a live Google Docs page and may not visibly do anything depending on Docs'
-current internals -- if it doesn't work for you, the floating badge is
-unaffected.
+(NORMAL, INSERT, VISUAL, etc.) -- this is the indicator to rely on. An
+earlier version also tried to restyle Google Docs' own text cursor (a
+resized block for normal/visual mode, a thin bar for insert mode) as a
+bonus on top of the badge, but sizing it to reliably match the actual
+character under the cursor isn't something DocsKeys can do without reading
+line content (see above), so that attempt has been removed -- Google Docs'
+native cursor is left alone, and the floating badge is the only mode
+indicator.
 
 ## Installation
 
@@ -209,6 +207,11 @@ named registers (see above). If you'd rather not grant that, you can still
 use everything else -- registers are the only feature that depends on it,
 and it fails silently (falling back to the default clipboard-backed
 register) if clipboard access doesn't work in your browser.
+
+The manifest also requests `storage`, used only to save named registers
+(`"ayy`, `"ap`, etc.) to `chrome.storage.local` so they survive closing or
+reloading the tab, instead of being lost with the rest of the content
+script's in-memory state. Nothing else is stored or sent anywhere.
 
 ## Known Limitations
 
