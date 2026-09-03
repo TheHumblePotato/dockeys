@@ -61,6 +61,36 @@ including which of these are "not practical" vs. just "not done yet."
   ignore punctuation and only stop at whitespace, but telling that apart from
   Google Docs' own word-jump requires reading line content, which DocsKeys
   can't do. See MISSING_VIM_FEATURES.md.
+- `f{char}` / `F{char}` - Move to the next/previous occurrence of `{char}` on
+  the current line, landing on it (inclusive if used with an operator, e.g.
+  `dfx`).
+- `t{char}` / `T{char}` - Move till just before/after the next/previous
+  occurrence of `{char}` on the current line (exclusive with an operator for
+  `T`, inclusive for `t` -- see `:help t`/`:help T`).
+- `;` / `,` - Repeat the last `f`/`F`/`t`/`T`, in the same/opposite direction.
+  A count (`{n}f{char}`) finds the n'th occurrence. `f`/`F`/`t`/`T` are the
+  first DocsKeys motions that actually read document text -- see "How f/F/t/T
+  read the document" below for how, and MISSING_VIM_FEATURES.md for the
+  caveats (scoped to the current wrapped line, not the full paragraph;
+  `;`/`,` only work as plain motions so far, not after an operator or in
+  visual mode).
+
+### How f/F/t/T read the document
+
+The section above explains why DocsKeys can't read arbitrary document text.
+`f`/`F`/`t`/`T` get around a narrower version of that problem using a
+mechanism DocsKeys already had: the same clipboard permission and
+save/restore pattern used for named registers. To answer "what character is
+next?", DocsKeys briefly selects from the cursor to the start (and
+separately, the end) of the current line with Home/End, clicks Google Docs'
+own Copy menu item, reads the result back from the OS clipboard, and then
+collapses the selection back to exactly where the cursor started -- all
+before the user's own clipboard contents (saved beforehand) are restored.
+This is a live, on-demand read every time, not a cached copy of the
+document, so it stays correct even while collaborators are editing
+elsewhere in the doc; the only risk window is the couple hundred
+milliseconds the read itself takes. See MISSING_VIM_FEATURES.md for the
+latency and scoping caveats.
 
 ### Numbered Prefixed Motions
 
@@ -104,7 +134,7 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
 #### Text Manipulation
 - `d` + motion - Delete. Supports `dw`/`dW`, `de`/`dE`, `db`/`dB`, `dh`, `dl`,
   `dj`, `dk`, `diw`, `dp`, `dip`, `d{`, `d}`, `dd`, `d_`, `d0`, `d^`, `d$`,
-  `dg`, `dG`.
+  `dg`, `dG`, `df{char}`, `dF{char}`, `dt{char}`, `dT{char}`.
   - `dj`/`dk` are **linewise**, matching real Vim exactly: `dj` deletes the
     current line and the line below (2 lines total), `dk` deletes the
     current line and the line above (2 lines total), and a count extends

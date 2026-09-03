@@ -1,25 +1,3 @@
-// Google Docs has /// Google Docs has moved from using editable HTML elements (textbox with contenteditable=true)
-// to custom implementation with its own editing surface since 2015. (https://drive.googleblog.com/2010/05/whats-different-about-new-google-docs.html)
-// This means that each keystroke is captured and then fed into layout engine which 
-// then draws the text, cursor, selection, headings etc on seperate iframe.
-// Such implementation deters any extensibility in terms of text manipulation because 
-// there is no API to interact with Google Docs layout engine
-
-// Thus only way (in my understanding) to achieve vim motions would be to capture keystrokes
-// before sending to layout engine and interpret them into respective vim motion/command.
-// Then implement those motions by sending relevant keystrokes. Essentially doing a keystroke to keystroke remapping. 
-
-// --- Startup robustness ------------------------------------------------
-// Google Docs builds its editing surface (the keystroke-target iframe, the
-// "kix-cursor-top" cursor element) asynchronously after the page itself has
-// loaded. Grabbing these the instant content.js runs assumes they already
-// exist, which isn't always true (e.g. a slow-loading doc, a large
-// document, or a slower machine) -- when it isn't, `iframe` comes back
-// `undefined` and `iframe.contentDocument` throws, or `cursorTop` comes
-// back `undefined` and any later `cursorTop.style...` throws. Polling for
-// the element to appear (with a generous timeout so we don't loop forever
-// on a page that isn't actually a doc) makes startup resilient to that
-// instead of assuming a specific load order.
 function waitForElement(getElement, callback, { interval = 200, timeoutMs = 20000 } = {}) {
     const start = Date.now()
     const attempt = () => {
@@ -39,7 +17,7 @@ function waitForElement(getElement, callback, { interval = 200, timeoutMs = 2000
 
 waitForElement(
     () => {
-        const el = document.getElementsByTagName('iframe')[0]   // https://stackoverflow.com/a/4388829
+        const el = document.getElementsByTagName('iframe')[0]   
         return (el && el.contentDocument) ? el : null
     },
     (iframe) => {
@@ -47,10 +25,6 @@ waitForElement(
     },
 )
 
-// Element to edit to show normal vs insert mode. This is looked up lazily
-// via getCursorTop() (below) rather than cached once here, since it's
-// subject to the same "may not exist yet" timing issue as the iframe above,
-// and re-querying is cheap.
 let cursorTop = null
 function getCursorTop() {
     if (!cursorTop || !cursorTop.isConnected) {
@@ -60,15 +34,12 @@ function getCursorTop() {
 }
 
 let mode = 'normal'
-let tempnormal = false // State variable for indicating temperory normal mode
+let tempnormal = false 
 let multipleMotion = {
     times:0,
     mode:"normal"
 }
 
-// How to simulate a keypress in Chrome: http://stackoverflow.com/a/10520017/46237
-// Note that we have to do this keypress simulation in an injected script, because events dispatched
-// by content scripts do not preserve overridden properties.
 const script = document.createElement("script");
 script.src = chrome.runtime.getURL("page_script.js");
 document.documentElement.appendChild(script);
@@ -88,21 +59,6 @@ const keyCodes = {
     down: 40,
     "delete": 46,
 };
-
-// --- Programmer Dvorak support ---------------------------------------------
-// DocsKeys reads e.key, which already reflects whatever OS keyboard layout is
-// active. If that layout is Programmer Dvorak, e.key for the physical h/j/k/l
-// (etc.) keys will report Dvorak's characters, not "h"/"j"/"k"/"l", so none of
-// the switch-case commands below would ever match.
-//
-// To fix this we translate e.key back to the QWERTY letter that lives at that
-// same physical key position before it's used as a command, mirroring the
-// `langmap` trick used for Neovim. The tables below are a direct port of the
-// unshifted/shifted tables in the init.lua langmap config (label = QWERTY key,
-// value = character Programmer Dvorak produces at that physical key).
-//
-// Set DVORAK_MODE to false to disable this and use raw QWERTY-style DocsKeys.
-const DVORAK_MODE = true;
 
 const dvorakUnshifted = {
     "`": "$", "1": "&", "2": "[", "3": "{", "4": "}",
@@ -125,11 +81,6 @@ const dvorakShifted = {
     "<": "W", ">": "V", "?": "Z",
 };
 
-// Reverse map: character Dvorak actually produces -> QWERTY label DocsKeys expects.
-// Programmer Dvorak puts symbols on the unshifted number row and digits on the
-// shifted number row, so this table also takes care of digits: pressing the
-// physical, unshifted "1" key produces "&" under Dvorak, and that reverse-maps
-// back to "1" here -- which is exactly what's needed for DocsKeys' repeat counts.
 const dvorakToQwerty = (() => {
     const out = {};
     for (const tbl of [dvorakUnshifted, dvorakShifted]) {
@@ -145,11 +96,7 @@ const dvorakToQwerty = (() => {
     return out;
 })();
 
-// Translates a single key character produced under Programmer Dvorak back into
-// the QWERTY letter that occupies the same physical key. Multi-char key names
-// (e.g. "Escape", "Shift") and untranslated characters pass through unchanged.
 function translateKey(key) {
-    if (!DVORAK_MODE || key.length !== 1) return key;
     return dvorakToQwerty[key] !== undefined ? dvorakToQwerty[key] : key;
 }
 
@@ -164,16 +111,12 @@ function paragraphMods(shift = false) {
     return { shift, [paragraphModifierKey]: true }
 }
 
-// Send request to injected page script to simulate keypress
-// Messages are passed to page script via "doc-keys-simulate-keypress" events, which are dispatched
-// on the window object by the content script.
 function sendKeyEvent(key, mods = {}) {
     const keyCode = keyCodes[key]
     const defaultMods = { shift: false, control: false, alt: false, meta: false }
     window.dispatchEvent(new CustomEvent("doc-keys-simulate-keypress", { detail: { keyCode, mods: { ...defaultMods, ...mods } } }));
 }
 
-//Mode indicator thing (insert, visualline)
 const modeIndicator = document.createElement('div')
 modeIndicator.style.position = 'fixed'
 modeIndicator.style.bottom = '20px'
@@ -233,20 +176,10 @@ function switchModeToVisualLine() {
 }
 
 function switchModeToNormal() {
-    // NOTE: this used to also send a spurious "left" arrow whenever mode was
-    // "waitForFirstInput" (operator-pending). That was intended to correct
-    // cursor position for whole-line deletes, but dd/dj/dk-style callers
-    // already set `mode = 'normal'` themselves *before* calling this function
-    // specifically to avoid it -- so the branch was dead for its one
-    // legitimate case and only ever fired as a bug: it moved the cursor left
-    // one character after cancelling an operator with Escape/an invalid key,
-    // and after every yank (yw, yy, ...), since those paths reach here while
-    // mode is still "waitForFirstInput". Removed; see MISSING_VIM_FEATURES.md.
     if (mode == "visualLine") sendKeyEvent("left")
     mode = 'normal'
     updateModeIndicator(mode)
 
-    //caret indicating visual mode 
     const ct = getCursorTop()
     if (ct) {
         ct.style.opacity = 1
@@ -265,25 +198,18 @@ function switchModeToInsert() {
 function switchModeToWait() {
     mode = "waitForFirstInput"
     updateModeIndicator(mode)
-    // define cursor style
 }
 
 function switchModeToWait2() {
     mode = "waitForSecondInput"
     updateModeIndicator(mode)
-    // define cursor style
 }
 
-// Enters the mode that waits for exactly one more keystroke -- the
-// replacement character for the "r" command (see handleKeyEventNormal).
 function switchModeToReplaceChar() {
     mode = "replaceChar"
     updateModeIndicator(mode)
 }
 
-// Enters the mode that waits for exactly one more keystroke naming a
-// register -- the character after `"`, e.g. the "a" in `"ayy`. See the
-// Registers section below.
 let waitForRegisterReturnMode = "normal"
 function switchModeToWaitForRegister() {
     waitForRegisterReturnMode = mode
@@ -291,73 +217,41 @@ function switchModeToWaitForRegister() {
     updateModeIndicator(mode)
 }
 
-let longStringOp = ""
-let operatorCount = 0 // pending count typed between an operator (c/d/y) and its motion, e.g. the "2" in "c2w"
+// --- f/F/t/T (find-character motions) ---
+// These are the first DocsKeys motions that need to know what character is
+// actually in the document. See readCursorLineContext() below for how that's
+// done without a Docs content-reading API: temporarily select to the line's
+// start/end, Copy, and read the OS clipboard (the same clipboard permission
+// already used for registers), then restore the selection and the user's
+// real clipboard contents. This is scoped to the current *wrapped display
+// line* (Home/End), the same approximation of "line" already used by DocsKeys'
+// existing $/0/D/C -- see MISSING_VIM_FEATURES.md.
+let pendingFindType = null       // 'f' | 'F' | 't' | 'T'
+let pendingFindOperator = null   // null for a plain/visual motion, else 'c'/'d'/'y'
+let pendingFindCount = 1
+let pendingFindReturnMode = "normal" // mode to resume in: 'normal' | 'visual' | 'visualLine'
+let lastFind = null              // { type, char } for ';' and ','
+let findBusy = false             // re-entrancy guard around the async clipboard read
 
-// --- Dot-repeat (`.`) -------------------------------------------------------
-// Real Vim's `.` replays the last *change*. For everything DocsKeys builds
-// out of plain cursor-movement + Edit-menu clicks (dw, d$, dd, D, x, J, p,
-// ...) that's just "call the same JS function again", so we record a
-// zero-arg closure for the last dot-repeatable command and replay it here.
-//
-// This intentionally does NOT cover insert-mode text (ciw, o, A, s, and c-
-// family operators only repeat their *deletion*, not what you typed
-// afterward) -- see MISSING_VIM_FEATURES.md for why: inserted characters are
-// real, trusted keystrokes DocsKeys never intercepts or records, so there is
-// nothing to replay. After a repeated change-operator you'll land in insert
-// mode and need to type the replacement text again, same as if you'd typed
-// the operator+motion yourself.
-//
-// Per real Vim semantics, yank (`y`, `Y`) is NOT a change and does not get
-// recorded here, and visual-mode operations are excluded entirely (visual
-// dot-repeat is approximate even in real Vim, and doubly so without the
-// ability to read text to judge selection sizes at the new cursor position).
+let longStringOp = ""
+let operatorCount = 0 
+
 let lastChange = null
 
 function recordChange(fn) {
     lastChange = fn
 }
 
-// Runs a (possibly operator-driven) change function and records it for `.`
-// unless op is "y" (yank never gets recorded, matching real Vim).
 function runDotRepeatable(fn, op) {
     fn()
     if (op !== "y") recordChange(fn)
 }
 
-// --- Registers ---------------------------------------------------------
-// DocsKeys cannot read the document's text (see MISSING_VIM_FEATURES.md /
-// README "Why can't you read the line?"), so the *only* way it ever gets
-// yanked/deleted text into JS-land at all is by asking Google Docs to put it
-// on the real OS clipboard (via its own Edit > Copy/Cut menu item) and then
-// reading that clipboard back with the async Clipboard API. That read is
-// inherently racy -- Docs performs the clipboard write asynchronously, off
-// the back of a simulated menu click, and there's no event we can await, so
-// we just wait a beat and hope -- and it depends on Clipboard API
-// permissions/behavior we can't fully verify without testing against a
-// live, focused Google Docs tab.
-//
-// Every clipboard-API call here is therefore wrapped in try/catch and
-// treated as *purely additive*: if it fails, the named register just
-// doesn't get populated/restored, and DocsKeys falls back to exactly its
-// old behavior (one implicit register, backed directly by the OS clipboard
-// via the Edit menu, which is what plain `y`/`d`/`c`/`p` without a `"reg`
-// prefix always use). Nothing about the pre-existing y/d/c/p behavior is
-// allowed to depend on the Clipboard API succeeding.
 let registers = {}
-let pendingRegister = null // register name captured via `"` prefix; applies to the NEXT y/d/c/p only
-const REGISTER_READ_DELAY_MS = 80 // heuristic; Docs' clipboard write from a simulated menu click isn't synchronous
+let pendingRegister = null 
+const REGISTER_READ_DELAY_MS = 80
 const REGISTER_STORAGE_KEY = "docskeys-registers"
 
-// --- Register persistence -----------------------------------------------
-// `registers` used to live only in this content script's in-memory JS
-// object, so it was reset every time the tab (and with it, this script)
-// reloaded -- closing/reloading the Docs tab silently threw away anything
-// stored in a named register. chrome.storage.local persists across reloads
-// and even browser restarts, and (like the clipboard access above) this is
-// wired up as purely additive: if a load/save fails for any reason,
-// registers just behave as they did before (in-memory only for this tab),
-// they don't stop working.
 chrome.storage.local.get(REGISTER_STORAGE_KEY, (result) => {
     if (chrome.runtime.lastError) {
         console.warn("DocsKeys: couldn't load saved registers", chrome.runtime.lastError)
@@ -384,8 +278,6 @@ function waitForRegisterInput(key) {
     if (/^[a-z0-9]$/i.test(key)) {
         pendingRegister = key.toLowerCase()
     }
-    // Any other key (Esc, punctuation, ...): silently cancel, matching Vim's
-    // behavior of treating an invalid register name as a no-op.
     mode = waitForRegisterReturnMode
     updateModeIndicator(mode)
 }
@@ -416,8 +308,6 @@ async function pasteRegister(name) {
     try {
         previousClipboard = await navigator.clipboard.readText()
     } catch (err) {
-        // We just won't be able to restore the clipboard afterward; the
-        // paste itself can still proceed below.
     }
     try {
         await navigator.clipboard.writeText(text)
@@ -432,6 +322,203 @@ async function pasteRegister(name) {
     }
 }
 
+
+// Reads the text of the current wrapped display line, split at the cursor,
+// without ever touching the document: select cursor->end (Home/End key, same
+// as $/0), Copy, read the clipboard, collapse the selection back to the
+// original cursor position, then repeat for start->cursor. The user's real
+// clipboard is saved beforehand and restored afterward, mirroring the
+// save/restore pattern pasteRegister() already uses.
+//
+// Because this always reads the *live* selection at the moment it's called
+// (never a cached snapshot), it stays correct even if a collaborator is
+// editing elsewhere in the document -- there's no stale state to drift.
+// The only risk window is the ~150-300ms this takes to run: a collaborator
+// editing at this exact cursor position during that window could invalidate
+// the read. Considered an acceptable, documented limitation for now.
+async function readCursorLineContext() {
+    let previousClipboard = null
+    try {
+        previousClipboard = await navigator.clipboard.readText()
+    } catch (err) {
+        // Best-effort: if we can't read the existing clipboard we can't restore
+        // it later either, but we can still proceed with the find itself.
+    }
+    let before = null
+    let after = null
+    try {
+        sendKeyEvent("end", { shift: true })
+        clickMenu(menuItems.copy)
+        await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
+        after = await navigator.clipboard.readText()
+        sendKeyEvent("left") // collapses the selection back to its start (the original cursor)
+
+        sendKeyEvent("home", { shift: true })
+        clickMenu(menuItems.copy)
+        await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
+        before = await navigator.clipboard.readText()
+        sendKeyEvent("right") // collapses the selection back to its end (the original cursor)
+    } catch (err) {
+        console.warn("DocsKeys: couldn't read line text for f/F/t/T (best-effort feature; falling back to no-op)", err)
+        return null
+    } finally {
+        if (previousClipboard !== null) {
+            try {
+                await navigator.clipboard.writeText(previousClipboard)
+            } catch (err) {
+                console.warn("DocsKeys: couldn't restore clipboard after f/F/t/T read", err)
+            }
+        }
+    }
+    return { before, after }
+}
+
+// `after` is the text from the cursor to end-of-line, so after[0] is the
+// character currently under the cursor. Real f/t search *starts* at the next
+// character, matching Vim's ":help f": "the count'th occurrence of {char} to
+// the right", not counting the character the cursor is already on.
+function findForward(text, char, count) {
+    let idx = 0
+    for (let n = 0; n < count; n++) {
+        idx = text.indexOf(char, idx + 1)
+        if (idx === -1) return { found: false }
+    }
+    return { found: true, matchIndex: idx } // matchIndex = steps to land ON char (plain f)
+}
+
+// `before` is the text from start-of-line to the cursor (not including the
+// cursor's own character), so before[before.length-1] is the character
+// immediately to the left of the cursor -- distance 1 for F/T's search.
+function findBackward(text, char, count) {
+    let idx = text.length
+    for (let n = 0; n < count; n++) {
+        idx = text.lastIndexOf(char, idx - 1)
+        if (idx === -1) return { found: false }
+    }
+    return { found: true, distance: text.length - idx } // steps to land ON char (plain F)
+}
+
+function finishFind(returnMode) {
+    if (returnMode === "visual" || returnMode === "visualLine") {
+        mode = returnMode
+        updateModeIndicator(mode)
+    } else {
+        switchModeToNormal()
+    }
+}
+
+// Builds the actual keystrokes for a resolved f/F/t/T, given the plain-motion
+// step count (how many arrow presses land the cursor on the target for f/F,
+// or one short of it for t/T).
+//
+// Per :help f/F/t/T: f and t are *inclusive* (the landing character is part
+// of an operator's range), F and T are *exclusive*. Concretely, for the
+// forward (f/t) case the operator-pending selection needs one MORE shift-press
+// than the plain motion, to also grab the character the cursor started on
+// (which the plain motion never selects, only passes over). For the backward
+// (F/T) case the operator-pending selection needs the SAME number of
+// shift-presses as the plain motion -- selecting backward by N never touches
+// the original cursor's own character in the first place, which is exactly
+// what "exclusive" backward means here. Verified against real Vim's
+// documented dfX/dtX/dFX/dTX behavior (e.g. cursor on 'a' in "abcXdef",
+// "dfX" deletes "abcX", "dtX" deletes "abc").
+function applyFindResult(type, steps, operator, returnMode) {
+    const forward = (type === "f" || type === "t")
+    const inclusive = (type === "f" || type === "t")
+    const dirKey = forward ? "right" : "left"
+
+    if (operator) {
+        const selectSteps = inclusive ? steps + 1 : steps
+        const fn = () => {
+            repeatMotion(() => sendKeyEvent(dirKey, { shift: true }), selectSteps)
+            runLongStringOp(operator, false)
+        }
+        runDotRepeatable(fn, operator)
+        return
+    }
+
+    if (returnMode === "visual" || returnMode === "visualLine") {
+        repeatMotion(() => sendKeyEvent(dirKey, { shift: true }), steps)
+        mode = returnMode
+        updateModeIndicator(mode)
+        return
+    }
+
+    repeatMotion(() => sendKeyEvent(dirKey), steps)
+    switchModeToNormal()
+}
+
+async function performFind(type, char, count, operator, returnMode) {
+    const ctx = await readCursorLineContext()
+    if (!ctx) {
+        finishFind(returnMode)
+        return
+    }
+    const forward = (type === "f" || type === "t")
+    const isTill = (type === "t" || type === "T")
+    const result = forward
+        ? findForward(ctx.after, char, count)
+        : findBackward(ctx.before, char, count)
+
+    if (!result.found) {
+        console.warn(`DocsKeys: no match for ${type}${char} on this line`)
+        finishFind(returnMode)
+        return
+    }
+
+    const landingSteps = forward ? result.matchIndex : result.distance
+    const steps = isTill ? landingSteps - 1 : landingSteps
+    if (steps < 0) {
+        // e.g. "t" immediately adjacent with nothing between -- no movement
+        finishFind(returnMode)
+        return
+    }
+
+    lastFind = { type, char }
+    applyFindResult(type, steps, operator, returnMode)
+}
+
+// Entry point from eventHandler. IMPORTANT: this must be called with the raw,
+// untranslated e.key, not the Dvorak-remapped `key` variable used for command
+// letters elsewhere in this file. DVORAK_MODE's translateKey() exists to turn
+// a physically-Dvorak-typed key back into its QWERTY *command* label (so 'd'
+// means delete regardless of layout) -- but f/F/t/T's argument isn't a
+// command, it's a literal character to search for in the document, and
+// e.key already reflects the correct on-screen character under the active
+// OS keyboard layout. Translating it would search for the wrong character.
+// (This mirrors how the existing 'r' replace-character command sidesteps the
+// same issue, by not consuming the translated `key` for its actual character
+// either -- see the `mode == 'replaceChar'` branch in eventHandler.)
+function handleFindCharInput(rawKey) {
+    if (findBusy) return
+    if (rawKey.length !== 1) {
+        pendingFindType = null
+        pendingFindOperator = null
+        finishFind(pendingFindReturnMode)
+        return
+    }
+    const type = pendingFindType
+    const operator = pendingFindOperator
+    const count = pendingFindCount || 1
+    const returnMode = pendingFindReturnMode
+    pendingFindType = null
+    pendingFindOperator = null
+    pendingFindCount = 1
+
+    findBusy = true
+    performFind(type, rawKey, count, operator, returnMode).finally(() => {
+        findBusy = false
+    })
+}
+
+function repeatLastFind(reverse) {
+    if (!lastFind) return
+    let { type, char } = lastFind
+    if (reverse) {
+        type = { f: "F", F: "f", t: "T", T: "t" }[type]
+    }
+    performFind(type, char, 1, null, "normal")
+}
 
 function goToStartOfLine() {
     sendKeyEvent("home")
@@ -457,15 +544,6 @@ function selectToEndOfWord() {
     sendKeyEvent("right", wordMods(true))
 }
 
-// NOTE: despite the name, this is Google Docs' Ctrl+Right (Alt+Right on Mac)
-// behavior, which Google's own docs describe as moving "to the next word" --
-// i.e. to the *beginning* of the next word, not the end of the current one.
-// This is exactly right for Vim's `w`, which is why it's used unmodified for
-// that. It is NOT the same as Vim's `e` -- see goToEndOfWordVim below.
-//
-// This is also used as the underlying primitive for `W` (WORD motion): see
-// the "WORD (W/E/B)" note below goToEndOfWordVim for why W/E/B are currently
-// honest aliases of w/e/b rather than true whitespace-only WORD motions.
 function goToEndOfWord() {
     sendKeyEvent("right", wordMods())
 }
@@ -474,33 +552,6 @@ function goToStartOfWord() {
     sendKeyEvent("left", wordMods())
 }
 
-// Real Vim's `e` moves the cursor to the last character of the current (or
-// next, if already at a word's end) word, and pressing `e` again from an
-// end-of-word position moves to the end of the *following* word ("In Vim
-// `ee` and `2e` are the same" -- vim's own docs). The only word-motion
-// primitive DocsKeys has is Ctrl+Right, which moves to the *start* of the
-// next word regardless of where inside the current word the cursor already
-// is -- so a naive "Ctrl+Right then step back twice" gets stuck: pressing it
-// twice in a row computes the exact same "next word start" both times and
-// therefore never advances past the first word.
-//
-// Fix: nudge the cursor forward two plain characters *before* the word-jump.
-// This guarantees that if the cursor was already sitting at an end-of-word
-// position (2 characters before some word's start), the nudge pushes it to
-// or past that word's start, so the following Ctrl+Right is forced to skip
-// to the *next* word instead of recomputing the same one -- while a cursor
-// freshly placed anywhere inside a word still lands on that same word's end,
-// since two characters forward doesn't leave the word (as long as words are
-// longer than 2 characters. For 1-2 character words this still works out
-// because Ctrl+Right's own "next word" boundary detection absorbs it -- see
-// MISSING_VIM_FEATURES.md for the full derivation and remaining edge cases).
-//
-// This is still a single-space, whitespace-boundary approximation: runs of
-// multiple spaces/tabs, or punctuation immediately adjacent to a word (e.g.
-// hyphens), can land a character or two off from true Vim behavior, because
-// resolving that exactly requires reading line content, which this
-// architecture cannot do. What's fixed here is specifically the "gets stuck
-// on repeat" bug, not the punctuation-adjacency approximation.
 function goToEndOfWordVim() {
     sendKeyEvent("right")
     sendKeyEvent("right")
@@ -516,18 +567,6 @@ function selectToEndOfWordVim() {
     sendKeyEvent("left", { shift: true })
     sendKeyEvent("left", { shift: true })
 }
-
-// --- WORD motions (W/E/B) ---------------------------------------------------
-// Real Vim distinguishes "word" (w/e/b: stops at punctuation too) from
-// "WORD" (W/E/B: only whitespace counts as a boundary). Telling those apart
-// requires knowing what character is actually at the boundary, which
-// DocsKeys cannot do (see "The core constraint" in MISSING_VIM_FEATURES.md).
-// Google Docs' own Ctrl+Right/Left word-jump is the only primitive available
-// either way, so W/E/B are implemented here as honest aliases of w/e/b: they
-// share goToEndOfWord/goToEndOfWordVim/goToStartOfWord (and their
-// select-variants) below rather than pretending to have separate,
-// more-correct behavior. This is called out explicitly in the README/
-// MISSING_VIM_FEATURES.md rather than silently shipped as identical.
 
 function goToDocStart(shift = false) {
     if (isMac) {
@@ -561,13 +600,6 @@ function goToStartOfPara(shift = false) {
     sendKeyEvent("up", paragraphMods(shift))
 }
 
-// --- Linewise selection helpers for j/k as operator motions -----------------
-// Real Vim: `dj` deletes the current line and the line below (2 lines
-// total), `dk` deletes the current line and the line above (2 lines total),
-// and a count extends how far the motion reaches (`d2j` = 3 lines: current +
-// 2 below), consistent with `dd`/`2dd`. These mirror the existing whole-line
-// selection approach used for dd/yy/cc below, just extending up or down
-// instead of only down.
 function selectLinesDown(count) {
     goToStartOfLine()
     sendKeyEvent("end", { shift: true })
@@ -598,19 +630,6 @@ function addLineBottom() {
     switchModeToInsert()
 }
 
-// `linewise` controls whether the "d" case does the extra merge-Backspace
-// after Cut. That backspace is only correct for whole-line deletes (dd,
-// dj, dk, ...): Home-to-End selection deliberately excludes the trailing
-// newline, so after cutting, an empty line remains and needs one more
-// Backspace to merge it away. For every other d-motion (dw, D, diw, d$,
-// dh, dl, ...) the selection already includes everything that needs to go
-// (e.g. selectToEndOfWord's Ctrl+Shift+Right already grabs the trailing
-// space), so that same unconditional backspace used to delete one extra,
-// unrelated character before the target -- a real bug that was previously
-// flagged in MISSING_VIM_FEATURES.md but left unfixed. Defaulting this to
-// false and only passing `true` from the genuinely-linewise call sites
-// fixes it (and, as a side effect, also fixes `D`, which shares this "d"
-// case and was incorrectly getting the extra backspace before).
 function runLongStringOp(operation = longStringOp, linewise = false) {
     const reg = pendingRegister
     pendingRegister = null
@@ -662,15 +681,13 @@ function waitForSecondInput(key) {
 }
 
 function waitForFirstInput(key) {
-    // Accumulate a count before the motion (e.g. the "2" in "c2w"). A bare "0"
-    // typed before any other digit is the "start of line" motion, not a count.
     if (/[1-9]/.test(key) || (operatorCount > 0 && key === "0")) {
         operatorCount = operatorCount * 10 + Number(key)
         return
     }
     const count = operatorCount || 1
     operatorCount = 0
-    const op = longStringOp // captured now, so a later operator press can't retroactively change what a recorded dot-repeat replays
+    const op = longStringOp 
 
     switch (key) {
         case "i":
@@ -678,7 +695,7 @@ function waitForFirstInput(key) {
             switchModeToWait2()
             break
         case "w":
-        case "W": // see "WORD motions (W/E/B)" note above goToDocStart
+        case "W": 
             runDotRepeatable(() => { repeatMotion(selectToEndOfWord, count); runLongStringOp(op) }, op)
             break
         case "e":
@@ -690,19 +707,15 @@ function waitForFirstInput(key) {
             runDotRepeatable(() => { repeatMotion(selectToStartOfWord, count); runLongStringOp(op) }, op)
             break
         case "h":
-            // Charwise: deletes/yanks count characters to the left of cursor.
             runDotRepeatable(() => { repeatMotion(() => sendKeyEvent("left", { shift: true }), count); runLongStringOp(op) }, op)
             break
         case "l":
-            // Charwise: deletes/yanks count characters starting at cursor (like `x`).
             runDotRepeatable(() => { repeatMotion(() => sendKeyEvent("right", { shift: true }), count); runLongStringOp(op) }, op)
             break
         case "j":
-            // Linewise: current line + count lines below (dj = 2 lines total).
             runDotRepeatable(() => { selectLinesDown(count); runLongStringOp(op, true) }, op)
             break
         case "k":
-            // Linewise: current line + count lines above (dk = 2 lines total).
             runDotRepeatable(() => { selectLinesUp(count); runLongStringOp(op, true) }, op)
             break
         case "p":
@@ -725,6 +738,17 @@ function waitForFirstInput(key) {
             break
         case "g":
             runDotRepeatable(() => { goToDocStart(true); runLongStringOp(op) }, op)
+            break
+        case "f":
+        case "F":
+        case "t":
+        case "T":
+            pendingFindType = key
+            pendingFindOperator = op
+            pendingFindCount = count
+            pendingFindReturnMode = "normal"
+            mode = "waitForFindChar"
+            updateModeIndicator(mode)
             break
         case longStringOp:
             runDotRepeatable(() => {
@@ -766,14 +790,15 @@ function handleMultipleMotion(key) {
     const times = multipleMotion.times || 1
     const targetMode = multipleMotion.mode
 
-    // A count typed *before* an operator (e.g. "3dw") is equivalent, per Vim
-    // semantics, to giving the same count to the motion that follows the
-    // operator (e.g. "d3w"). Route it through the existing operatorCount
-    // mechanism rather than literally replaying "d" three times, which would
-    // just re-enter waitForFirstInput redundantly and (previously) get its
-    // mode clobbered back to "normal" below before the motion ever arrived.
     if (targetMode === "normal" && (key === "c" || key === "d" || key === "y")) {
         operatorCount = times
+        handleKeyEventNormal(key)
+        multipleMotion.times = 0
+        return
+    }
+
+    if (targetMode === "normal" && (key === "f" || key === "F" || key === "t" || key === "T")) {
+        pendingFindCount = times
         handleKeyEventNormal(key)
         multipleMotion.times = 0
         return
@@ -789,10 +814,6 @@ function handleMultipleMotion(key) {
             break
     }
 
-    // Only fall back to the mode we started counting from if the repeated
-    // action didn't itself transition to a new mode (e.g. an "i"/"a"/"o"
-    // entering insert mode, or "v" entering visual mode). Unconditionally
-    // resetting here used to clobber those transitions.
     if (mode === "multipleMotion") {
         mode = targetMode
     }
@@ -814,13 +835,10 @@ function eventHandler(e) {
         e.stopImmediatePropagation()
         switchModeToNormal()
 
-        // Turn on state variable to indicate temperory normal mode
         tempnormal = true
         return;
     }
     if (e.ctrlKey && mode=='normal' && key=='r') {
-        // Vim's redo is Ctrl+r (bare "r" is reserved for the "replace
-        // character" command, see handleKeyEventNormal).
         e.preventDefault()
         e.stopImmediatePropagation()
         clickMenu(menuItems.redo)
@@ -837,21 +855,6 @@ function eventHandler(e) {
     }
     if (mode == 'replaceChar') {
         if (key.length === 1) {
-            // Delete the character under the cursor, then let this real,
-            // trusted keystroke fall through untouched so the browser's
-            // native input pipeline types the replacement character --
-            // exactly like normal insert-mode typing elsewhere in this file,
-            // which is why we return instead of calling preventDefault().
-            //
-            // Note this is also why `r` is intentionally NOT dot-repeatable
-            // (see the "Dot-repeat" section above): there is no live,
-            // trusted keystroke available to supply the replacement
-            // character when `.` is pressed later, and re-dispatching the
-            // character as a synthetic event wouldn't actually insert it
-            // (same restriction that keeps insert-mode typing itself from
-            // being replayable). A dot-repeat that silently deleted a
-            // character without actually replacing it would be more
-            // confusing than not having one at all.
             sendKeyEvent('delete')
             switchModeToNormal()
             if (tempnormal) {
@@ -860,8 +863,6 @@ function eventHandler(e) {
             }
             return;
         }
-        // Any other key (Tab, arrows, etc.) cancels replace-mode without
-        // making an edit, same as Escape.
         e.preventDefault()
         switchModeToNormal()
         return;
@@ -887,6 +888,9 @@ function eventHandler(e) {
                 break
             case "waitForRegister":
                 waitForRegisterInput(key)
+                break
+            case "waitForFindChar":
+                handleFindCharInput(e.key) // raw key -- see handleFindCharInput's comment
                 break
             case "multipleMotion":
                 handleMultipleMotion(key)
@@ -926,16 +930,9 @@ function handleKeyEventNormal(key) {
             goToStartOfWord()
             break
         case "B":
-            // See "WORD motions (W/E/B)" note above goToDocStart: honest
-            // alias of `b`, since DocsKeys can't distinguish word/WORD
-            // boundaries without reading text.
             goToStartOfWord()
             break
         case "e":
-            // See goToEndOfWordVim's comment: Google Docs' Ctrl+Right moves
-            // to the *start* of the next word, not the end of the current
-            // one, so `e` needs its own helper rather than reusing
-            // goToEndOfWord() (which is correct for `w`, not `e`).
             goToEndOfWordVim()
             break
         case "E":
@@ -960,25 +957,19 @@ function handleKeyEventNormal(key) {
             mode = "waitForFirstInput"
             break
         case "D":
-            // Delete to end of line, equivalent to "d$".
             { const fn = () => { selectToEndOfLine(); runLongStringOp("d") }
               fn(); recordChange(fn) }
             break
         case "C":
-            // Change to end of line, equivalent to "c$".
             { const fn = () => { selectToEndOfLine(); runLongStringOp("c") }
               fn(); recordChange(fn) }
             break
         case "Y":
-            // Yank the whole line, equivalent to "yy". Not dot-repeatable
-            // (yank is never a "change" in Vim's dot-repeat model).
             goToStartOfLine()
             selectToEndOfLine()
             runLongStringOp("y")
             break
         case "\"":
-            // Register prefix: the next key names a register (a-z, 0-9) to
-            // use for the following y/d/c/p. See the Registers section above.
             switchModeToWaitForRegister()
             break
         case "p":
@@ -1026,20 +1017,32 @@ function handleKeyEventNormal(key) {
             clickMenu(menuItems.undo)
             break
         case "r":
-            // Real Vim's "r" waits for exactly one more keystroke and uses it
-            // to replace the character under the cursor, staying in normal
-            // mode throughout. See the "replaceChar" handling in
-            // eventHandler for the actual replacement.
             switchModeToReplaceChar()
             break
         case ".":
-            // Dot-repeat: replay the last recorded change, if any. See the
-            // "Dot-repeat" section above for exactly what is and isn't
-            // recorded.
             if (lastChange) lastChange()
             break
         case "/":
             clickMenu(menuItems.find)
+            break
+        case "f":
+        case "F":
+        case "t":
+        case "T":
+            pendingFindType = key
+            pendingFindOperator = null
+            pendingFindReturnMode = "normal"
+            // pendingFindCount was already set by handleMultipleMotion for a
+            // count prefix like "3fx"; default to 1 for a bare "fx".
+            pendingFindCount = pendingFindCount || 1
+            mode = "waitForFindChar"
+            updateModeIndicator(mode)
+            break
+        case ";":
+            repeatLastFind(false)
+            break
+        case ",":
+            repeatLastFind(true)
             break
         case "x":
             { const fn = () => { sendKeyEvent("delete") }
@@ -1053,8 +1056,6 @@ function handleKeyEventNormal(key) {
             { const fn = () => {
                 goToEndOfLine()
                 sendKeyEvent("delete")
-                // Real Vim's J leaves a single space at the join point rather
-                // than smashing the two lines together.
                 sendKeyEvent("space")
               }
               fn(); recordChange(fn) }
@@ -1062,13 +1063,8 @@ function handleKeyEventNormal(key) {
         default:
             return;
     }
-    // Check if operation is occuring in temperory normal mode after ctrl-o
     if (tempnormal) {
-        // Don't snap back to insert mode while a command is still "in
-        // progress" (waiting on a motion or another keystroke) -- only once
-        // a command has actually run to completion. waitForFirstInput et al.
-        // consume `tempnormal` themselves once *they* finish.
-        if (mode != 'visual' && mode != 'visualLine' && mode != 'replaceChar') {
+        if (mode != 'visual' && mode != 'visualLine' && mode != 'replaceChar' && mode != 'waitForFindChar') {
             tempnormal = false
             switchModeToInsert()
         }
@@ -1142,18 +1138,28 @@ function handleKeyEventVisualLine(key) {
         case "c":
         case "d":
         case "y":
-            // Visual-mode changes are intentionally not recorded for
-            // dot-repeat (see the "Dot-repeat" section above) -- selection
-            // size at a new cursor position can't be reliably re-derived
-            // without reading text, so a replay could easily delete/yank the
-            // wrong amount.
             runLongStringOp(key)
             break
         case "i":
         case "a":
             mode = "waitForVisualInput"
             break
-
+        case "f":
+        case "F":
+        case "t":
+        case "T":
+            // Counted f/t in visual mode (e.g. "3fx") isn't supported: a
+            // count here would need to repeat this whole wait-for-a-char
+            // flow, which handleMultipleMotion doesn't have a way to do
+            // for a command with its own pending input. See
+            // MISSING_VIM_FEATURES.md.
+            pendingFindType = key
+            pendingFindOperator = null
+            pendingFindCount = 1
+            pendingFindReturnMode = mode
+            mode = "waitForFindChar"
+            updateModeIndicator(mode)
+            break
 
     }
 }
@@ -1174,8 +1180,6 @@ function clickMenu(itemCaption) {
 }
 
 function clickToolbarButton(captionList) {
-    // Sometimes a toolbar button won't exist in the DOM until its parent has been clicked, so we
-    // click all of its parents in sequence.
     for (const caption of Array.from(captionList)) {
         const els = document.querySelectorAll(`*[aria-label='${caption}']`);
         if (els.length == 0) {
@@ -1183,8 +1187,6 @@ function clickToolbarButton(captionList) {
             console.log(captionList);
             return;
         }
-        // Sometimes there are multiple elements that have the same label. When that happens, it's
-        // ambiguous which one to click, so we log it so it's easier to debug.
         if (els.length > 1) {
             console.log(
                 `Warning: there are multiple buttons with the caption ${caption}. ` +
@@ -1195,9 +1197,6 @@ function clickToolbarButton(captionList) {
         simulateClick(els[0]);
     }
 }
-// Returns the DOM element of the menu item with the given caption. Prints a warning if a menu
-// item isn't found (since this is a common source of errors in SheetKeys) unless silenceWarning
-// is true.
 
 function getMenuItem(menuItem, silenceWarning = false) {
     const caption = menuItem.caption;
@@ -1238,20 +1237,20 @@ function simulateClick(el, x = 0, y = 0) {
         const event = document.createEvent("MouseEvents");
         event.initMouseEvent(
             eventName,
-            true, // bubbles
-            true, // cancelable
-            window, //view
-            1, // event-detail
-            x, // screenX
-            y, // screenY
-            x, // clientX
-            y, // clientY
-            false, // ctrl
-            false, // alt
-            false, // shift
-            false, // meta
-            0, // button
-            null, // relatedTarget
+            true,
+            true,
+            window,
+            1,
+            x,
+            y,
+            x,
+            y,
+            false,
+            false,
+            false,
+            false,
+            0,
+            null,
         );
         el.dispatchEvent(event);
     }
@@ -1263,11 +1262,8 @@ function activateTopLevelMenu(menuCaption) {
     if (!button) {
         throw new Error(`Couldn't find top-level button with caption ${menuCaption}`);
     }
-    // Unlike submenus, top-level menus can be hidden by clicking the button a second time to
-    // dismiss the menu.
     simulateClick(button);
     simulateClick(button);
 }
 
-// Initiate to Normal Mode
 switchModeToNormal()

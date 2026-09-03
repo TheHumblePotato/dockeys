@@ -47,6 +47,55 @@ commands entry below for the most extreme version of that same call.
 
 ## Implemented in this pass
 
+- **`f{char}`, `F{char}`, `t{char}`, `T{char}`** as normal-mode motions,
+  operator-pending motions (`df{char}`, `dF{char}`, `dt{char}`, `dT{char}`,
+  and the `c`/`y` equivalents), and visual-mode selection-extenders, plus
+  `;`/`,` to repeat the last one forward/backward. This is the first
+  DocsKeys motion that needs to know an actual character from the document,
+  which "The core constraint" above says DocsKeys can't do -- but `f`/`t`
+  only need to know the text of the *current line*, not the whole document,
+  and DocsKeys already has clipboard read/write permission for registers.
+  So instead of reading the DOM/canvas, `readCursorLineContext()` briefly
+  selects cursor-to-line-start and cursor-to-line-end with Home/End (the
+  same "line" `$`/`0`/`D`/`C` already use, i.e. the wrapped *display* line,
+  not the paragraph -- see Known limitations below), clicks Docs' own Copy
+  menu item, reads the OS clipboard, and collapses the selection back to
+  the original cursor position -- twice (once for the text after the
+  cursor, once for the text before), with the user's actual clipboard
+  contents saved before and restored after, reusing the exact save/restore
+  pattern `pasteRegister()` already established for named registers. Because
+  every `f`/`t` press does a fresh, live read rather than consulting a
+  cached copy of the document, this stays correct even while a collaborator
+  is editing elsewhere in the doc -- there's no stored state to drift out
+  of sync. The only accuracy risk is the read's own latency (roughly
+  150-300ms, two clipboard round-trips at `REGISTER_READ_DELAY_MS` each): a
+  collaborator editing at the exact cursor position during that window
+  could make the read stale before it's used. Considered acceptable for a
+  keystroke-triggered, non-realtime command.
+
+  The inclusive/exclusive step-counting was checked directly against Vim's
+  `:help f`/`:help t`/`:help F`/`:help T` (`f`/`t` inclusive, `F`/`T`
+  exclusive) and verified against Vim's own worked example in `:help
+  operator` ("abcXdef" with the cursor on `a`: `dfX` deletes `abcX`, `dtX`
+  deletes `abc`) with a standalone unit test of the step-count arithmetic
+  before wiring it into the keystroke layer, rather than trusting the
+  derivation by inspection alone.
+
+  One correctness subtlety specific to this Dvorak fork: the character
+  argument to `f`/`F`/`t`/`T` is read from the *raw, untranslated* `e.key`,
+  not the `translateKey()`-remapped value used for command letters
+  elsewhere in this file. `translateKey()` exists to turn a physically
+  Dvorak-typed key back into its QWERTY *command* label (so a physical key
+  still means "delete" regardless of layout); but the character after
+  `f`/`t` isn't a command, it's a literal character to search for in the
+  document, and `e.key` already reflects the correct on-screen character
+  under whatever OS keyboard layout is active. Translating it would search
+  for the wrong character. (The existing `r` replace-character command
+  sidesteps the same issue a different way: it never consumes the
+  translated `key` for the replacement character at all, instead letting
+  the untouched native keydown fall through to Google Docs after a
+  synthetic delete.)
+
 - **`e` bug fix (gets stuck on repeat).** `e` previously computed the exact
   same "next word start via Ctrl+Right" both on a fresh press and on a
   repeated press, so `ee`/`2e` never advanced past the first word -- visibly
@@ -176,8 +225,11 @@ commands entry below for the most extreme version of that same call.
 - **Marks** (`m{x}`, `` `{x} ``, `'{x}`) -- would need to persist cursor
   positions across time with no reliable way to translate a saved position
   back into cursor movement after the document has changed.
-- **Search motions** `f`/`F`/`t`/`T`/`;`/`,` and `/pattern<CR>`, `n`/`N` --
-  all need to read line/document text to find a target character or string.
+- **Pattern search** `/pattern<CR>`, `?pattern<CR>`, `n`/`N` -- these need to
+  read and search the *whole document* (or at least scroll-range) for an
+  arbitrary pattern, not just the current line, which is a meaningfully
+  bigger version of the "read document text" problem than `f`/`t` turned out
+  to be (see "Implemented in this pass" below for how `f`/`F`/`t`/`T` do it).
   `/` currently only opens Docs' Find dialog, which is a reasonable partial
   substitute but isn't Vim's incremental search-and-jump.
 - **`%`** (matching bracket/paren) -- needs text content.
@@ -244,6 +296,38 @@ commands entry below for the most extreme version of that same call.
   the true end of word.
 - **`W`/`E`/`B` are aliases of `w`/`e`/`b`,** not true WORD motions. See
   above.
+- **`f`/`F`/`t`/`T` are scoped to the wrapped display line, not the
+  paragraph.** They search within whatever Home/End already bounds -- same
+  as the existing `$`/`0`/`D`/`C` -- so on a long paragraph that wraps
+  across several screen lines, `f{char}` won't find a `{char}` that's
+  visually one line down but still part of the same paragraph. Real Vim's
+  own "line" is the buffer line (no hard wrap), so for a single unwrapped
+  Google Docs paragraph this is arguably the more Vim-consistent choice
+  anyway (Vim's `f`/`t` don't stop at soft-wrap boundaries either) -- but it
+  does mean a *paragraph* that Google Docs wraps across multiple display
+  lines behaves differently from a Vim buffer line that never wraps.
+- **`;`/`,` only repeat as a plain motion, not after an operator or in
+  visual mode.** `d;` and `v;` aren't implemented -- only bare `;`/`,` in
+  normal mode. Deferred to keep this first pass's surface area small;
+  wiring them into `waitForFirstInput` and `handleKeyEventVisualLine` the
+  same way `f`/`F`/`t`/`T` are would be straightforward follow-up work.
+- **Counted `f`/`t` in visual mode (`3fx`) isn't supported.** `handleMultipleMotion`'s
+  visual-mode branch repeats a command by calling its handler `n` times,
+  which works for immediate motions but doesn't compose with a command that
+  itself needs to wait for a follow-up keystroke -- doing `3fx` in visual
+  mode would open three separate wait-for-a-character states instead of
+  finding the 3rd occurrence. Normal-mode and operator-pending counts
+  (`3fx`, `d3fx`) work correctly; only the visual-mode case is affected.
+- **`f`/`F`/`t`/`T` briefly overwrite, then restore, the OS clipboard.**
+  Same tradeoff registers already accept: if something outside DocsKeys
+  writes to the clipboard in the same ~150-300ms window a find is running,
+  that write could be lost when DocsKeys restores its saved copy afterward.
+  Narrow window, but worth knowing about.
+- **`f`/`F`/`t`/`T`'s pending-input mode (`waitForFindChar`) inherits the
+  same `tempnormal` staleness bug already flagged below for `waitForFirstInput`
+  and `waitForRegister`**: `Ctrl+o` followed by `f{char}` currently reverts
+  to insert mode before the character is even read, for the same
+  not-yet-fixed reason described there.
 - **Registers are the least-tested feature in this codebase.** The
   Clipboard-API timing/permission caveats are real; if named registers
   misbehave in your browser, plain `y`/`d`/`c`/`p` (no `"reg` prefix) are
