@@ -248,8 +248,11 @@ function runDotRepeatable(fn, op) {
 }
 
 let registers = {}
-let pendingRegister = null 
-const REGISTER_READ_DELAY_MS = 80
+let pendingRegister = null
+let pendingRegisterAppend = false // true if the register was given as an UPPERCASE letter ("A -> append to "a)
+const CUT_REGISTER = "-"      // where a plain d/c (no explicit "reg) lands, matching Vim's small-delete register name
+const BLACKHOLE_REGISTER = "_" // writes here are discarded, matching Vim's "_
+const REGISTER_READ_DELAY_MS = 60 // was 80; lower this further if it proves reliable on a live Docs page, raise it if reads start coming back stale/truncated
 const REGISTER_STORAGE_KEY = "docskeys-registers"
 
 chrome.storage.local.get(REGISTER_STORAGE_KEY, (result) => {
@@ -274,25 +277,121 @@ function saveRegisters() {
     }
 }
 
+// "a-"z (or 0-9, or -/_) selects that register for the next y/d/c/p.
+// An UPPERCASE letter selects the same (lowercased) register in *append*
+// mode: the next y/d/c adds to what's already there instead of overwriting.
+// "_ is the black-hole register: anything "written" there is discarded, and
+// it always reads back empty, same as real Vim.
 function waitForRegisterInput(key) {
-    if (/^[a-z0-9]$/i.test(key)) {
+    if (/^[a-z0-9]$/.test(key)) {
+        pendingRegister = key
+        pendingRegisterAppend = false
+    } else if (/^[A-Z]$/.test(key)) {
         pendingRegister = key.toLowerCase()
+        pendingRegisterAppend = true
+    } else if (key === "-" || key === "_") {
+        pendingRegister = key
+        pendingRegisterAppend = false
     }
     mode = waitForRegisterReturnMode
     updateModeIndicator(mode)
 }
 
-async function captureClipboardIntoRegister(name) {
-    if (!name) return
-    try {
+function writeRegister(name, text, append) {
+    if (!name || name === BLACKHOLE_REGISTER) return
+    registers[name] = (append && registers[name] !== undefined) ? registers[name] + text : text
+    saveRegisters()
+}
+
+// Everything below this point is the y/d/c <-> clipboard/register wiring.
+// The core tension: Google Docs only exposes "what's selected" through its
+// own Cut/Copy menu items, which always write to the real OS clipboard --
+// there's no clipboard-free way to ask "what text is in this selection".
+// So capturing a register's contents always means briefly writing to the
+// real clipboard and reading it back. To keep a *plain* y/d/c from
+// permanently stepping on whatever the user had copied from somewhere else:
+//   - reading the clipboard's *current* contents (to know what to restore)
+//     has to happen before our own Copy/Cut call overwrites it, and that
+//     read is unavoidably async -- so register-qualified y/d/c/"reg commands
+//     carry one small clipboard-read's worth of latency before the actual
+//     edit happens. In practice this is a handful of ms, not the ~150-300ms
+//     read used for f/t/w/e/b (those wait out Docs' own async clipboard
+//     write; this is just reading whatever's already sitting there).
+//   - restoring the user's original clipboard afterward doesn't need to
+//     block anything, so it (and the register-write itself) happens in the
+//     background after the edit and mode switch are already done.
+//   - a *plain* y with no register keeps going straight to the OS clipboard
+//     exactly as before, with none of the above -- zero added latency.
+//   - a plain d/c with no register now defaults to the CUT_REGISTER ("-")
+//     instead of the OS clipboard, so frequent deletes stop overwriting
+//     whatever the user meant to paste elsewhere; "-p pastes it back, and
+//     ""p (the real OS clipboard) is untouched by cuts.
+//   - deletion itself always goes through Backspace on the active selection,
+//     never Docs' Cut menu item, specifically so a *plain* d/c never has to
+//     touch the clipboard system at all when going to the black-hole
+//     register, and so the register bookkeeping above is a clean side
+//     channel rather than being load-bearing for the deletion itself.
+let clipboardGuardQueue = Promise.resolve() // serializes the background register-capture/restore tail so rapid repeats (mashing "add) can't race and clobber each other's saved clipboard snapshot
+
+function queueRegisterCapture(targetReg, append, previousClipboard) {
+    clipboardGuardQueue = clipboardGuardQueue.then(async () => {
         await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
-        const text = await navigator.clipboard.readText()
-        registers[name] = text
-        saveRegisters()
-    } catch (err) {
-        console.warn(`DocsKeys: couldn't read clipboard into register "${name}" (best-effort feature; the default clipboard-backed register is unaffected)`, err)
+        try {
+            const text = await navigator.clipboard.readText()
+            writeRegister(targetReg, text, append)
+        } catch (err) {
+            console.warn(`DocsKeys: couldn't capture text into register "${targetReg}"`, err)
+        }
+        if (previousClipboard !== null) {
+            try {
+                await navigator.clipboard.writeText(previousClipboard)
+            } catch (err) {
+                console.warn("DocsKeys: couldn't restore clipboard", err)
+            }
+        }
+    })
+}
+
+async function deleteOrChangeSelection(reg, append, isChange, linewise) {
+    const targetReg = (reg === BLACKHOLE_REGISTER) ? null : (reg || CUT_REGISTER)
+    let previousClipboard = null
+    if (targetReg) {
+        try {
+            previousClipboard = await navigator.clipboard.readText()
+        } catch (err) {
+            // Can't save it, so there'll be nothing to restore -- proceed anyway.
+        }
+        clickMenu(menuItems.copy)
+    }
+    sendKeyEvent("backspace") // deletes the active selection; see the block comment above for why this is Backspace, not Docs' Cut
+    if (linewise) sendKeyEvent("backspace")
+    if (isChange) {
+        switchModeToInsert()
+    } else {
+        mode = "normal"
+        switchModeToNormal()
+    }
+    if (targetReg) {
+        queueRegisterCapture(targetReg, append, previousClipboard)
     }
 }
+
+async function yankSelection(reg, append) {
+    if (!reg) {
+        clickMenu(menuItems.copy) // straight to the OS clipboard, exactly as before -- no added latency
+        switchModeToNormal()
+        return
+    }
+    let previousClipboard = null
+    try {
+        previousClipboard = await navigator.clipboard.readText()
+    } catch (err) {
+    }
+    clickMenu(menuItems.copy)
+    switchModeToNormal()
+    queueRegisterCapture(reg, append, previousClipboard)
+}
+
 
 async function pasteRegister(name) {
     if (!name) {
@@ -323,54 +422,73 @@ async function pasteRegister(name) {
 }
 
 
-// Reads the text of the current wrapped display line, split at the cursor,
-// without ever touching the document: select cursor->end (Home/End key, same
-// as $/0), Copy, read the clipboard, collapse the selection back to the
-// original cursor position, then repeat for start->cursor. The user's real
-// clipboard is saved beforehand and restored afterward, mirroring the
-// save/restore pattern pasteRegister() already uses.
-//
-// Because this always reads the *live* selection at the moment it's called
-// (never a cached snapshot), it stays correct even if a collaborator is
-// editing elsewhere in the document -- there's no stale state to drift.
-// The only risk window is the ~150-300ms this takes to run: a collaborator
-// editing at this exact cursor position during that window could invalidate
-// the read. Considered an acceptable, documented limitation for now.
-async function readCursorLineContext() {
+// Wraps an action in a save-clipboard/restore-clipboard pair, the same
+// pattern pasteRegister() established. Used by every oracle read and by the
+// register-capture functions below.
+async function withClipboardSaved(fn) {
     let previousClipboard = null
     try {
         previousClipboard = await navigator.clipboard.readText()
     } catch (err) {
-        // Best-effort: if we can't read the existing clipboard we can't restore
-        // it later either, but we can still proceed with the find itself.
+        // Best-effort: if we can't read/save the existing clipboard we can't
+        // restore it later, but we can still run the action itself.
     }
-    let before = null
-    let after = null
     try {
-        sendKeyEvent("end", { shift: true })
-        clickMenu(menuItems.copy)
-        await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
-        after = await navigator.clipboard.readText()
-        sendKeyEvent("left") // collapses the selection back to its start (the original cursor)
-
-        sendKeyEvent("home", { shift: true })
-        clickMenu(menuItems.copy)
-        await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
-        before = await navigator.clipboard.readText()
-        sendKeyEvent("right") // collapses the selection back to its end (the original cursor)
-    } catch (err) {
-        console.warn("DocsKeys: couldn't read line text for f/F/t/T (best-effort feature; falling back to no-op)", err)
-        return null
+        return await fn()
     } finally {
         if (previousClipboard !== null) {
             try {
                 await navigator.clipboard.writeText(previousClipboard)
             } catch (err) {
-                console.warn("DocsKeys: couldn't restore clipboard after f/F/t/T read", err)
+                console.warn("DocsKeys: couldn't restore clipboard", err)
             }
         }
     }
-    return { before, after }
+}
+
+// Reads the text from the cursor to the end of the current wrapped display
+// line (same "line" $/0/D/C already use), via a temporary selection + Copy +
+// clipboard read, then collapses the selection back to the original cursor
+// position. Returns null on any failure. This is a live, on-demand read
+// every time -- never a cached snapshot -- so it stays correct even while a
+// collaborator is editing elsewhere in the doc.
+//
+// Split into single-direction reads (this, and readBeforeCursor() below)
+// rather than one function that always reads both: every current caller
+// (f/t, w/e, F/T, b) only ever needs one side, so this roughly halves the
+// number of clipboard round-trips compared to always reading both.
+async function readAfterCursor() {
+    return withClipboardSaved(async () => {
+        try {
+            sendKeyEvent("end", { shift: true })
+            clickMenu(menuItems.copy)
+            await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
+            const text = await navigator.clipboard.readText()
+            sendKeyEvent("left") // collapses the selection back to its start (the original cursor)
+            return text
+        } catch (err) {
+            console.warn("DocsKeys: couldn't read text after cursor (best-effort feature; falling back to no-op)", err)
+            return null
+        }
+    })
+}
+
+// Same as readAfterCursor(), but for the text from the start of the line to
+// the cursor.
+async function readBeforeCursor() {
+    return withClipboardSaved(async () => {
+        try {
+            sendKeyEvent("home", { shift: true })
+            clickMenu(menuItems.copy)
+            await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
+            const text = await navigator.clipboard.readText()
+            sendKeyEvent("right") // collapses the selection back to its end (the original cursor)
+            return text
+        } catch (err) {
+            console.warn("DocsKeys: couldn't read text before cursor (best-effort feature; falling back to no-op)", err)
+            return null
+        }
+    })
 }
 
 // `after` is the text from the cursor to end-of-line, so after[0] is the
@@ -422,9 +540,7 @@ function finishFind(returnMode) {
 // what "exclusive" backward means here. Verified against real Vim's
 // documented dfX/dtX/dFX/dTX behavior (e.g. cursor on 'a' in "abcXdef",
 // "dfX" deletes "abcX", "dtX" deletes "abc").
-function applyFindResult(type, steps, operator, returnMode) {
-    const forward = (type === "f" || type === "t")
-    const inclusive = (type === "f" || type === "t")
+function applyMotionSteps(forward, inclusive, steps, operator, returnMode) {
     const dirKey = forward ? "right" : "left"
 
     if (operator) {
@@ -448,17 +564,23 @@ function applyFindResult(type, steps, operator, returnMode) {
     switchModeToNormal()
 }
 
+function applyFindResult(type, steps, operator, returnMode) {
+    const forward = (type === "f" || type === "t")
+    const inclusive = (type === "f" || type === "t")
+    applyMotionSteps(forward, inclusive, steps, operator, returnMode)
+}
+
 async function performFind(type, char, count, operator, returnMode) {
-    const ctx = await readCursorLineContext()
-    if (!ctx) {
+    const forward = (type === "f" || type === "t")
+    const text = forward ? await readAfterCursor() : await readBeforeCursor()
+    if (text === null) {
         finishFind(returnMode)
         return
     }
-    const forward = (type === "f" || type === "t")
     const isTill = (type === "t" || type === "T")
     const result = forward
-        ? findForward(ctx.after, char, count)
-        : findBackward(ctx.before, char, count)
+        ? findForward(text, char, count)
+        : findBackward(text, char, count)
 
     if (!result.found) {
         console.warn(`DocsKeys: no match for ${type}${char} on this line`)
@@ -528,6 +650,36 @@ function goToEndOfLine() {
     sendKeyEvent("end")
 }
 
+// Real Vim's `^`/`_` land on the line's first non-blank character; `0` always
+// lands on column 0. DocsKeys previously treated all three identically. This
+// needs the *whole* current line (not just one side of the cursor), so
+// unlike f/t/w/e/b it reads both directions -- a rarer-invoked motion, so
+// the extra read is an acceptable trade for correctness here.
+async function goToFirstNonBlank(operator, returnMode) {
+    const before = await readBeforeCursor()
+    const after = await readAfterCursor()
+    if (before === null || after === null) {
+        finishFind(returnMode)
+        return
+    }
+    const full = before + after
+    const match = full.search(/\S/)
+    const firstNonBlank = (match === -1) ? 0 : match // an all-blank line: approximate as column 0 rather than real Vim's "last character" -- documented gap
+    const delta = firstNonBlank - before.length
+    if (delta === 0) {
+        if (operator) {
+            runLongStringOp(operator, false)
+        } else if (returnMode === "visual" || returnMode === "visualLine") {
+            mode = returnMode
+            updateModeIndicator(mode)
+        } else {
+            switchModeToNormal()
+        }
+        return
+    }
+    applyMotionSteps(delta > 0, false, Math.abs(delta), operator, returnMode)
+}
+
 function selectToStartOfLine() {
     sendKeyEvent("home", { shift: true })
 }
@@ -536,36 +688,171 @@ function selectToEndOfLine() {
     sendKeyEvent("end", { shift: true })
 }
 
-function selectToStartOfWord() {
-    sendKeyEvent("left", wordMods(true))
+// --- word / WORD motions (w, e, b, and true W, E, B) ---
+//
+// The previous implementation approximated `e` by nudging the cursor a fixed
+// 2 characters before a native Ctrl+Right word-jump, to dodge Ctrl+Right's
+// "always lands on the start of the next word" behavior when `e` needed to
+// land on a word's own end. That fixed nudge assumed the cursor was always
+// exactly at a previous end-of-word position (the repeated-press case,
+// `ee`/`2e`); on a *fresh* press from elsewhere in a word (e.g. from a
+// word's start), the same nudge overshot backward past the real end --
+// which is exactly what landing "between o and n" in "discussions" was.
+//
+// Now that DocsKeys can read line text (see f/F/t/T above), w/e/b/W/E/B are
+// computed exactly against Vim's actual word/WORD definitions instead of
+// guessed from Ctrl+Right/Ctrl+Left's behavior. This only knows about the
+// current wrapped display line, though (same scope as f/t) -- so if a
+// motion would need to continue onto the next line, these fall back to the
+// old native-keystroke behavior for that one press, which handles crossing
+// lines correctly (if not always with exact Vim word semantics right at the
+// boundary). See MISSING_VIM_FEATURES.md for exactly what that fallback
+// does and doesn't get right.
+
+function classifyWordChar(ch) {
+    if (/\s/.test(ch)) return "blank"
+    if (/[A-Za-z0-9_]/.test(ch)) return "keyword"
+    return "punct"
+}
+function classifyWORDChar(ch) {
+    return /\s/.test(ch) ? "blank" : "nonblank"
 }
 
-function selectToEndOfWord() {
-    sendKeyEvent("right", wordMods(true))
+// Forward, within `text` = cursor-to-end-of-line (text[0] = char under cursor).
+// Finds the end of the current word if there's more of it ahead, otherwise
+// the end of the next word -- this is what makes repeated `e`/`ee`/`2e`
+// naturally agree, per ":help ee/2e are the same".
+function findWordEnd(text, classify) {
+    const n = text.length
+    if (n === 0) return -1
+    const cls0 = classify(text[0])
+    const atEnd = cls0 !== "blank" && (1 >= n || classify(text[1]) !== cls0)
+    let i
+    if (cls0 === "blank" || atEnd) {
+        i = (cls0 === "blank") ? 0 : 1
+        while (i < n && classify(text[i]) === "blank") i++
+        if (i >= n) return -1
+        const cls = classify(text[i])
+        while (i + 1 < n && classify(text[i + 1]) === cls) i++
+        return i
+    }
+    let i2 = 0
+    while (i2 + 1 < n && classify(text[i2 + 1]) === cls0) i2++
+    return i2
 }
 
-function goToEndOfWord() {
-    sendKeyEvent("right", wordMods())
+// Forward, within `text` = cursor-to-end-of-line. Finds the start of the next word.
+function findWordStart(text, classify) {
+    const n = text.length
+    if (n === 0) return -1
+    let i = 0
+    const cls0 = classify(text[0])
+    if (cls0 !== "blank") {
+        while (i < n && classify(text[i]) === cls0) i++
+    }
+    while (i < n && classify(text[i]) === "blank") i++
+    if (i >= n) return -1
+    return i
 }
 
-function goToStartOfWord() {
-    sendKeyEvent("left", wordMods())
+// Backward, within `text` = start-of-line-to-cursor. Finds the start of the
+// previous word, returned as a distance (steps left) from the cursor.
+function findWordStartBackward(text, classify) {
+    let i = text.length
+    if (i === 0) return -1
+    i--
+    while (i >= 0 && classify(text[i]) === "blank") i--
+    if (i < 0) return -1
+    const cls = classify(text[i])
+    while (i - 1 >= 0 && classify(text[i - 1]) === cls) i--
+    return text.length - i
 }
 
-function goToEndOfWordVim() {
-    sendKeyEvent("right")
-    sendKeyEvent("right")
-    sendKeyEvent("right", wordMods())
-    sendKeyEvent("left")
-    sendKeyEvent("left")
+// Applies one of the four finder functions `count` times in a row, each time
+// re-slicing the text so the previous match becomes the new "cursor".
+function countedWordSteps(text, classify, count, finder, backward) {
+    let t = text
+    let total = 0
+    for (let n = 0; n < count; n++) {
+        const step = finder(t, classify)
+        if (step === -1) return -1
+        total += step
+        t = backward ? t.slice(0, t.length - step) : t.slice(step)
+    }
+    return total
 }
 
-function selectToEndOfWordVim() {
-    sendKeyEvent("right", { shift: true })
-    sendKeyEvent("right", { shift: true })
-    sendKeyEvent("right", wordMods(true))
-    sendKeyEvent("left", { shift: true })
-    sendKeyEvent("left", { shift: true })
+// Fallback for when a motion runs off the end of what we've read (i.e. it
+// would need to continue onto another line): reproduces the old
+// native-Ctrl+Right/Ctrl+Left-based behavior for exactly that one press.
+function fallbackWordMotion(forward, shift) {
+    sendKeyEvent(forward ? "right" : "left", wordMods(shift))
+}
+function fallbackWordEnd(shift) {
+    // The old repeat-nudge heuristic -- kept only as the cross-line fallback,
+    // where its "assume we're at a previous end-of-word" premise is a much
+    // smaller approximation than it was as the primary implementation.
+    sendKeyEvent(shift ? "right" : "right", { shift })
+    sendKeyEvent("right", { shift })
+    sendKeyEvent("right", wordMods(shift))
+    sendKeyEvent("left", { shift })
+    sendKeyEvent("left", { shift })
+}
+
+// Guards against a second w/e/b press firing an overlapping async read while
+// one is already in flight (there's no "waiting for input" mode transition
+// for these, unlike f/t, so eventHandler would otherwise happily dispatch a
+// second call mid-read).
+let wordMotionBusy = false
+let pendingWordCount = 1
+let pendingLineCount = 1
+
+async function performWordMotion(kind, classify, count, operator, returnMode) {
+    if (wordMotionBusy) return
+    wordMotionBusy = true
+    try {
+        await performWordMotionInner(kind, classify, count, operator, returnMode)
+    } finally {
+        wordMotionBusy = false
+    }
+}
+
+async function performWordMotionInner(kind, classify, count, operator, returnMode) {
+    const forward = (kind === "e" || kind === "w")
+    const inclusive = (kind === "e")
+    const text = forward ? await readAfterCursor() : await readBeforeCursor()
+
+    if (text === null) {
+        finishFind(returnMode) // oracle read failed -- bail out to normal, same as f/t
+        return
+    }
+
+    const finder = kind === "e" ? findWordEnd
+        : kind === "w" ? findWordStart
+        : findWordStartBackward // "b"
+    const steps = countedWordSteps(text, classify, count, finder, !forward)
+
+    if (steps === -1) {
+        // Ran off the end of the current line -- fall back to the native
+        // motion for this one press rather than silently doing nothing.
+        const shift = !!operator || returnMode === "visual" || returnMode === "visualLine"
+        if (kind === "e") {
+            fallbackWordEnd(shift)
+        } else {
+            fallbackWordMotion(forward, shift)
+        }
+        if (operator) {
+            runLongStringOp(operator, false)
+        } else if (returnMode === "visual" || returnMode === "visualLine") {
+            mode = returnMode
+            updateModeIndicator(mode)
+        } else {
+            switchModeToNormal()
+        }
+        return
+    }
+
+    applyMotionSteps(forward, inclusive, steps, operator, returnMode)
 }
 
 function goToDocStart(shift = false) {
@@ -600,6 +887,14 @@ function goToStartOfPara(shift = false) {
     sendKeyEvent("up", paragraphMods(shift))
 }
 
+function selectToEndOfLineCounted(count) {
+    selectToEndOfLine()
+    for (let i = 1; i < count; i++) {
+        sendKeyEvent("down", { shift: true })
+        sendKeyEvent("end", { shift: true })
+    }
+}
+
 function selectLinesDown(count) {
     goToStartOfLine()
     sendKeyEvent("end", { shift: true })
@@ -632,24 +927,18 @@ function addLineBottom() {
 
 function runLongStringOp(operation = longStringOp, linewise = false) {
     const reg = pendingRegister
+    const append = pendingRegisterAppend
     pendingRegister = null
+    pendingRegisterAppend = false
     switch (operation) {
         case "c":
-            clickMenu(menuItems.cut)
-            captureClipboardIntoRegister(reg)
-            switchModeToInsert()
+            deleteOrChangeSelection(reg, append, true, linewise)
             break
         case "d":
-            clickMenu(menuItems.cut)
-            captureClipboardIntoRegister(reg)
-            if (linewise) sendKeyEvent('backspace')
-            mode = 'normal'
-            switchModeToNormal()
+            deleteOrChangeSelection(reg, append, false, linewise)
             break
         case "y":
-            clickMenu(menuItems.copy)
-            captureClipboardIntoRegister(reg)
-            switchModeToNormal()
+            yankSelection(reg, append)
             break
         case "p":
             pasteRegister(reg)
@@ -664,10 +953,10 @@ function runLongStringOp(operation = longStringOp, linewise = false) {
 }
 
 
-function waitForSecondInput(key) {
+async function waitForSecondInput(key) {
     switch (key) {
         case "w":
-            goToStartOfWord()
+            await performWordMotion("b", classifyWordChar, 1, null, "normal")
             waitForFirstInput(key)
             break
         case "p":
@@ -695,16 +984,16 @@ function waitForFirstInput(key) {
             switchModeToWait2()
             break
         case "w":
-        case "W": 
-            runDotRepeatable(() => { repeatMotion(selectToEndOfWord, count); runLongStringOp(op) }, op)
+        case "W":
+            performWordMotion("w", key === "W" ? classifyWORDChar : classifyWordChar, count, op, "normal")
             break
         case "e":
         case "E":
-            runDotRepeatable(() => { repeatMotion(selectToEndOfWordVim, count); runLongStringOp(op) }, op)
+            performWordMotion("e", key === "E" ? classifyWORDChar : classifyWordChar, count, op, "normal")
             break
         case "b":
         case "B":
-            runDotRepeatable(() => { repeatMotion(selectToStartOfWord, count); runLongStringOp(op) }, op)
+            performWordMotion("b", key === "B" ? classifyWORDChar : classifyWordChar, count, op, "normal")
             break
         case "h":
             runDotRepeatable(() => { repeatMotion(() => sendKeyEvent("left", { shift: true }), count); runLongStringOp(op) }, op)
@@ -727,6 +1016,8 @@ function waitForFirstInput(key) {
             break
         case "^":
         case "_":
+            goToFirstNonBlank(op, "normal")
+            break
         case "0":
             runDotRepeatable(() => { selectToStartOfLine(); runLongStringOp(op) }, op)
             break
@@ -766,12 +1057,12 @@ function waitForFirstInput(key) {
     }
 }
 
-function waitForVisualInput(key) {
+async function waitForVisualInput(key) {
     switch (key) {
         case "w":
-            sendKeyEvent("left",{control:true})
-            goToStartOfWord()
-            selectToEndOfWord()
+            sendKeyEvent("left", { control: true })
+            await performWordMotion("b", classifyWordChar, 1, null, "normal")
+            await performWordMotion("w", classifyWordChar, 1, null, "visual")
             break
         case "p":
             goToStartOfPara()
@@ -799,6 +1090,20 @@ function handleMultipleMotion(key) {
 
     if (targetMode === "normal" && (key === "f" || key === "F" || key === "t" || key === "T")) {
         pendingFindCount = times
+        handleKeyEventNormal(key)
+        multipleMotion.times = 0
+        return
+    }
+
+    if (targetMode === "normal" && (key === "w" || key === "W" || key === "e" || key === "E" || key === "b" || key === "B")) {
+        pendingWordCount = times
+        handleKeyEventNormal(key)
+        multipleMotion.times = 0
+        return
+    }
+
+    if (targetMode === "normal" && (key === "D" || key === "C" || key === "Y")) {
+        pendingLineCount = times
         handleKeyEventNormal(key)
         multipleMotion.times = 0
         return
@@ -927,23 +1232,18 @@ function handleKeyEventNormal(key) {
             goToStartOfPara()
             break
         case "b":
-            goToStartOfWord()
-            break
         case "B":
-            goToStartOfWord()
-            break
         case "e":
-            goToEndOfWordVim()
-            break
         case "E":
-            goToEndOfWordVim()
-            break
         case "w":
-            goToEndOfWord()
+        case "W": {
+            const isWORD = (key === "B" || key === "E" || key === "W")
+            const kind = (key === "b" || key === "B") ? "b" : (key === "e" || key === "E") ? "e" : "w"
+            const wcount = pendingWordCount || 1
+            pendingWordCount = 1
+            performWordMotion(kind, isWORD ? classifyWORDChar : classifyWordChar, wcount, null, "normal")
             break
-        case "W":
-            goToEndOfWord()
-            break
+        }
         case "g":
             goToDocStart()
             break
@@ -957,17 +1257,22 @@ function handleKeyEventNormal(key) {
             mode = "waitForFirstInput"
             break
         case "D":
-            { const fn = () => { selectToEndOfLine(); runLongStringOp("d") }
+            { const lcount = pendingLineCount || 1
+              pendingLineCount = 1
+              const fn = () => { selectToEndOfLineCounted(lcount); runLongStringOp("d") }
               fn(); recordChange(fn) }
             break
         case "C":
-            { const fn = () => { selectToEndOfLine(); runLongStringOp("c") }
+            { const lcount = pendingLineCount || 1
+              pendingLineCount = 1
+              const fn = () => { selectToEndOfLineCounted(lcount); runLongStringOp("c") }
               fn(); recordChange(fn) }
             break
         case "Y":
-            goToStartOfLine()
-            selectToEndOfLine()
-            runLongStringOp("y")
+            { const lcount = pendingLineCount || 1
+              pendingLineCount = 1
+              selectLinesDown(lcount - 1)
+              runLongStringOp("y") }
             break
         case "\"":
             switchModeToWaitForRegister()
@@ -987,6 +1292,8 @@ function handleKeyEventNormal(key) {
             break
         case "^":
         case "_":
+            goToFirstNonBlank(null, "normal")
+            break
         case "0":
             goToStartOfLine()
             break
@@ -1111,18 +1418,20 @@ function handleKeyEventVisualLine(key) {
             break
         case "b":
         case "B":
-            selectToStartOfWord()
+            performWordMotion("b", key === "B" ? classifyWORDChar : classifyWordChar, 1, null, mode)
             break
         case "e":
         case "E":
-            selectToEndOfWordVim()
+            performWordMotion("e", key === "E" ? classifyWORDChar : classifyWordChar, 1, null, mode)
             break
         case "w":
         case "W":
-            selectToEndOfWord()
+            performWordMotion("w", key === "W" ? classifyWORDChar : classifyWordChar, 1, null, mode)
             break
         case "^":
         case "_":
+            goToFirstNonBlank(null, mode)
+            break
         case "0":
             selectToStartOfLine()
             break

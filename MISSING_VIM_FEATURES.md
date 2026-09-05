@@ -47,6 +47,97 @@ commands entry below for the most extreme version of that same call.
 
 ## Implemented in this pass
 
+- **`e` bug fix (landing mid-word, e.g. between 'o' and 'n' in "discussions").**
+  Root cause: the previous fix for the `ee`/`2e` repeat-press bug (see
+  "Implemented in the previous pass" below) nudged the cursor forward a fixed
+  2 characters before a native Ctrl+Right word-jump, on the assumption the
+  cursor was always sitting at a *previous* end-of-word position. That's true
+  for a repeated press, but not for a fresh press from elsewhere in a word --
+  there the same fixed nudge overshoots past the word's real end. Fixed by
+  replacing the whole Ctrl+Right-based heuristic with an exact
+  implementation: `w`/`e`/`b` (and now true `W`/`E`/`B`) are computed by
+  reading the current line's text (the same clipboard-based oracle `f`/`t`
+  use) and tokenizing it against Vim's actual word/WORD definitions --
+  `word` = a run of `[A-Za-z0-9_]` or a run of other non-blank characters,
+  `WORD` = any run of non-blank characters -- then counting the exact number
+  of characters to move. Checked against Vim's own "`ee` and `2e` are the
+  same" example directly (a unit test that repeats a single `e` twice and
+  compares it against a counted `2e` on the same text), not just derived by
+  inspection.
+
+  This only knows about the current wrapped display line, the same scope
+  `f`/`t` have. When a motion would need to continue onto another line (e.g.
+  `w` from the last word of a line), it falls back to the old native
+  Ctrl+Right/Ctrl+Left-based behavior for that one press -- exact within a
+  line, approximate only at line-crossings, rather than approximate
+  everywhere as before.
+
+- **True `W`, `E`, `B`.** Previously honest aliases of `w`/`e`/`b` (see below
+  -- this used to be the "not practical" answer, since telling word from
+  WORD boundaries needs to read text DocsKeys couldn't read at the time).
+  Now that the oracle exists, `W`/`E`/`B` tokenize with the WORD (whitespace
+  is the only boundary) instead of word (alnum/punctuation/whitespace all
+  boundaries) classifier, and are genuinely distinct from lowercase `w`/`e`/`b`.
+
+- **Register/clipboard semantics overhaul.** Previously every `y`/`d`/`c` --
+  named register or not -- went through Docs' Cut/Copy menu items, which
+  always write to the real OS clipboard; a named-register yank (`"ayy`)
+  silently clobbered whatever the user had copied from elsewhere, with no way
+  to get it back. New behavior:
+  - Plain `y` (no register): unchanged, goes straight to the OS clipboard.
+  - `"{reg}y`: captured into that register only; the real OS clipboard is
+    saved beforehand and restored afterward, so it's untouched by the end of
+    the command.
+  - Plain `d`/`c` (no register): now land in a new default register (`"-`,
+    matching Vim's actual small-delete register name, though DocsKeys
+    applies it to every cut rather than just character-wise-small ones) as
+    an approximation) instead of the OS clipboard -- so repeated deleting no
+    longer overwrites what the user meant to paste elsewhere. `"-p` pastes
+    the last cut back; the real clipboard (`p` with no register) is
+    unaffected by cuts.
+  - `"{reg}d`/`"{reg}c`: land only in that register, same as `y`.
+  - Register append mode: an uppercase register letter (`"Ayy`) appends to
+    that register instead of overwriting it, per real Vim.
+  - Black-hole register (`"_dd`): discards the deleted text entirely rather
+    than storing it anywhere.
+
+  Mechanically, deletion now always goes through synthetic Backspace on the
+  active selection rather than Docs' Cut menu item, specifically so a delete
+  to the black-hole register (or, in principle, a hypothetical future
+  "don't bother with any register" mode) never has to touch the clipboard
+  system at all. When a register capture *is* needed, the current OS
+  clipboard is read (to know what to restore) before the capturing Copy
+  click, and the read-back-and-restore happens in the background after the
+  edit and mode switch are already done, so it doesn't block anything visible
+  beyond that one initial clipboard read. Concurrent register-touching
+  commands (e.g. mashing `"add` quickly) are serialized through a small
+  promise queue so they can't race and clobber each other's saved clipboard
+  snapshot.
+
+- **Latency reduction for the text-reading oracle.** `f`/`F`/`t`/`T` (and now
+  `w`/`e`/`b`) previously always read *both* directions around the cursor
+  even though every caller only ever needs one side. Split into
+  `readAfterCursor()`/`readBeforeCursor()`, each doing a single
+  select+Copy+read+collapse instead of two -- roughly halves the round-trip
+  latency for these commands. Also lowered `REGISTER_READ_DELAY_MS` from 80ms
+  to 60ms; this hasn't been tuned against a live Docs page, so it may need
+  raising back up if reads start coming back stale/truncated.
+
+- **`^`/`_` vs `0`.** Previously identical (see "Known limitations" in the
+  last pass). `^`/`_` now read the whole current line (both directions, via
+  the oracle -- the one motion in this pass that needs both sides, since
+  "first non-blank" is a property of the whole line rather than one side of
+  the cursor) and move to the actual first non-blank character; `0` is
+  unchanged (still the fast, oracle-free native Home).
+
+- **Counted `D`/`C`/`Y` (`3D`, `3C`, `3Y`).** Previously didn't span multiple
+  lines the way `3dd`/`3yy` do (see "Known limitations" in the last pass).
+  Now `3D` deletes from the cursor to the end of the current line plus the
+  next 2 full lines, matching `:help D`'s "and [count-1] more lines"; `3Y`
+  yanks 3 full lines, matching `3yy`.
+
+
+
 - **`f{char}`, `F{char}`, `t{char}`, `T{char}`** as normal-mode motions,
   operator-pending motions (`df{char}`, `dF{char}`, `dt{char}`, `dT{char}`,
   and the `c`/`y` equivalents), and visual-mode selection-extenders, plus
@@ -206,13 +297,11 @@ commands entry below for the most extreme version of that same call.
 ### Medium practicality
 
 - **True `iw` vs `aw` (and `ip` vs `ap`) distinction.** Right now both
-  behave like the "inner" variant (see Known limitations). An approximate fix
-  (extend the "a" selection by one extra word-boundary jump) is plausible but
-  can't reliably match Vim's actual whitespace-aware behavior without reading
-  the line.
-- **Register append (`"A`) and black-hole register (`"_`).** Natural
-  extensions of the existing registers work; deferred to keep that
-  (already-least-tested) feature's surface area small.
+  behave like the "inner" variant (see Known limitations). This is more
+  tractable than it used to be -- the word/WORD tokenizer built for `w`/`e`/`b`
+  (see "Implemented in this pass" above) already knows exactly where a
+  word's whitespace-inclusive "a" boundary would be -- but it hasn't been
+  wired up yet.
 
 ### Low practicality
 
@@ -252,9 +341,6 @@ commands entry below for the most extreme version of that same call.
   additionally require knowing where the selection boundary landed, which
   needs text content -- excluded rather than shipped as a worse
   approximation of an already-approximate Vim feature.
-- **True word/WORD distinction for `w`/`W`, `e`/`E`, `b`/`B`.** See "W, E, B"
-  above -- currently honest aliases, since this needs to read text to
-  distinguish punctuation from whitespace boundaries.
 - **`gg` as a true double-`g` prefix.** Real Vim's `gg` (go to top) requires
   two `g` presses, with a single `g` being a pending prefix for a family of
   `g`-commands (`ge`, `gE`, `g_`, ...). This project binds a single `g` press
@@ -275,27 +361,25 @@ commands entry below for the most extreme version of that same call.
 
 ## Known limitations / inconsistencies (not bugs per se)
 
-- **`d^`, `d_`, `d0` are all identical** (delete to column 0), rather than
-  `d^` targeting the first non-blank character specifically. Same for `c^`
-  vs `c_`/`c0`, and `y^` vs `y_`/`y0`. This requires knowing where the first
-  non-blank character is, which needs line content.
 - **`iw`/`aw` (and `ip`/`ap`) are currently identical.** Both act like the
   "inner" variant; the "a" variants don't extend the selection to include
   surrounding whitespace the way real Vim does.
-- **Counted linewise commands (`3D`, `3Y`, `3C`) don't multi-line the way
-  `3dd`/`3yy` do.** `dd`/`yy` (and `cc`) have dedicated count-aware selection
-  logic; `D`/`C`/`Y` were implemented by reusing the simpler single-line
-  `selectToEndOfLine`/whole-line-select helpers for consistency with the rest
-  of the file, so a leading count on them just repeats the single-line
-  command via the generic `multipleMotion` path instead of spanning multiple
-  lines. Low-impact since `D`/`C`/`Y` are rarely used with a count in
-  practice.
 - **`e`'s fix is a single-space approximation.** See "Implemented in this
   pass" above -- multiple spaces/tabs between words, or words directly
   adjacent to punctuation, can still land `e` one or more characters short of
   the true end of word.
-- **`W`/`E`/`B` are aliases of `w`/`e`/`b`,** not true WORD motions. See
-  above.
+- **`x`/`s` don't populate any register yet.** Real Vim's `x`/`s` write to
+  the unnamed and small-delete registers same as any other delete; DocsKeys'
+  `x`/`s` still just send a plain native Delete key, untouched by this
+  pass's register work.
+- **Register-qualified `y`/`d`/`c` (`"ayy`, plain `dd`/`cc` now included,
+  since they default to `"-`) carry one small added latency step**: reading
+  the OS clipboard's *current* contents (to know what to restore afterward)
+  before the capturing Copy click. This is a plain `clipboard.readText()`
+  with no artificial delay attached (unlike the ~60ms settle wait used after
+  Docs' own Copy/Cut), so it should be on the order of a few ms in practice,
+  but it's not zero the way a bare `y` (real OS clipboard, no register) still
+  is.
 - **`f`/`F`/`t`/`T` are scoped to the wrapped display line, not the
   paragraph.** They search within whatever Home/End already bounds -- same
   as the existing `$`/`0`/`D`/`C` -- so on a long paragraph that wraps

@@ -56,11 +56,10 @@ including which of these are "not practical" vs. just "not done yet."
   Repeated presses (`ee`/`2e`) correctly keep advancing word-by-word. Still a
   single-space approximation around multi-space runs or punctuation directly
   adjacent to a word -- see MISSING_VIM_FEATURES.md.
-- `W`, `E`, `B` - WORD-wise equivalents of `w`/`e`/`b`. **Currently behave
-  identically to their lowercase counterparts**: real Vim's WORD motions
-  ignore punctuation and only stop at whitespace, but telling that apart from
-  Google Docs' own word-jump requires reading line content, which DocsKeys
-  can't do. See MISSING_VIM_FEATURES.md.
+- `W`, `E`, `B` - True WORD-wise equivalents of `w`/`e`/`b`: whitespace is the
+  only boundary (punctuation doesn't split a WORD the way it splits a word).
+  Uses the same text-reading mechanism as `f`/`F`/`t`/`T` -- see "How DocsKeys
+  reads the document" below.
 - `f{char}` / `F{char}` - Move to the next/previous occurrence of `{char}` on
   the current line, landing on it (inclusive if used with an operator, e.g.
   `dfx`).
@@ -75,22 +74,23 @@ including which of these are "not practical" vs. just "not done yet."
   `;`/`,` only work as plain motions so far, not after an operator or in
   visual mode).
 
-### How f/F/t/T read the document
+### How DocsKeys reads the document
 
 The section above explains why DocsKeys can't read arbitrary document text.
-`f`/`F`/`t`/`T` get around a narrower version of that problem using a
-mechanism DocsKeys already had: the same clipboard permission and
-save/restore pattern used for named registers. To answer "what character is
-next?", DocsKeys briefly selects from the cursor to the start (and
-separately, the end) of the current line with Home/End, clicks Google Docs'
-own Copy menu item, reads the result back from the OS clipboard, and then
-collapses the selection back to exactly where the cursor started -- all
-before the user's own clipboard contents (saved beforehand) are restored.
-This is a live, on-demand read every time, not a cached copy of the
-document, so it stays correct even while collaborators are editing
-elsewhere in the doc; the only risk window is the couple hundred
-milliseconds the read itself takes. See MISSING_VIM_FEATURES.md for the
-latency and scoping caveats.
+`f`/`F`/`t`/`T` and `w`/`e`/`b`/`W`/`E`/`B` get around a narrower version of
+that problem using a mechanism DocsKeys already had: the same clipboard
+permission and save/restore pattern used for named registers. To answer
+"what's on this line?", DocsKeys briefly selects from the cursor to the start
+(or the end) of the current line with Home/End, clicks Google Docs' own Copy
+menu item, reads the result back from the OS clipboard, and then collapses
+the selection back to exactly where the cursor started -- all before the
+user's own clipboard contents (saved beforehand) are restored. This is a
+live, on-demand read every time, not a cached copy of the document, so it
+stays correct even while collaborators are editing elsewhere in the doc; the
+only risk window is the read itself, which only touches one side of the
+cursor (whichever the motion needs) and takes on the order of a hundred
+milliseconds or so. See MISSING_VIM_FEATURES.md for the latency and scoping
+caveats.
 
 ### Numbered Prefixed Motions
 
@@ -106,9 +106,9 @@ A count also works immediately before an operator, e.g. `3dw` deletes 3
 words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
 
 #### Line Navigation
-- `0` or `^` or `_` - Go to start of line (DocsKeys does not currently
-  distinguish `^`'s "first non-blank character" from `0`'s "column 0", since
-  that requires reading line content -- see MISSING_VIM_FEATURES.md)
+- `0` - Go to column 0 of the line (fast, native, no document read needed)
+- `^` or `_` - Go to the line's first non-blank character (reads the current
+  line the same way `f`/`t` do -- see "How DocsKeys reads the document")
 - `$` - Go to end of line
 - `I` - Go to start of line and enter insert mode
 - `A` - Go to end of line and enter insert mode
@@ -143,9 +143,12 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
     cursor (same as `x`), `dh` deletes the character(s) before the cursor.
 - `c` + motion - Change (same motion set as `d` above)
 - `y` + motion - Yank/copy (same motion set as `d` above)
-- `D` - Delete to end of line (equivalent to `d$`)
-- `C` - Change to end of line (equivalent to `c$`)
-- `Y` - Yank the whole line (equivalent to `yy`)
+- `D` - Delete to end of line (equivalent to `d$`). A count spans lines like
+  Vim's does: `3D` deletes to end of line plus the next 2 full lines.
+- `C` - Change to end of line (equivalent to `c$`), with the same counted
+  behavior as `D`.
+- `Y` - Yank the whole line (equivalent to `yy`), with the same counted
+  behavior as `yy`/`dd` (`3Y` yanks 3 full lines).
 - `r` + character - Replace the character under the cursor with the next
   character you type, without leaving normal mode
 - `p` - Paste
@@ -160,16 +163,29 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
   typed last time -- see MISSING_VIM_FEATURES.md for why. `r{char}` and
   yank commands are intentionally not dot-repeatable.
 - `"{register}` before `y`/`d`/`c`/`p` - use a named register (`a`-`z`,
-  `0`-`9`) instead of the default clipboard-backed register, e.g. `"ayy`
-  yanks the line into register `a`, `"ap` pastes it back. Plain `y`/`d`/`c`/
-  `p` with no `"reg` prefix keep using the OS clipboard directly, exactly as
-  before. This is the newest and least-tested feature here -- see
-  MISSING_VIM_FEATURES.md for the caveats.
+  `0`-`9`) instead of the default. Registers now behave much closer to real
+  Vim:
+  - Plain `y` with no register goes straight to the OS clipboard, exactly as
+    before -- use it to copy something out of Google Docs.
+  - Plain `d`/`c` with no register no longer touch the OS clipboard at all --
+    they land in a dedicated cut register (`"-`) instead, so repeated
+    deleting doesn't overwrite whatever you meant to paste elsewhere. `"-p`
+    pastes your last cut back.
+  - `"{reg}y`/`"{reg}d`/`"{reg}c` capture into that register only; the real
+    OS clipboard is saved and restored around the command, so it's left
+    exactly as it was.
+  - An uppercase register (`"Ayy`) appends to that register instead of
+    overwriting it.
+  - `"_` is the black-hole register: `"_dd` deletes without storing the text
+    anywhere.
+  - This is still one of the newer, less-tested parts of DocsKeys -- see
+    MISSING_VIM_FEATURES.md for the caveats.
 
 Note: DocsKeys' `iw`/`aw` (and `ip`/`ap`) text objects currently behave
 identically -- both act like the "inner" variant. Real Vim's "a" (around)
-variants additionally grab surrounding whitespace, which DocsKeys can't
-detect without reading line content. See MISSING_VIM_FEATURES.md.
+variants additionally grab surrounding whitespace; DocsKeys can now read
+enough of the line to do this (the same word/WORD tokenizer that powers
+`w`/`e`/`b`), it's just not wired up yet. See MISSING_VIM_FEATURES.md.
 
 #### Line Operations
 - `o` - Add new line below and enter insert mode

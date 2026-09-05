@@ -135,7 +135,7 @@
             </div>
             <div class="shortcut">
                 <div class="key">w / W</div>
-                <div class="description">Next word (W/E/B currently alias w/e/b, see docs)</div>
+                <div class="description">Next word (W is a true WORD motion: only whitespace splits it)</div>
             </div>
             <div class="shortcut">
                 <div class="key">b / B</div>
@@ -308,7 +308,7 @@
              <div class="tip-content">
                 <b>.</b> repeats deletes/changes/paste, but can't retype text you typed during an insert-mode change (e.g. after <span class="key inline">cw</span> you'll need to type the replacement again). Yank and <span class="key inline">r</span> are never repeated by <b>.</b>
                 <br><br>
-                <b>"{reg}</b>, e.g. <span class="key inline">"ayy</span> then <span class="key inline">"ap</span>, uses a named register instead of the clipboard. Plain <span class="key inline">y</span>/<span class="key inline">d</span>/<span class="key inline">c</span>/<span class="key inline">p</span> always still use the clipboard directly. This is the newest, least-tested feature -- see MISSING_VIM_FEATURES.md.
+                <b>"{reg}</b>, e.g. <span class="key inline">"ayy</span> then <span class="key inline">"ap</span>, uses a named register instead of the clipboard, saving/restoring your real clipboard around the command. Plain <span class="key inline">y</span> still goes straight to the clipboard; plain <span class="key inline">d</span>/<span class="key inline">c</span> now land in a dedicated cut register ("-) instead, so deleting doesn't clobber your clipboard -- "-p pastes it back. Uppercase ("A) appends; "_ discards (black hole). Still one of the newer, less-tested features -- see MISSING_VIM_FEATURES.md.
              </div>
          </div>
     </div>
@@ -316,7 +316,7 @@
     <div class="tip">
         <div class="tip-title">Quick Tip</div>
         <div class="tip-content">
-            If you use Vimium/Surfing Keys, disable it for Google Docs. Also note: <span class="key inline">W</span>/<span class="key inline">E</span>/<span class="key inline">B</span> currently behave the same as <span class="key inline">w</span>/<span class="key inline">e</span>/<span class="key inline">b</span> -- see MISSING_VIM_FEATURES.md for why.
+            If you use Vimium/Surfing Keys, disable it for Google Docs.
         </div>
     </div>
 
