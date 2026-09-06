@@ -252,7 +252,7 @@ let pendingRegister = null
 let pendingRegisterAppend = false // true if the register was given as an UPPERCASE letter ("A -> append to "a)
 const CUT_REGISTER = "-"      // where a plain d/c (no explicit "reg) lands, matching Vim's small-delete register name
 const BLACKHOLE_REGISTER = "_" // writes here are discarded, matching Vim's "_
-const REGISTER_READ_DELAY_MS = 60 // was 80; lower this further if it proves reliable on a live Docs page, raise it if reads start coming back stale/truncated
+const PASTE_SETTLE_DELAY_MS = 40 // was 60/80 (formerly REGISTER_READ_DELAY_MS): only remaining fixed-delay wait, used to let Docs' paste actually consume the clipboard before pasteRegister() restores it. Polling doesn't apply here (we wrote the clipboard ourselves, so there's no "change" to detect -- we're waiting for Docs to *read* it, not write it). Unverified against a live Docs page; raise it if pastes intermittently pick up the wrong text.
 const REGISTER_STORAGE_KEY = "docskeys-registers"
 
 chrome.storage.local.get(REGISTER_STORAGE_KEY, (result) => {
@@ -335,12 +335,11 @@ let clipboardGuardQueue = Promise.resolve() // serializes the background registe
 
 function queueRegisterCapture(targetReg, append, previousClipboard) {
     clipboardGuardQueue = clipboardGuardQueue.then(async () => {
-        await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
-        try {
-            const text = await navigator.clipboard.readText()
+        const text = await pollClipboardForChange(previousClipboard)
+        if (text !== null) {
             writeRegister(targetReg, text, append)
-        } catch (err) {
-            console.warn(`DocsKeys: couldn't capture text into register "${targetReg}"`, err)
+        } else {
+            console.warn(`DocsKeys: couldn't capture text into register "${targetReg}"`)
         }
         if (previousClipboard !== null) {
             try {
@@ -412,7 +411,7 @@ async function pasteRegister(name) {
         await navigator.clipboard.writeText(text)
         clickMenu(menuItems.paste)
         if (previousClipboard !== null) {
-            await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
+            await new Promise((resolve) => setTimeout(resolve, PASTE_SETTLE_DELAY_MS))
             await navigator.clipboard.writeText(previousClipboard)
         }
     } catch (err) {
@@ -424,7 +423,24 @@ async function pasteRegister(name) {
 
 // Wraps an action in a save-clipboard/restore-clipboard pair, the same
 // pattern pasteRegister() established. Used by every oracle read and by the
-// register-capture functions below.
+// register-capture functions below. `fn` receives the saved previous
+// clipboard value so callers can also use it to detect when their own
+// Copy/Cut has actually landed (see pollClipboardForChange below), instead
+// of re-reading the clipboard a second time just to get the same value.
+//
+// The restore write is intentionally NOT awaited: the caller only cares
+// about `fn`'s result (the read text) and shouldn't have to wait on a
+// second clipboard round-trip just to get it back. The restore still
+// happens, just in the background. Tradeoff: if another oracle read fires
+// fast enough to read the clipboard's "previous" value before this one's
+// background restore has landed, it could see this call's temporary copied
+// text instead of the true original, and end up restoring that instead a
+// moment later. Rare in practice (would need two reads within single-digit
+// milliseconds of each other) and self-correcting-ish (the next read after
+// that would just treat this pass's contents as its own baseline), but
+// worth knowing about -- the alternative (fully serializing every oracle
+// read so this can never happen) reintroduces exactly the latency this is
+// trying to remove, so speed was prioritized here.
 async function withClipboardSaved(fn) {
     let previousClipboard = null
     try {
@@ -434,37 +450,71 @@ async function withClipboardSaved(fn) {
         // restore it later, but we can still run the action itself.
     }
     try {
-        return await fn()
+        return await fn(previousClipboard)
     } finally {
         if (previousClipboard !== null) {
-            try {
-                await navigator.clipboard.writeText(previousClipboard)
-            } catch (err) {
+            navigator.clipboard.writeText(previousClipboard).catch((err) => {
                 console.warn("DocsKeys: couldn't restore clipboard", err)
-            }
+            })
         }
+    }
+}
+
+// Waits for the clipboard to actually contain something different from
+// `previousText`, polling instead of a fixed delay. Google Docs' own
+// Copy/Cut click handler writes to the clipboard asynchronously, and how
+// long that takes isn't something DocsKeys can know in advance; a fixed
+// delay has to be pessimistic (long enough for the worst case), while
+// polling returns as soon as the write actually lands -- typically much
+// sooner. Falls back to "whatever's there now" after maxWaitMs so a copy
+// that happens to produce identical text to what was already on the
+// clipboard doesn't hang.
+async function pollClipboardForChange(previousText, maxWaitMs = 250, intervalMs = 12) {
+    const start = Date.now()
+    while (Date.now() - start < maxWaitMs) {
+        try {
+            const text = await navigator.clipboard.readText()
+            if (text !== previousText) return text
+        } catch (err) {
+            // keep polling; a transient read failure isn't necessarily final
+        }
+        await new Promise((resolve) => setTimeout(resolve, intervalMs))
+    }
+    try {
+        return await navigator.clipboard.readText()
+    } catch (err) {
+        return null
     }
 }
 
 // Reads the text from the cursor to the end of the current wrapped display
 // line (same "line" $/0/D/C already use), via a temporary selection + Copy +
-// clipboard read, then collapses the selection back to the original cursor
-// position. Returns null on any failure. This is a live, on-demand read
-// every time -- never a cached snapshot -- so it stays correct even while a
-// collaborator is editing elsewhere in the doc.
+// clipboard read. Returns null on any failure. This is a live, on-demand
+// read every time -- never a cached snapshot -- so it stays correct even
+// while a collaborator is editing elsewhere in the doc.
 //
 // Split into single-direction reads (this, and readBeforeCursor() below)
 // rather than one function that always reads both: every current caller
 // (f/t, w/e, F/T, b) only ever needs one side, so this roughly halves the
 // number of clipboard round-trips compared to always reading both.
+//
+// IMPORTANT: the temporary shift+End selection is undone with shift+Left
+// pressed exactly `text.length` times, NOT a single plain (non-shift) Left.
+// A plain arrow key on an active selection always collapses to an edge and
+// drops the anchor -- fine when there's nothing selected yet (normal mode),
+// but in visual mode it silently destroys the real anchor `v`/`V`
+// established, so every following motion re-selects from scratch instead of
+// extending it. Retracting with the same number of shift-presses undoes
+// exactly the extension this function just made and nothing else, so a
+// pre-existing visual-mode selection comes out the other side unchanged.
 async function readAfterCursor() {
-    return withClipboardSaved(async () => {
+    return withClipboardSaved(async (previousClipboard) => {
         try {
             sendKeyEvent("end", { shift: true })
             clickMenu(menuItems.copy)
-            await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
-            const text = await navigator.clipboard.readText()
-            sendKeyEvent("left") // collapses the selection back to its start (the original cursor)
+            const text = await pollClipboardForChange(previousClipboard)
+            if (text === null) return null
+            repeatMotion(() => sendKeyEvent("left", { shift: true }), text.length)
             return text
         } catch (err) {
             console.warn("DocsKeys: couldn't read text after cursor (best-effort feature; falling back to no-op)", err)
@@ -474,15 +524,16 @@ async function readAfterCursor() {
 }
 
 // Same as readAfterCursor(), but for the text from the start of the line to
-// the cursor.
+// the cursor. See readAfterCursor()'s comment for why the retraction uses
+// shift+Right `text.length` times rather than a single plain Right.
 async function readBeforeCursor() {
-    return withClipboardSaved(async () => {
+    return withClipboardSaved(async (previousClipboard) => {
         try {
             sendKeyEvent("home", { shift: true })
             clickMenu(menuItems.copy)
-            await new Promise((resolve) => setTimeout(resolve, REGISTER_READ_DELAY_MS))
-            const text = await navigator.clipboard.readText()
-            sendKeyEvent("right") // collapses the selection back to its end (the original cursor)
+            const text = await pollClipboardForChange(previousClipboard)
+            if (text === null) return null
+            repeatMotion(() => sendKeyEvent("right", { shift: true }), text.length)
             return text
         } catch (err) {
             console.warn("DocsKeys: couldn't read text before cursor (best-effort feature; falling back to no-op)", err)
@@ -633,13 +684,13 @@ function handleFindCharInput(rawKey) {
     })
 }
 
-function repeatLastFind(reverse) {
+function repeatLastFind(reverse, operator = null, returnMode = "normal") {
     if (!lastFind) return
     let { type, char } = lastFind
     if (reverse) {
         type = { f: "F", F: "f", t: "T", T: "t" }[type]
     }
-    performFind(type, char, 1, null, "normal")
+    performFind(type, char, 1, operator, returnMode)
 }
 
 function goToStartOfLine() {
@@ -1040,6 +1091,12 @@ function waitForFirstInput(key) {
             pendingFindReturnMode = "normal"
             mode = "waitForFindChar"
             updateModeIndicator(mode)
+            break
+        case ";":
+            if (lastFind) { repeatLastFind(false, op, "normal") } else { switchModeToNormal() }
+            break
+        case ",":
+            if (lastFind) { repeatLastFind(true, op, "normal") } else { switchModeToNormal() }
             break
         case longStringOp:
             runDotRepeatable(() => {
@@ -1468,6 +1525,12 @@ function handleKeyEventVisualLine(key) {
             pendingFindReturnMode = mode
             mode = "waitForFindChar"
             updateModeIndicator(mode)
+            break
+        case ";":
+            if (lastFind) repeatLastFind(false, null, mode)
+            break
+        case ",":
+            if (lastFind) repeatLastFind(true, null, mode)
             break
 
     }

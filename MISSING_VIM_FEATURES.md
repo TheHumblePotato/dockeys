@@ -47,9 +47,47 @@ commands entry below for the most extreme version of that same call.
 
 ## Implemented in this pass
 
+- **Visual-mode `w`/`W`/`e`/`E`/`b`/`B`/`f`/`F`/`t`/`T` getting stuck after one
+  motion.** Real bug in the previous pass: `readAfterCursor()`/
+  `readBeforeCursor()` collapsed their temporary selection with a single
+  plain (non-shift) arrow press after reading. A plain arrow on an active
+  selection always collapses to one edge *and drops the anchor* -- harmless
+  with nothing selected yet (normal mode), but in visual mode it silently
+  destroyed the real anchor `v`/`V` had established, so every motion after
+  the first one re-selected from scratch (from wherever the collapse landed)
+  instead of extending the existing selection. Fixed by retracting the
+  temporary selection with shift+arrow pressed exactly as many times as
+  characters were read, instead of one plain arrow -- this undoes exactly
+  the extension the read just made and nothing else, so a pre-existing
+  visual-mode selection comes out the other side completely unchanged, and
+  the next motion correctly extends it rather than restarting it.
+- **`;`/`,` now work after an operator and in visual mode** (`d;`, `v;`),
+  not just as a bare normal-mode motion.
+- **Latency reduction, take two.** Two real fixes, not just tuning:
+  - The fixed `REGISTER_READ_DELAY_MS` wait after every Copy/Cut (guessing
+    how long Docs' async clipboard write takes) is replaced with
+    `pollClipboardForChange()`, which polls the clipboard every ~12ms and
+    returns as soon as it actually changes, instead of always waiting out a
+    worst-case delay. In the common case this should be noticeably faster
+    than the fixed wait was; it still falls back to a bounded max wait
+    (250ms) for the rare case where the copied text happens to be identical
+    to what was already on the clipboard.
+  - `withClipboardSaved()`'s clipboard-restore write was previously
+    *awaited* before returning control to the caller -- meaning every single
+    oracle read (`f`/`t`/`w`/`e`/`b`) was waiting on a second clipboard
+    round-trip it didn't actually need to block on. The restore now happens
+    in the background; the caller gets its result as soon as the read
+    itself resolves. Tradeoff: two oracle reads firing within single-digit
+    milliseconds of each other could very rarely see each other's temporary
+    copied text instead of the true original clipboard contents. Considered
+    an acceptable, self-correcting-ish edge case given how much this was
+    the actual latency complaint.
+
+## Implemented in the previous pass
+
 - **`e` bug fix (landing mid-word, e.g. between 'o' and 'n' in "discussions").**
   Root cause: the previous fix for the `ee`/`2e` repeat-press bug (see
-  "Implemented in the previous pass" below) nudged the cursor forward a fixed
+  "Implemented in prior passes" below) nudged the cursor forward a fixed
   2 characters before a native Ctrl+Right word-jump, on the assumption the
   cursor was always sitting at a *previous* end-of-word position. That's true
   for a repeated press, but not for a fresh press from elsewhere in a word --
@@ -390,11 +428,6 @@ commands entry below for the most extreme version of that same call.
   anyway (Vim's `f`/`t` don't stop at soft-wrap boundaries either) -- but it
   does mean a *paragraph* that Google Docs wraps across multiple display
   lines behaves differently from a Vim buffer line that never wraps.
-- **`;`/`,` only repeat as a plain motion, not after an operator or in
-  visual mode.** `d;` and `v;` aren't implemented -- only bare `;`/`,` in
-  normal mode. Deferred to keep this first pass's surface area small;
-  wiring them into `waitForFirstInput` and `handleKeyEventVisualLine` the
-  same way `f`/`F`/`t`/`T` are would be straightforward follow-up work.
 - **Counted `f`/`t` in visual mode (`3fx`) isn't supported.** `handleMultipleMotion`'s
   visual-mode branch repeats a command by calling its handler `n` times,
   which works for immediate motions but doesn't compose with a command that
