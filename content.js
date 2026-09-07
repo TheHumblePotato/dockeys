@@ -33,6 +33,65 @@ function getCursorTop() {
     return cursorTop
 }
 
+// Box cursor: sizes kix-cursor-top's width to roughly match a character's
+// width in normal/visual mode, instead of leaving it as Docs' native thin
+// insert-style bar. Deliberately does NOT try to read the actual character
+// under the cursor and measure *that* -- doing so would mean an oracle read
+// (Copy + clipboard round-trip) on every single cursor-moving keystroke,
+// which would reintroduce exactly the per-keystroke latency that was the
+// whole point of the last two passes' work. Instead this measures a single
+// representative character ("0") in whatever font is currently active, so
+// it costs one canvas measurement (sub-millisecond, synchronous, no
+// clipboard involved) rather than a network-speed round trip. This is
+// still an approximation -- proportional fonts have different widths per
+// character -- but it should track font/size changes correctly, unlike the
+// old flat `1ch`/`0.6em` attempts, and it reuses kix-cursor-top's own
+// existing height rather than guessing at line-height.
+//
+// Font info comes from the docs-texteventtarget-iframe's contenteditable
+// element -- the same hidden keystroke-capture target page_script.js
+// already reads from -- which was confirmed to carry live font-family/
+// font-size/font-weight in its inline style.
+let measureCanvas = null
+function getCursorFontInfo() {
+    try {
+        const iframe = document.querySelector(".docs-texteventtarget-iframe")
+        const doc = iframe && iframe.contentDocument
+        const el = doc && (doc.activeElement || doc.querySelector('[contenteditable="true"]'))
+        if (!el) return null
+        const cs = el.ownerDocument.defaultView.getComputedStyle(el)
+        if (!cs.fontSize || !cs.fontFamily) return null
+        return { fontFamily: cs.fontFamily, fontSize: cs.fontSize, fontWeight: cs.fontWeight || "400" }
+    } catch (err) {
+        return null
+    }
+}
+
+function measureCharWidth(fontInfo) {
+    try {
+        if (!measureCanvas) measureCanvas = document.createElement("canvas")
+        const ctx = measureCanvas.getContext("2d")
+        ctx.font = `${fontInfo.fontWeight} ${fontInfo.fontSize} ${fontInfo.fontFamily}`
+        const width = ctx.measureText("0").width
+        return width > 0 ? width : null
+    } catch (err) {
+        return null
+    }
+}
+
+// Called whenever normal/visual mode is (re-)entered. Best-effort and fully
+// defensive: if the iframe/font lookup ever fails (e.g. Docs changes its
+// internal structure), this just silently leaves the cursor as whatever it
+// already was rather than throwing or breaking anything else.
+function updateCursorBoxWidth() {
+    const ct = getCursorTop()
+    if (!ct) return
+    const fontInfo = getCursorFontInfo()
+    if (!fontInfo) return
+    const width = measureCharWidth(fontInfo)
+    if (width) ct.style.width = `${width}px`
+}
+
 let mode = 'normal'
 let tempnormal = false 
 let multipleMotion = {
@@ -135,6 +194,7 @@ function updateModeIndicator(currentMode) {
         case 'normal':
             modeIndicator.style.backgroundColor = '#1a73e8'
             modeIndicator.style.color = 'white'
+            updateCursorBoxWidth()
             break
         case 'insert':
             modeIndicator.style.backgroundColor = '#34a853'
@@ -144,6 +204,7 @@ function updateModeIndicator(currentMode) {
         case 'visualLine':
             modeIndicator.style.backgroundColor = '#fbbc04'
             modeIndicator.style.color = 'black'
+            updateCursorBoxWidth()
             break
         case 'waitForFirstInput':
         case 'waitForSecondInput':
@@ -162,23 +223,57 @@ function repeatMotion(motion, times, key) {
   }
 }
 
+// Signed count of characters currently selected between the visual-mode
+// anchor and the current focus/cursor: positive means focus is that many
+// characters to the right of the anchor (selection growing forward),
+// negative means focus is to the left (growing backward). DocsKeys is the
+// only thing that ever extends a visual-mode selection, so it can just keep
+// its own running count instead of trying to ask Docs/the browser for it --
+// which matters because Shift+End/Shift+Home (used by readAfterCursor()/
+// readBeforeCursor() below) always extend relative to the *anchor*, not the
+// current focus, so the raw copied text needs this offset sliced off before
+// it represents "text relative to where the cursor actually is now". See
+// readAfterCursor()'s comment for the rest of the story.
+//
+// Known gap: this only stays correct while a visual selection keeps growing
+// in the same direction. Reversing direction (e.g. "b" enough times to pass
+// back through the anchor while extending forward) isn't tracked, and the
+// native cross-line fallback in performWordMotionInner() also can't update
+// this precisely (it doesn't know how many characters Ctrl+Right/Left
+// actually moved). Both are documented in MISSING_VIM_FEATURES.md.
+let visualSelectionChars = 0
+
 function switchModeToVisual() {
     mode = 'visual'
     updateModeIndicator(mode)
     sendKeyEvent('right', { shift: true })
+    visualSelectionChars = 1
+    updateCursorBoxWidth()
 }
 
-function switchModeToVisualLine() {
+async function switchModeToVisualLine() {
     mode = 'visualLine'
     updateModeIndicator(mode)
     sendKeyEvent('home')
     sendKeyEvent('down', { shift: true })
+    updateCursorBoxWidth()
+    // Learn exactly how many characters this initial line-based selection
+    // spans, so a later w/e/b/f/t extension in visual-line mode can
+    // correctly account for what's already selected. One-time read -- V is
+    // a discrete action, not a hot loop, so this doesn't cost anything on
+    // the path the latency complaints were actually about.
+    const text = await withClipboardSaved(async (previousClipboard) => {
+        clickMenu(menuItems.copy)
+        return await pollClipboardForChange(previousClipboard)
+    })
+    visualSelectionChars = (text !== null) ? text.length : 0
 }
 
 function switchModeToNormal() {
     if (mode == "visualLine") sendKeyEvent("left")
     mode = 'normal'
     updateModeIndicator(mode)
+    visualSelectionChars = 0
 
     const ct = getCursorTop()
     if (ct) {
@@ -186,13 +281,18 @@ function switchModeToNormal() {
         ct.style.display = "block"
         ct.style.backgroundColor = "black"
     }
+    updateCursorBoxWidth()
 }
 
 function switchModeToInsert() {
     mode = 'insert'
     updateModeIndicator(mode)
+    visualSelectionChars = 0
     const ct = getCursorTop()
-    if (ct) ct.style.opacity = 0
+    if (ct) {
+        ct.style.opacity = 0
+        ct.style.width = "" // revert to Docs' own native (thin) width
+    }
 }
 
 function switchModeToWait() {
@@ -507,15 +607,30 @@ async function pollClipboardForChange(previousText, maxWaitMs = 250, intervalMs 
 // extending it. Retracting with the same number of shift-presses undoes
 // exactly the extension this function just made and nothing else, so a
 // pre-existing visual-mode selection comes out the other side unchanged.
+// IMPORTANT: when called during an active visual-mode selection, Shift+End
+// extends the *focus* while leaving the *anchor* (where v/V was pressed)
+// fixed -- so the raw copied text starts at the anchor, not at wherever the
+// cursor currently is. Left unaccounted for, every computed motion is
+// relative to that stale anchor point instead of the actual cursor, which
+// is what made visual-mode w/e/b/f/t/;/, appear to move once and then get
+// stuck: the anchor never moves, so the "next word" computed from it stops
+// making forward progress once the real cursor has moved past what the
+// anchor-relative text still shows. Sliced off here using
+// visualSelectionChars (see its comment above), so the text this returns
+// always represents "from the actual cursor forward", whether or not a
+// selection happens to already be active.
 async function readAfterCursor() {
     return withClipboardSaved(async (previousClipboard) => {
         try {
             sendKeyEvent("end", { shift: true })
             clickMenu(menuItems.copy)
-            const text = await pollClipboardForChange(previousClipboard)
-            if (text === null) return null
-            repeatMotion(() => sendKeyEvent("left", { shift: true }), text.length)
-            return text
+            const raw = await pollClipboardForChange(previousClipboard)
+            if (raw === null) return null
+            repeatMotion(() => sendKeyEvent("left", { shift: true }), raw.length)
+            const alreadySelected = ((mode === "visual" || mode === "visualLine") && visualSelectionChars > 0)
+                ? Math.min(visualSelectionChars, raw.length)
+                : 0
+            return raw.slice(alreadySelected)
         } catch (err) {
             console.warn("DocsKeys: couldn't read text after cursor (best-effort feature; falling back to no-op)", err)
             return null
@@ -525,16 +640,20 @@ async function readAfterCursor() {
 
 // Same as readAfterCursor(), but for the text from the start of the line to
 // the cursor. See readAfterCursor()'s comment for why the retraction uses
-// shift+Right `text.length` times rather than a single plain Right.
+// shift+Right `text.length` times rather than a single plain Right, and for
+// why the already-selected portion needs to be sliced off in visual mode.
 async function readBeforeCursor() {
     return withClipboardSaved(async (previousClipboard) => {
         try {
             sendKeyEvent("home", { shift: true })
             clickMenu(menuItems.copy)
-            const text = await pollClipboardForChange(previousClipboard)
-            if (text === null) return null
-            repeatMotion(() => sendKeyEvent("right", { shift: true }), text.length)
-            return text
+            const raw = await pollClipboardForChange(previousClipboard)
+            if (raw === null) return null
+            repeatMotion(() => sendKeyEvent("right", { shift: true }), raw.length)
+            const alreadySelected = ((mode === "visual" || mode === "visualLine") && visualSelectionChars < 0)
+                ? Math.min(-visualSelectionChars, raw.length)
+                : 0
+            return raw.slice(0, raw.length - alreadySelected)
         } catch (err) {
             console.warn("DocsKeys: couldn't read text before cursor (best-effort feature; falling back to no-op)", err)
             return null
@@ -606,6 +725,7 @@ function applyMotionSteps(forward, inclusive, steps, operator, returnMode) {
 
     if (returnMode === "visual" || returnMode === "visualLine") {
         repeatMotion(() => sendKeyEvent(dirKey, { shift: true }), steps)
+        visualSelectionChars += forward ? steps : -steps
         mode = returnMode
         updateModeIndicator(mode)
         return
@@ -895,6 +1015,10 @@ async function performWordMotionInner(kind, classify, count, operator, returnMod
         if (operator) {
             runLongStringOp(operator, false)
         } else if (returnMode === "visual" || returnMode === "visualLine") {
+            // Can't know exactly how far the native Ctrl+Right/Left jump
+            // moved, so the running offset can't be updated precisely here.
+            // Reset it rather than carry forward a count we know is wrong.
+            visualSelectionChars = 0
             mode = returnMode
             updateModeIndicator(mode)
         } else {

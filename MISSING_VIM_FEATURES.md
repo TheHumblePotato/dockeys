@@ -47,6 +47,80 @@ commands entry below for the most extreme version of that same call.
 
 ## Implemented in this pass
 
+- **Box cursor, real attempt.** `kix-cursor-top` (already used for the
+  thin/hidden cursor bar in insert vs. normal mode) now also gets its width
+  set to roughly a character's width whenever normal/visual/visual-line mode
+  is (re-)entered or the mode indicator refreshes (i.e. on essentially every
+  motion), instead of staying Docs' native thin insert-style bar. Deliberately
+  does NOT read the actual character under the cursor to measure it
+  precisely -- that would mean a Copy+clipboard round trip on every single
+  cursor-moving keystroke, undoing the last two passes' latency work.
+  Instead it measures one representative character ("0") with a
+  `canvas.measureText()` call against whatever font is currently active
+  (read from the confirmed-real `docs-texteventtarget-iframe`'s
+  contenteditable element's computed style) -- a synchronous, sub-millisecond
+  operation with no clipboard involved, so it costs nothing on the latency
+  front. Uses `kix-cursor-top`'s own existing height rather than guessing at
+  line-height. This is confirmed-real-element-based rather than guessed
+  class names, unlike the earlier reverted attempt, but the actual visual
+  result (whether Docs' own JS ever resets this inline style on its own
+  blink/redraw cycle, and whether "0"'s width is a good stand-in for
+  whatever character is actually there) is still unverified against a live
+  page.
+- **Selection-highlight hiding during f/t/w/e/b/etc.: investigated and
+  confirmed not possible, not just "unverified."** A live-page diagnostic
+  (scanning every element for a selection-colored background during an
+  active selection) found zero matching DOM elements, only `<canvas>` tiles
+  (`kix-canvas-tile-content`). This matches Google's own stated reason for
+  moving Docs off DOM rendering in 2021: DOM couldn't provide the text-layout
+  precision needed to correctly highlight a selection in mixed
+  left-to-right/right-to-left text. The selection highlight is painted
+  directly into the same canvas pixels as the document text itself -- there
+  is no separate overlay to hide, and no CSS/DOM trick can hide "just the
+  highlight" without also hiding the text underneath it. Older tools (e.g.
+  google-docs-utils' `getSelectionOverlayElements`) relied on exactly the
+  DOM overlay this migration removed, which is why they stopped working at
+  the same time. Not revisiting this again barring some future change to how
+  Docs renders selections.
+
+- **Visual-mode `w`/`W`/`e`/`E`/`b`/`B`/`f`/`F`/`t`/`T`/`;`/`,` actually
+  getting stuck after one motion, for real this time.** The previous pass's
+  fix (retracting with shift+arrow instead of a plain arrow) correctly
+  stopped the read from *destroying* the visual-mode anchor, but that wasn't
+  the whole bug: Shift+End/Shift+Home always extend relative to the anchor
+  (wherever `v`/`V` was pressed), not the current focus/cursor -- so the
+  *text* those reads returned started at the anchor too. Every motion after
+  the first one was computing "next word" relative to that fixed, stale
+  anchor point instead of the actual cursor, which stops making forward
+  progress once the real cursor has moved past what the anchor-relative text
+  still showed -- exactly "moves once, then stuck." Confirmed this was the
+  actual mechanism with a standalone simulation of the read logic before
+  and after the fix: unfixed, four consecutive simulated `w` presses landed
+  on the same position four times in a row; fixed, they advanced through
+  four different word starts as expected.
+
+  Fixed by having DocsKeys track its own running count of "how many
+  characters are already selected between the anchor and the current
+  focus" (`visualSelectionChars`) -- straightforward since DocsKeys is the
+  only thing that ever extends a visual-mode selection here -- and slicing
+  that many characters off the front of whatever Shift+End/Shift+Home
+  reads back, so the text handed to the word/find logic always represents
+  "from the actual cursor", never "from the anchor". `V` additionally does
+  one one-time Copy+read when first entering visual-line mode, to learn
+  exactly how many characters its initial line-based selection spans
+  (unlike the fixed 1-character selection `v` starts with).
+
+  Known remaining gap, not fixed this pass: this tracking assumes the
+  selection keeps growing in the *same direction*. Reversing direction
+  mid-selection (e.g. extending forward with `w` a few times, then pressing
+  `b` enough times to cross back through the anchor and extend backward
+  past it) isn't accounted for, and neither is the cross-line native
+  fallback (it can't know exactly how far Ctrl+Right/Left actually moved,
+  so it resets the tracked count to 0 rather than carry forward a number
+  it knows is wrong -- meaning the *true* anchor position is "forgotten"
+  from that point on, though tracking then stays self-consistent again for
+  whatever comes after).
+
 - **Visual-mode `w`/`W`/`e`/`E`/`b`/`B`/`f`/`F`/`t`/`T` getting stuck after one
   motion.** Real bug in the previous pass: `readAfterCursor()`/
   `readBeforeCursor()` collapsed their temporary selection with a single
