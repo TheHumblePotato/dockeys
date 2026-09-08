@@ -51,9 +51,29 @@ const simulateKeyEvent = function(eventType, el, args) {
     el.dispatchEvent(event);
 };
 
-const editorEl = document.querySelector(".docs-texteventtarget-iframe").contentDocument.activeElement;
+// Looked up fresh on every simulated keypress rather than cached once at
+// script-load time. The original version did `const editorEl =
+// document.querySelector(...).contentDocument.activeElement` here at the
+// top level -- if Google Docs hadn't created its keystroke-capture iframe
+// yet at the moment this script ran (a real, observed race on some page
+// loads), that line throws, and since nothing after it in the file ever
+// runs, the addEventListener() call below never registers at all -- so
+// *no* DocsKeys command works, silently, for the rest of the page's life,
+// with no way to recover short of reloading. Looking it up fresh each time
+// avoids both that startup race and the possibility of a stale cached
+// element if the iframe's active element ever changes later.
+function getEditorEl() {
+    const iframe = document.querySelector(".docs-texteventtarget-iframe");
+    if (!iframe || !iframe.contentDocument) return null;
+    return iframe.contentDocument.activeElement || iframe.contentDocument.body || null;
+}
 
 window.addEventListener("doc-keys-simulate-keypress", function(event) {
+    const editorEl = getEditorEl();
+    if (!editorEl) {
+        console.warn("DocsKeys: couldn't find the Docs keystroke-capture element (page may still be loading, or no document is focused)");
+        return;
+    }
     const args = event.detail
     simulateKeyEvent("keydown", editorEl, args);
     simulateKeyEvent("keyup", editorEl, args);

@@ -1,3 +1,11 @@
+// Set to true and reload the extension to log how long each phase of a
+// text-oracle read (f/F/t/T/w/e/b) actually takes, in the DevTools console.
+// Useful for finding out where remaining latency is actually going, instead
+// of guessing -- e.g. whether it's the clipboard round-trip itself, or
+// something else like Docs' own Copy-click handler being slow on a large
+// document.
+const DEBUG_TIMING = false
+
 function waitForElement(getElement, callback, { interval = 200, timeoutMs = 20000 } = {}) {
     const start = Date.now()
     const attempt = () => {
@@ -28,30 +36,77 @@ waitForElement(
 let cursorTop = null
 function getCursorTop() {
     if (!cursorTop || !cursorTop.isConnected) {
-        cursorTop = document.getElementsByClassName("kix-cursor-top")[0] || null
+        // kix-cursor-caret is the element multiple independent sources
+        // describe as the actual visible blinking cursor (Docs toggles its
+        // `display` between "none"/"inline" for the blink) -- likely the
+        // real fix for the box cursor showing up as a "tail" near, but not
+        // exactly at, kix-cursor-top's position. Falls back to
+        // kix-cursor-top (what this used before) in case the class name
+        // varies by Docs version/rollout -- unverified against a live page,
+        // same as everything else about Docs' internal structure in this
+        // file.
+        cursorTop = document.getElementsByClassName("kix-cursor-caret")[0]
+            || document.getElementsByClassName("kix-cursor-top")[0]
+            || null
     }
     return cursorTop
 }
 
-// Box cursor: sizes kix-cursor-top's width to roughly match a character's
-// width in normal/visual mode, instead of leaving it as Docs' native thin
-// insert-style bar. Deliberately does NOT try to read the actual character
-// under the cursor and measure *that* -- doing so would mean an oracle read
-// (Copy + clipboard round-trip) on every single cursor-moving keystroke,
-// which would reintroduce exactly the per-keystroke latency that was the
-// whole point of the last two passes' work. Instead this measures a single
-// representative character ("0") in whatever font is currently active, so
-// it costs one canvas measurement (sub-millisecond, synchronous, no
-// clipboard involved) rather than a network-speed round trip. This is
-// still an approximation -- proportional fonts have different widths per
-// character -- but it should track font/size changes correctly, unlike the
-// old flat `1ch`/`0.6em` attempts, and it reuses kix-cursor-top's own
-// existing height rather than guessing at line-height.
+// Box cursor: an independent overlay element, positioned/sized to match
+// kix-cursor-top's location, rather than resizing kix-cursor-top itself.
 //
+// This replaces an earlier version that set `width` directly on
+// kix-cursor-top, which showed up as a "tail" behind the real cursor
+// instead of a proper block -- most likely because Docs sizes/positions
+// that element with its own CSS (possibly a transform, going by this
+// project's history with a previous, separately-reverted cursor-styling
+// attempt that used `transform: scaleY`), and stacking our own `width`
+// change on top of whatever that is doesn't compose the way a plain CSS
+// property normally would. Rather than guess again at exactly what Docs
+// does internally -- risking actually breaking the native cursor's
+// *position*, not just its cosmetic size, if a blind fix happens to clear
+// or fight a transform Docs relies on -- this sidesteps the question
+// entirely: kix-cursor-top's own style is never modified, only *read*
+// (its position and height, via getBoundingClientRect()), and a completely
+// separate `position: fixed` div is drawn on top of it at that location.
+// Nothing about Docs' own cursor element or its behavior is touched.
+let cursorBoxOverlay = null
+function getCursorBoxOverlay() {
+    if (!cursorBoxOverlay || !cursorBoxOverlay.isConnected) {
+        cursorBoxOverlay = document.createElement("div")
+        cursorBoxOverlay.style.position = "fixed"
+        cursorBoxOverlay.style.pointerEvents = "none"
+        cursorBoxOverlay.style.backgroundColor = "black"
+        cursorBoxOverlay.style.zIndex = "9998"
+        cursorBoxOverlay.style.display = "none"
+        document.body.appendChild(cursorBoxOverlay)
+    }
+    return cursorBoxOverlay
+}
+
 // Font info comes from the docs-texteventtarget-iframe's contenteditable
 // element -- the same hidden keystroke-capture target page_script.js
 // already reads from -- which was confirmed to carry live font-family/
 // font-size/font-weight in its inline style.
+//
+// Two-tier sizing, because measuring the *actual* character under the
+// cursor needs an oracle read (Copy + clipboard round-trip), and doing that
+// on every single cursor-moving keystroke would reintroduce exactly the
+// per-keystroke latency the last two passes removed, and would also flash
+// the selection highlight on plain h/l/j/k presses that currently never
+// touch the clipboard at all:
+//   1. updateCursorBoxWidth() -- instant, synchronous, no oracle read.
+//      Measures a stand-in character ("0") so there's *something*
+//      reasonably sized immediately, called right when normal/visual mode
+//      is (re-)entered.
+//   2. scheduleBoxWidthRefresh() -- debounced (waits for a short pause in
+//      keystrokes), reads the actual character under the cursor via the
+//      oracle, and re-measures using that specific character instead of the
+//      "0" stand-in. Called after every normal/visual-mode keystroke, but
+//      the debounce means it only actually runs once you pause, not on
+//      every single press -- so navigation stays instant and the highlight
+//      doesn't flash while actively moving, and the box corrects to the
+//      exact width shortly after you stop.
 let measureCanvas = null
 function getCursorFontInfo() {
     try {
@@ -67,30 +122,83 @@ function getCursorFontInfo() {
     }
 }
 
-function measureCharWidth(fontInfo) {
+function measureCharWidth(fontInfo, char = "0") {
     try {
         if (!measureCanvas) measureCanvas = document.createElement("canvas")
         const ctx = measureCanvas.getContext("2d")
         ctx.font = `${fontInfo.fontWeight} ${fontInfo.fontSize} ${fontInfo.fontFamily}`
-        const width = ctx.measureText("0").width
+        // A newline/empty line has no character to measure -- fall back to
+        // the stand-in width rather than a zero-width box.
+        const target = (char && char !== "\n" && char !== "\r") ? char : "0"
+        const width = ctx.measureText(target).width
         return width > 0 ? width : null
     } catch (err) {
         return null
     }
 }
 
+// Positions the overlay at kix-cursor-top's current location, sized to
+// `widthPx` wide and as tall as kix-cursor-top itself already is (i.e.
+// still not guessing at line-height -- just reading it, same as before).
+function positionCursorBoxOverlay(widthPx) {
+    const nativeCursor = getCursorTop()
+    if (!nativeCursor || !widthPx) return false
+    try {
+        const rect = nativeCursor.getBoundingClientRect()
+        if (!rect.height) return false
+        const overlay = getCursorBoxOverlay()
+        overlay.style.left = `${rect.left}px`
+        overlay.style.top = `${rect.top}px`
+        overlay.style.width = `${widthPx}px`
+        overlay.style.height = `${rect.height}px`
+        return true
+    } catch (err) {
+        return false
+    }
+}
+
+function showCursorBoxOverlay() {
+    const overlay = getCursorBoxOverlay()
+    overlay.style.display = "block"
+}
+
+function hideCursorBoxOverlay() {
+    if (cursorBoxOverlay) cursorBoxOverlay.style.display = "none"
+}
+
 // Called whenever normal/visual mode is (re-)entered. Best-effort and fully
-// defensive: if the iframe/font lookup ever fails (e.g. Docs changes its
-// internal structure), this just silently leaves the cursor as whatever it
-// already was rather than throwing or breaking anything else.
+// defensive: if the iframe/font/cursor lookup ever fails (e.g. Docs changes
+// its internal structure, or hasn't created its cursor element yet -- see
+// the waitForElement() call near the bottom of this file for page-load
+// timing), this just leaves the overlay hidden rather than throwing or
+// breaking anything else.
 function updateCursorBoxWidth() {
-    const ct = getCursorTop()
-    if (!ct) return
     const fontInfo = getCursorFontInfo()
     if (!fontInfo) return
     const width = measureCharWidth(fontInfo)
-    if (width) ct.style.width = `${width}px`
+    if (positionCursorBoxOverlay(width)) showCursorBoxOverlay()
 }
+
+const BOX_WIDTH_REFRESH_DEBOUNCE_MS = 150
+let boxWidthRefreshTimer = null
+function scheduleBoxWidthRefresh() {
+    if (mode !== "normal" && mode !== "visual" && mode !== "visualLine") return
+    clearTimeout(boxWidthRefreshTimer)
+    boxWidthRefreshTimer = setTimeout(async () => {
+        // Re-check: mode may have changed, or another oracle read may have
+        // started, during the debounce wait.
+        if (mode !== "normal" && mode !== "visual" && mode !== "visualLine") return
+        if (wordMotionBusy || findBusy) return
+        const after = await readAfterCursor()
+        if (mode !== "normal" && mode !== "visual" && mode !== "visualLine") return // could have changed while awaiting
+        if (after === null || after.length === 0) return
+        const fontInfo = getCursorFontInfo()
+        if (!fontInfo) return
+        const width = measureCharWidth(fontInfo, after[0])
+        if (width) positionCursorBoxOverlay(width)
+    }, BOX_WIDTH_REFRESH_DEBOUNCE_MS)
+}
+
 
 let mode = 'normal'
 let tempnormal = false 
@@ -288,11 +396,9 @@ function switchModeToInsert() {
     mode = 'insert'
     updateModeIndicator(mode)
     visualSelectionChars = 0
+    hideCursorBoxOverlay()
     const ct = getCursorTop()
-    if (ct) {
-        ct.style.opacity = 0
-        ct.style.width = "" // revert to Docs' own native (thin) width
-    }
+    if (ct) ct.style.opacity = 0
 }
 
 function switchModeToWait() {
@@ -569,7 +675,7 @@ async function withClipboardSaved(fn) {
 // sooner. Falls back to "whatever's there now" after maxWaitMs so a copy
 // that happens to produce identical text to what was already on the
 // clipboard doesn't hang.
-async function pollClipboardForChange(previousText, maxWaitMs = 250, intervalMs = 12) {
+async function pollClipboardForChange(previousText, maxWaitMs = 250, intervalMs = 8) {
     const start = Date.now()
     while (Date.now() - start < maxWaitMs) {
         try {
@@ -598,39 +704,56 @@ async function pollClipboardForChange(previousText, maxWaitMs = 250, intervalMs 
 // (f/t, w/e, F/T, b) only ever needs one side, so this roughly halves the
 // number of clipboard round-trips compared to always reading both.
 //
-// IMPORTANT: the temporary shift+End selection is undone with shift+Left
-// pressed exactly `text.length` times, NOT a single plain (non-shift) Left.
-// A plain arrow key on an active selection always collapses to an edge and
-// drops the anchor -- fine when there's nothing selected yet (normal mode),
-// but in visual mode it silently destroys the real anchor `v`/`V`
-// established, so every following motion re-selects from scratch instead of
-// extending it. Retracting with the same number of shift-presses undoes
-// exactly the extension this function just made and nothing else, so a
-// pre-existing visual-mode selection comes out the other side unchanged.
-// IMPORTANT: when called during an active visual-mode selection, Shift+End
-// extends the *focus* while leaving the *anchor* (where v/V was pressed)
-// fixed -- so the raw copied text starts at the anchor, not at wherever the
-// cursor currently is. Left unaccounted for, every computed motion is
-// relative to that stale anchor point instead of the actual cursor, which
-// is what made visual-mode w/e/b/f/t/;/, appear to move once and then get
-// stuck: the anchor never moves, so the "next word" computed from it stops
-// making forward progress once the real cursor has moved past what the
-// anchor-relative text still shows. Sliced off here using
-// visualSelectionChars (see its comment above), so the text this returns
-// always represents "from the actual cursor forward", whether or not a
-// selection happens to already be active.
+// Two things make this correct during an active visual-mode selection,
+// where a plain shift+End can't just be read at face value:
+//
+// 1. Shift+End extends the *focus* while leaving the *anchor* (where v/V
+//    was pressed) fixed, so the raw copied text starts at the anchor, not
+//    at wherever the cursor currently is. Sliced off below using
+//    `visualSelectionChars` (see its comment above), so what this function
+//    returns always represents "from the actual cursor forward".
+// 2. The temporary extension is undone with shift+Left -- never a plain
+//    (non-shift) Left, which would collapse to an edge and drop the anchor
+//    entirely -- but critically, only for exactly as many characters as
+//    this function's *own* extension added (`after.length`, i.e. after
+//    slicing), not the full raw text's length. Retracting the full raw
+//    length would also retract back through whatever was already selected
+//    before this call started, overshooting all the way back to the
+//    anchor every time instead of back to where the cursor actually was.
 async function readAfterCursor() {
+    const t0 = DEBUG_TIMING ? performance.now() : 0
     return withClipboardSaved(async (previousClipboard) => {
         try {
+            const t1 = DEBUG_TIMING ? performance.now() : 0
             sendKeyEvent("end", { shift: true })
             clickMenu(menuItems.copy)
+            const t2 = DEBUG_TIMING ? performance.now() : 0
             const raw = await pollClipboardForChange(previousClipboard)
+            const t3 = DEBUG_TIMING ? performance.now() : 0
             if (raw === null) return null
-            repeatMotion(() => sendKeyEvent("left", { shift: true }), raw.length)
             const alreadySelected = ((mode === "visual" || mode === "visualLine") && visualSelectionChars > 0)
                 ? Math.min(visualSelectionChars, raw.length)
                 : 0
-            return raw.slice(alreadySelected)
+            const after = raw.slice(alreadySelected)
+            // Retract only the NEW extension this shift+End just made
+            // (after.length), NOT the full raw.length. raw also includes
+            // whatever was already selected before this read started; in
+            // visual mode, retracting that much too overshoots all the way
+            // back to the anchor instead of back to where the cursor
+            // actually was -- which is what caused w/e/b/f/t/;/, to appear
+            // to jump around randomly instead of advancing normally
+            // (verified with a standalone simulation before this fix: the
+            // buggy version's tracked position and the real selection
+            // length diverge from the very first press; this version keeps
+            // them in exact lockstep across repeated presses). In normal
+            // mode alreadySelected is 0, so after.length === raw.length and
+            // this is unchanged from before.
+            repeatMotion(() => sendKeyEvent("left", { shift: true }), after.length)
+            if (DEBUG_TIMING) {
+                const t4 = performance.now()
+                console.log(`DocsKeys timing: save-clipboard=${(t1 - t0).toFixed(1)}ms select+click=${(t2 - t1).toFixed(1)}ms poll-for-copy=${(t3 - t2).toFixed(1)}ms retract=${(t4 - t3).toFixed(1)}ms TOTAL=${(t4 - t0).toFixed(1)}ms`)
+            }
+            return after
         } catch (err) {
             console.warn("DocsKeys: couldn't read text after cursor (best-effort feature; falling back to no-op)", err)
             return null
@@ -640,20 +763,29 @@ async function readAfterCursor() {
 
 // Same as readAfterCursor(), but for the text from the start of the line to
 // the cursor. See readAfterCursor()'s comment for why the retraction uses
-// shift+Right `text.length` times rather than a single plain Right, and for
-// why the already-selected portion needs to be sliced off in visual mode.
+// shift+Right `before.length` times (not the full raw length) and why the
+// already-selected portion needs to be sliced off in visual mode.
 async function readBeforeCursor() {
+    const t0 = DEBUG_TIMING ? performance.now() : 0
     return withClipboardSaved(async (previousClipboard) => {
         try {
+            const t1 = DEBUG_TIMING ? performance.now() : 0
             sendKeyEvent("home", { shift: true })
             clickMenu(menuItems.copy)
+            const t2 = DEBUG_TIMING ? performance.now() : 0
             const raw = await pollClipboardForChange(previousClipboard)
+            const t3 = DEBUG_TIMING ? performance.now() : 0
             if (raw === null) return null
-            repeatMotion(() => sendKeyEvent("right", { shift: true }), raw.length)
             const alreadySelected = ((mode === "visual" || mode === "visualLine") && visualSelectionChars < 0)
                 ? Math.min(-visualSelectionChars, raw.length)
                 : 0
-            return raw.slice(0, raw.length - alreadySelected)
+            const before = raw.slice(0, raw.length - alreadySelected)
+            repeatMotion(() => sendKeyEvent("right", { shift: true }), before.length)
+            if (DEBUG_TIMING) {
+                const t4 = performance.now()
+                console.log(`DocsKeys timing: save-clipboard=${(t1 - t0).toFixed(1)}ms select+click=${(t2 - t1).toFixed(1)}ms poll-for-copy=${(t3 - t2).toFixed(1)}ms retract=${(t4 - t3).toFixed(1)}ms TOTAL=${(t4 - t0).toFixed(1)}ms`)
+            }
+            return before
         } catch (err) {
             console.warn("DocsKeys: couldn't read text before cursor (best-effort feature; falling back to no-op)", err)
             return null
@@ -1557,6 +1689,7 @@ function handleKeyEventNormal(key) {
             switchModeToInsert()
         }
     }
+    scheduleBoxWidthRefresh()
 }
 
 function handleKeyEventVisualLine(key) {
@@ -1572,15 +1705,19 @@ function handleKeyEventVisualLine(key) {
             break
         case "h":
             sendKeyEvent("left", { shift: true })
+            visualSelectionChars -= 1
             break
         case "j":
             sendKeyEvent("down", { shift: true })
+            visualSelectionChars = 0 // unknown delta (depends on line length) -- see comment on visualSelectionChars
             break
         case "k":
             sendKeyEvent("up", { shift: true })
+            visualSelectionChars = 0
             break
         case "l":
             sendKeyEvent("right", { shift: true })
+            visualSelectionChars += 1
             break
         case "\"":
             switchModeToWaitForRegister()
@@ -1593,9 +1730,11 @@ function handleKeyEventVisualLine(key) {
             break
         case "}":
             goToEndOfPara(true)
+            visualSelectionChars = 0
             break
         case "{":
             goToStartOfPara(true)
+            visualSelectionChars = 0
             break
         case "b":
         case "B":
@@ -1615,15 +1754,19 @@ function handleKeyEventVisualLine(key) {
             break
         case "0":
             selectToStartOfLine()
+            visualSelectionChars = 0
             break
         case "$":
             selectToEndOfLine()
+            visualSelectionChars = 0
             break
         case "G":
             goToDocEnd(true)
+            visualSelectionChars = 0
             break
         case "g":
             goToDocStart(true)
+            visualSelectionChars = 0
             break
         case "c":
         case "d":
@@ -1658,6 +1801,7 @@ function handleKeyEventVisualLine(key) {
             break
 
     }
+    scheduleBoxWidthRefresh()
 }
 
 let menuItemElements = {}
@@ -1763,3 +1907,16 @@ function activateTopLevelMenu(menuCaption) {
 }
 
 switchModeToNormal()
+
+// switchModeToNormal() above runs immediately on page load, before Google
+// Docs has created its cursor element yet -- so the box-cursor sizing it
+// tries to do silently no-ops (getCursorTop() finds nothing). Previously
+// this meant the box cursor simply didn't appear until *something else*
+// happened to call switchModeToNormal() again later (e.g. pressing Esc),
+// which looked like "it needs Esc to work" but was really just "nothing
+// has retried since the element didn't exist yet". Retrying once the
+// element actually shows up fixes this without needing any user action.
+waitForElement(
+    () => getCursorTop(),
+    () => { if (mode === "normal") updateCursorBoxWidth() },
+)

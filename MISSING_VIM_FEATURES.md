@@ -47,6 +47,147 @@ commands entry below for the most extreme version of that same call.
 
 ## Implemented in this pass
 
+- **`page_script.js` crash that could silently break every single DocsKeys
+  command.** Real bug, not cosmetic: it cached `editorEl` once, synchronously,
+  by chaining straight into `.contentDocument.activeElement` on the
+  keystroke-capture iframe at script-injection time, with no check for the
+  iframe existing yet. On a page load where Docs hadn't created that iframe
+  yet (an observed, real race, not hypothetical), this threw, and since
+  nothing after that line in the file ever ran, the
+  `doc-keys-simulate-keypress` listener never got registered at all -- so
+  *no* synthetic keystroke DocsKeys sends would do anything, silently, for
+  the rest of that page's life, with no way to recover short of reloading.
+  Fixed by looking up the element fresh on every simulated keypress instead
+  of caching it once (`getEditorEl()`), which also incidentally fixes a
+  latent staleness risk from caching a single `activeElement` reference
+  forever.
+- **Box cursor didn't appear until pressing Esc.** Different bug from the
+  one above: `switchModeToNormal()` runs once immediately at page load, but
+  Google Docs hasn't created its cursor element yet at that point, so the
+  box-cursor sizing silently no-ops. Nothing ever retried until some other
+  event happened to call `switchModeToNormal()` again later, which is what
+  pressing Esc was actually doing -- not "fixing" anything specific to the
+  cursor, just being the first successful retry. Fixed with the same
+  `waitForElement()` pattern already used to find the keystroke-capture
+  iframe: wait for the cursor element to actually exist, then do the initial
+  sizing once it does.
+- **Box cursor appearing as a "tail" instead of a proper block.** Rewrote
+  the whole approach rather than patch the symptom, for two reasons found
+  together: (1) multiple independent sources describe the actual visible
+  blinking cursor as class `kix-cursor-caret` (toggled `display`
+  none/inline by Docs' own JS for the blink), not `kix-cursor-top` -- which
+  this project had been styling instead, a container/reference element
+  whose position may not exactly coincide with the true caret, explaining a
+  nearby-but-misaligned "tail". (2) This project's own history already
+  flags a previous, separately-reverted cursor-styling attempt that used a
+  CSS `transform` for sizing -- suggesting Docs may size/position its
+  cursor via transform rather than plain `width`, in which case stacking a
+  plain `width` override on top wouldn't compose predictably. Rather than
+  guess further at exactly what Docs does internally -- risking breaking
+  the native cursor's actual *position* if a blind fix happened to clear or
+  fight a transform Docs relies on, which would be worse than the cosmetic
+  tail -- the box cursor is now a completely independent overlay element,
+  positioned to match the native cursor's location (read via
+  `getBoundingClientRect()`, never modified) rather than resizing Docs' own
+  element at all. `getCursorTop()` now looks for `kix-cursor-caret` first,
+  falling back to `kix-cursor-top`.
+- **Selection-highlight hiding: found a real, specific, documented CSS
+  class worth checking directly** (`.kix-selection-overlay`, from a 2020
+  blog post fixing the same highlight for high-contrast/dark-theme users)
+  that contradicts the previous pass's "closed, not possible" conclusion --
+  or at least complicates it. That post predates the 2021 canvas migration
+  found earlier, so the class may no longer be the active rendering path,
+  but canvas-migrated elements sometimes stick around in the DOM invisibly
+  (repurposed, or just never removed) -- which would explain why the
+  previous pass's visibility-based scan (only looking for already-visible
+  blue elements) missed it even if it's still there. Not re-opening the
+  "closed" verdict without checking first: added
+  `find-selection-overlay.js`, which checks for this specific class name
+  regardless of visibility and, if found, forces it to an unmissable
+  magenta/lime style to confirm whether restyling it actually has any
+  visible effect today.
+
+- **Box cursor now measures the actual character under the cursor**,
+  instead of a generic "0" stand-in -- confirmed necessary once the box
+  itself was confirmed visible (via `test-box-cursor.js`) but the wrong
+  size for different characters. Since measuring the real character needs
+  an oracle read (Copy + clipboard round-trip), and doing that on every
+  single cursor-moving keystroke would reintroduce per-keystroke latency
+  and flash the highlight on plain `h`/`l`/`j`/`k` presses that currently
+  never touch the clipboard at all, this is split into two tiers: an
+  instant, synchronous "0"-based measurement for immediate feedback right
+  when normal/visual mode is (re-)entered, and a *debounced* (150ms after
+  the last keystroke) background read of the actual character, which
+  re-measures using that specific character once you pause. Also found and
+  fixed a second, more basic gap while implementing this: plain `h`/`l`/`j`/`k`
+  presses were never triggering *any* box-width refresh at all (only mode
+  transitions were), so the box could easily have been stale from whatever
+  character was under the cursor last time normal mode was entered,
+  regardless of "0" vs. real-character measurement.
+- **`h`/`j`/`k`/`l`/`0`/`$`/`{`/`}`/`g`/`G` in visual mode weren't updating
+  `visualSelectionChars` at all.** Same class of bug as the "jumps around
+  randomly" fix above, just not yet hit by anything reported: mixing e.g.
+  `v`, `l`, `l`, `w` would have corrupted the tracked offset, since only
+  `w`/`e`/`b`/`f`/`F`/`t`/`T` (which route through `applyMotionSteps`) were
+  updating it. `h`/`l` now update it exactly (always ±1 character); the
+  rest (`j`/`k`/`0`/`$`/`{`/`}`/`g`/`G`) reset it to 0 rather than leave it
+  wrong, since their exact character delta isn't knowable without a read --
+  same documented degradation as the native cross-line word-motion
+  fallback above.
+- **Trade-off worth knowing about**: the debounced box-width refresh means
+  a background clipboard save/restore cycle now runs roughly once every
+  time you pause for 150ms after a burst of normal/visual-mode keystrokes
+  (not continuously, and not while actively typing/navigating -- only once
+  things go quiet). This is the same clipboard-touching mechanism `f`/`t`/
+  `w`/`e`/`b` already use when actively invoked; this just adds one more
+  occurrence per pause. Noting it here in case clipboard behavior ever
+  looks surprising and this is why.
+
+- **The real bug behind visual-mode w/e/b/f/t/;/, "jumping around
+  randomly."** The previous pass's fix (slicing off the already-selected
+  prefix) was the right idea but had a concrete arithmetic bug: the
+  temporary shift+End/shift+Home extension was being retracted by
+  `raw.length` -- the *entire* anchor-to-line-end text -- instead of just
+  the newly-read portion beyond what was already selected
+  (`after.length`/`before.length`). In visual mode this over-retracts all
+  the way back to the anchor on every single read, silently collapsing the
+  real selection back to a single point each time, while DocsKeys' own
+  tracked `visualSelectionChars` kept counting up as if nothing had
+  collapsed -- so each subsequent motion computed a step count that was
+  correct in isolation but got applied from the wrong (collapsed-at-anchor)
+  starting point, producing exactly the "moves somewhere, but not where
+  you'd expect, seemingly at random" symptom. In normal mode this bug was
+  invisible: with nothing pre-selected, `after.length === raw.length`
+  always, so retracting by either amount landed in the same place, which is
+  exactly why every one of the earlier passes' normal-mode tests passed
+  while visual mode kept breaking. Found this time via a standalone
+  simulation modeling anchor/focus as real positions and Copy as an actual
+  substring operation, rather than reasoning about it further from
+  assumptions: the buggy version's tracked position and the real selection
+  length diverge starting from the very first press; the fixed version
+  (retracting by `after.length`) keeps them in exact lockstep across
+  repeated presses, confirmed for 5 consecutive simulated `w` presses in a
+  row before this fix was applied to `content.js` itself.
+- **Latency: tightened the poll interval** (12ms -> 8ms), and **added an
+  opt-in timing instrument** (`DEBUG_TIMING` at the top of `content.js`) that
+  logs how long each phase of a `f`/`F`/`t`/`T`/`w`/`e`/`b` read actually
+  takes (saving the clipboard, selecting + clicking Copy, polling for the
+  write to land, retracting the selection) to the console. Intended to
+  replace further guessing about where latency is going with an actual
+  number from a real Docs page.
+- **Box cursor: still unverified, given a concrete way to check.** No live
+  page access means no way to confirm whether sizing `kix-cursor-top`
+  actually has a visible effect, or whether something else (Docs' own
+  blink/redraw cycle, a z-index issue, the element not being the thing
+  that's actually painted) is fighting it. Provided a standalone diagnostic
+  script (`test-box-cursor.js`, not part of the extension) that forces the
+  element to an unmissable red box and watches for anything resetting its
+  style, so this can be confirmed or ruled out directly instead of guessing
+  again.
+- **Correction: the "underscore cursor for pending-input modes" entry
+  further down this file describes a feature that isn't actually in the
+  current codebase.** See the note added directly under that entry.
+
 - **Box cursor, real attempt.** `kix-cursor-top` (already used for the
   thin/hidden cursor bar in insert vs. normal mode) now also gets its width
   set to roughly a character's width whenever normal/visual/visual-line mode
@@ -383,6 +524,15 @@ commands entry below for the most extreme version of that same call.
   on whatever height Docs' own element already has, rather than a hardcoded
   pixel height, so it doesn't need to know the actual line-height/font-size
   to look roughly right.
+
+  **Correction, added later:** this was reverted at some point before the
+  current baseline of this file -- the README's "Mode indicators" section
+  says the cursor-restyling attempt (this entry) was removed and the
+  floating badge is the only mode indicator, and the current `content.js`
+  has no `scaleY`/underscore code at all. Left this entry in place rather
+  than delete history, but don't take it as a description of current
+  behavior -- if you want an underscore cursor for pending-input modes, it
+  needs to be (re-)implemented, not assumed present.
 
 ## Implemented in prior passes
 
