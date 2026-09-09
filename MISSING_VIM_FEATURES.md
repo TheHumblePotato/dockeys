@@ -47,6 +47,69 @@ commands entry below for the most extreme version of that same call.
 
 ## Implemented in this pass
 
+- **Real concurrency bug: a cosmetic, debounced box-width refresh could race
+  with an actual motion.** The previous pass's debounced width refresh
+  checked whether a real motion was already using the text oracle before
+  starting its own read, but never marked *itself* as busy while that read
+  was in flight -- so a real motion (w/e/b/f/t) could start concurrently
+  with a still-in-flight cosmetic read. Two overlapping
+  select+Copy+retract cycles fighting over the same selection is
+  consistent with everything reported: stray highlighting appearing during
+  plain `h`/`l`/`j`/`k` (which never otherwise touch the clipboard at all),
+  visual mode behaving erratically, and in the worst case a subsequent
+  `d`/`c`/`y` acting on a corrupted selection range instead of the intended
+  one. Also found and closed the same class of gap in two other places
+  while auditing this: `goToFirstNonBlank()` (`^`/`_`) had no busy guard at
+  all, and `;`/`,`'s `repeatLastFind()` called the oracle directly with no
+  guard either. All oracle-touching code now shares a single `oracleBusy`
+  flag (replacing the previous separate, non-cross-checking `wordMotionBusy`
+  and `findBusy`), so nothing can start a read while anything else is using
+  the oracle, regardless of which command started it.
+- **Given the above, the debounced oracle-based box-width refresh is
+  removed entirely**, not just fixed -- a cosmetic nicety isn't worth this
+  class of risk. Box-cursor width goes back to a single stand-in-character
+  ("0") measurement, but now updates instantly and synchronously (no
+  debounce, no async, nothing to race) on every normal/visual-mode
+  keystroke, via `refreshCursorOverlayForCurrentMode()`. This also
+  directly fixes a separate, simpler bug noticed along the way: plain
+  `h`/`j`/`k`/`l` were never triggering *any* overlay refresh before (only
+  mode transitions were), which independently explains "doesn't track the
+  cursor until I stop moving" -- position now updates on literally every
+  keystroke, with zero latency cost, since reading the native cursor's
+  position is a synchronous DOM read with no clipboard involved.
+- **Cursor overlay is now semi-transparent** (`rgba(0, 0, 0, 0.5)`) instead
+  of solid black, closer to a terminal's block cursor (which shows the
+  character through it) rather than one that fully hides it.
+- **Underline cursor for pending-input modes** (`r`, the `d`/`c`/`y`
+  operator-pending wait, `"` register wait, the `i`/`a` text-object prefix,
+  `f`/`F`/`t`/`T`'s character wait, and the count-prefix wait), matching
+  real Vim's distinct "waiting on one more keystroke" cursor shape. Uses
+  the same overlay element, just anchored to the bottom 3px of the
+  character's height instead of the full block. (This was described in
+  this file's own history as already implemented, then separately reverted
+  before this project's current baseline -- see the correction note further
+  down -- so this is a fresh implementation, not a restoration.)
+- **Cursor invisible in insert mode, fixed by removing the cause rather
+  than patching around it.** Once `getCursorTop()` started preferring
+  `kix-cursor-caret` (the actual visible blinking cursor, per last pass's
+  research) over `kix-cursor-top`, the existing insert-mode code that set
+  `opacity: 0` on whatever this function returned started hiding the *real*
+  cursor while typing -- previously harmless (probably) when this only ever
+  targeted `kix-cursor-top`, a likely non-visual reference element. Fixed
+  by no longer touching the native cursor element's style at all, in any
+  mode, for any reason -- the overlay is now the sole thing DocsKeys draws;
+  Docs' own cursor is only ever read (for position), never modified.
+- **Selection-highlight hiding: re-confirmed gone, not just unverified.**
+  `find-selection-overlay.js` checked specifically for `.kix-selection-overlay`
+  (and two likely variant names) by class name, regardless of visibility --
+  none were found in the DOM at all, not even hidden ones. Combined with
+  the previous pass's canvas-only finding, this closes the door more
+  firmly: the element a 2020 fix relied on isn't just invisible, it's gone
+  entirely, consistent with the 2021 canvas migration removing it rather
+  than just repurposing it. Not revisiting this again without some future
+  change to how Docs renders selections.
+
+
 - **`page_script.js` crash that could silently break every single DocsKeys
   command.** Real bug, not cosmetic: it cached `editorEl` once, synchronously,
   by chaining straight into `.contentDocument.activeElement` on the

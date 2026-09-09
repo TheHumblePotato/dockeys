@@ -38,13 +38,10 @@ function getCursorTop() {
     if (!cursorTop || !cursorTop.isConnected) {
         // kix-cursor-caret is the element multiple independent sources
         // describe as the actual visible blinking cursor (Docs toggles its
-        // `display` between "none"/"inline" for the blink) -- likely the
-        // real fix for the box cursor showing up as a "tail" near, but not
-        // exactly at, kix-cursor-top's position. Falls back to
-        // kix-cursor-top (what this used before) in case the class name
-        // varies by Docs version/rollout -- unverified against a live page,
-        // same as everything else about Docs' internal structure in this
-        // file.
+        // `display` between "none"/"inline" for the blink). Falls back to
+        // kix-cursor-top in case the class name varies by Docs
+        // version/rollout -- unverified against a live page, same as
+        // everything else about Docs' internal structure in this file.
         cursorTop = document.getElementsByClassName("kix-cursor-caret")[0]
             || document.getElementsByClassName("kix-cursor-top")[0]
             || null
@@ -52,31 +49,36 @@ function getCursorTop() {
     return cursorTop
 }
 
-// Box cursor: an independent overlay element, positioned/sized to match
-// kix-cursor-top's location, rather than resizing kix-cursor-top itself.
+// Box/underline cursor: an independent overlay element, positioned/sized to
+// match the native cursor's location, rather than modifying the native
+// cursor element itself in any way (not even opacity -- an earlier version
+// of this hid the native cursor's opacity in insert mode, which turned out
+// to make the *real* typing cursor invisible once getCursorTop() started
+// targeting kix-cursor-caret instead of kix-cursor-top; simplest fix is to
+// never touch it at all, for any mode).
 //
-// This replaces an earlier version that set `width` directly on
-// kix-cursor-top, which showed up as a "tail" behind the real cursor
-// instead of a proper block -- most likely because Docs sizes/positions
-// that element with its own CSS (possibly a transform, going by this
-// project's history with a previous, separately-reverted cursor-styling
-// attempt that used `transform: scaleY`), and stacking our own `width`
-// change on top of whatever that is doesn't compose the way a plain CSS
-// property normally would. Rather than guess again at exactly what Docs
-// does internally -- risking actually breaking the native cursor's
-// *position*, not just its cosmetic size, if a blind fix happens to clear
-// or fight a transform Docs relies on -- this sidesteps the question
-// entirely: kix-cursor-top's own style is never modified, only *read*
-// (its position and height, via getBoundingClientRect()), and a completely
-// separate `position: fixed` div is drawn on top of it at that location.
-// Nothing about Docs' own cursor element or its behavior is touched.
+// IMPORTANT: sizing this overlay's WIDTH used to involve reading the actual
+// character under the cursor via the text oracle (Copy + clipboard round
+// trip), debounced so it wouldn't run on every keystroke. That introduced a
+// real concurrency bug: the debounced refresh checked whether a real
+// motion was already using the oracle before starting, but never marked
+// *itself* as busy while its own read was in flight -- so a real motion
+// (w/e/b/f/t) could start concurrently with a still-in-flight cosmetic
+// read, two overlapping select+Copy+retract cycles could fight over the
+// same selection, and depending on timing that could leave a stray
+// selection on screen or corrupt visual mode's tracked selection length
+// (up to and including a subsequent d/c/y deleting the wrong range). Not
+// an acceptable trade for a cosmetic nicety. The oracle-based width
+// refresh is gone; width now uses a single stand-in-character measurement
+// only, and position+width both update instantly and synchronously (no
+// async, no debounce, nothing to race) on every normal/visual-mode
+// keystroke.
 let cursorBoxOverlay = null
 function getCursorBoxOverlay() {
     if (!cursorBoxOverlay || !cursorBoxOverlay.isConnected) {
         cursorBoxOverlay = document.createElement("div")
         cursorBoxOverlay.style.position = "fixed"
         cursorBoxOverlay.style.pointerEvents = "none"
-        cursorBoxOverlay.style.backgroundColor = "black"
         cursorBoxOverlay.style.zIndex = "9998"
         cursorBoxOverlay.style.display = "none"
         document.body.appendChild(cursorBoxOverlay)
@@ -84,29 +86,16 @@ function getCursorBoxOverlay() {
     return cursorBoxOverlay
 }
 
+// Semi-transparent, like a terminal's block cursor (which shows the
+// character through it via color inversion) rather than a solid block that
+// completely hides what's underneath.
+const CURSOR_BOX_COLOR = "rgba(0, 0, 0, 0.5)"
+const CURSOR_UNDERLINE_HEIGHT_PX = 3
+
 // Font info comes from the docs-texteventtarget-iframe's contenteditable
 // element -- the same hidden keystroke-capture target page_script.js
 // already reads from -- which was confirmed to carry live font-family/
 // font-size/font-weight in its inline style.
-//
-// Two-tier sizing, because measuring the *actual* character under the
-// cursor needs an oracle read (Copy + clipboard round-trip), and doing that
-// on every single cursor-moving keystroke would reintroduce exactly the
-// per-keystroke latency the last two passes removed, and would also flash
-// the selection highlight on plain h/l/j/k presses that currently never
-// touch the clipboard at all:
-//   1. updateCursorBoxWidth() -- instant, synchronous, no oracle read.
-//      Measures a stand-in character ("0") so there's *something*
-//      reasonably sized immediately, called right when normal/visual mode
-//      is (re-)entered.
-//   2. scheduleBoxWidthRefresh() -- debounced (waits for a short pause in
-//      keystrokes), reads the actual character under the cursor via the
-//      oracle, and re-measures using that specific character instead of the
-//      "0" stand-in. Called after every normal/visual-mode keystroke, but
-//      the debounce means it only actually runs once you pause, not on
-//      every single press -- so navigation stays instant and the highlight
-//      doesn't flash while actively moving, and the box corrects to the
-//      exact width shortly after you stop.
 let measureCanvas = null
 function getCursorFontInfo() {
     try {
@@ -122,83 +111,69 @@ function getCursorFontInfo() {
     }
 }
 
-function measureCharWidth(fontInfo, char = "0") {
+// Stand-in-character measurement only -- see the block comment above for
+// why this no longer tries to measure the actual character under the
+// cursor. "0" is a reasonable average-width guess for most fonts; this is
+// an approximation, not a per-character-exact size.
+function measureCharWidth(fontInfo) {
     try {
         if (!measureCanvas) measureCanvas = document.createElement("canvas")
         const ctx = measureCanvas.getContext("2d")
         ctx.font = `${fontInfo.fontWeight} ${fontInfo.fontSize} ${fontInfo.fontFamily}`
-        // A newline/empty line has no character to measure -- fall back to
-        // the stand-in width rather than a zero-width box.
-        const target = (char && char !== "\n" && char !== "\r") ? char : "0"
-        const width = ctx.measureText(target).width
+        const width = ctx.measureText("0").width
         return width > 0 ? width : null
     } catch (err) {
         return null
     }
 }
 
-// Positions the overlay at kix-cursor-top's current location, sized to
-// `widthPx` wide and as tall as kix-cursor-top itself already is (i.e.
-// still not guessing at line-height -- just reading it, same as before).
-function positionCursorBoxOverlay(widthPx) {
-    const nativeCursor = getCursorTop()
-    if (!nativeCursor || !widthPx) return false
-    try {
-        const rect = nativeCursor.getBoundingClientRect()
-        if (!rect.height) return false
-        const overlay = getCursorBoxOverlay()
-        overlay.style.left = `${rect.left}px`
-        overlay.style.top = `${rect.top}px`
-        overlay.style.width = `${widthPx}px`
-        overlay.style.height = `${rect.height}px`
-        return true
-    } catch (err) {
-        return false
-    }
-}
-
-function showCursorBoxOverlay() {
-    const overlay = getCursorBoxOverlay()
-    overlay.style.display = "block"
-}
-
 function hideCursorBoxOverlay() {
     if (cursorBoxOverlay) cursorBoxOverlay.style.display = "none"
 }
 
-// Called whenever normal/visual mode is (re-)entered. Best-effort and fully
-// defensive: if the iframe/font/cursor lookup ever fails (e.g. Docs changes
-// its internal structure, or hasn't created its cursor element yet -- see
-// the waitForElement() call near the bottom of this file for page-load
-// timing), this just leaves the overlay hidden rather than throwing or
-// breaking anything else.
-function updateCursorBoxWidth() {
+// Instant and fully synchronous: reads the native cursor's current
+// position (getBoundingClientRect(), never modifying it), measures a
+// stand-in character width, and positions the overlay to match -- either
+// as a block (normal/visual mode) or a thin underline anchored to the
+// bottom (pending-input modes like r/replaceChar, waitForFirstInput after
+// d/c/y, etc., matching real Vim's distinct cursor shape for "waiting on
+// one more keystroke"). Called on every normal/visual/pending-input-mode
+// keystroke; safe to call this often since nothing here is async or
+// touches the clipboard.
+function updateCursorOverlay(shape) {
+    const nativeCursor = getCursorTop()
     const fontInfo = getCursorFontInfo()
-    if (!fontInfo) return
+    if (!nativeCursor || !fontInfo) {
+        hideCursorBoxOverlay()
+        return
+    }
     const width = measureCharWidth(fontInfo)
-    if (positionCursorBoxOverlay(width)) showCursorBoxOverlay()
+    if (!width) {
+        hideCursorBoxOverlay()
+        return
+    }
+    try {
+        const rect = nativeCursor.getBoundingClientRect()
+        if (!rect.height) {
+            hideCursorBoxOverlay()
+            return
+        }
+        const overlay = getCursorBoxOverlay()
+        overlay.style.backgroundColor = CURSOR_BOX_COLOR
+        overlay.style.left = `${rect.left}px`
+        overlay.style.width = `${width}px`
+        if (shape === "underline") {
+            overlay.style.top = `${rect.bottom - CURSOR_UNDERLINE_HEIGHT_PX}px`
+            overlay.style.height = `${CURSOR_UNDERLINE_HEIGHT_PX}px`
+        } else {
+            overlay.style.top = `${rect.top}px`
+            overlay.style.height = `${rect.height}px`
+        }
+        overlay.style.display = "block"
+    } catch (err) {
+        hideCursorBoxOverlay()
+    }
 }
-
-const BOX_WIDTH_REFRESH_DEBOUNCE_MS = 150
-let boxWidthRefreshTimer = null
-function scheduleBoxWidthRefresh() {
-    if (mode !== "normal" && mode !== "visual" && mode !== "visualLine") return
-    clearTimeout(boxWidthRefreshTimer)
-    boxWidthRefreshTimer = setTimeout(async () => {
-        // Re-check: mode may have changed, or another oracle read may have
-        // started, during the debounce wait.
-        if (mode !== "normal" && mode !== "visual" && mode !== "visualLine") return
-        if (wordMotionBusy || findBusy) return
-        const after = await readAfterCursor()
-        if (mode !== "normal" && mode !== "visual" && mode !== "visualLine") return // could have changed while awaiting
-        if (after === null || after.length === 0) return
-        const fontInfo = getCursorFontInfo()
-        if (!fontInfo) return
-        const width = measureCharWidth(fontInfo, after[0])
-        if (width) positionCursorBoxOverlay(width)
-    }, BOX_WIDTH_REFRESH_DEBOUNCE_MS)
-}
-
 
 let mode = 'normal'
 let tempnormal = false 
@@ -296,31 +271,52 @@ modeIndicator.style.fontWeight = '500'
 modeIndicator.style.zIndex = '9999'
 document.body.appendChild(modeIndicator)
 
+// Called after every normal/visual-mode keystroke, including ones like
+// plain h/l/j/k that don't otherwise call updateModeIndicator() (which
+// only runs on an actual mode transition). Instant and synchronous --
+// nothing here is async or touches the clipboard, so it's safe to call
+// after every single keystroke without any latency or concurrency concern.
+function refreshCursorOverlayForCurrentMode() {
+    if (mode === "normal" || mode === "visual" || mode === "visualLine") {
+        updateCursorOverlay("block")
+    } else if (mode === "insert") {
+        hideCursorBoxOverlay()
+    } else {
+        // Pending-input modes (waitForFirstInput, waitForSecondInput,
+        // waitForVisualInput, waitForRegister, waitForFindChar,
+        // replaceChar, multipleMotion): underline, matching real Vim.
+        updateCursorOverlay("underline")
+    }
+}
+
 function updateModeIndicator(currentMode) {
     modeIndicator.textContent = currentMode.toUpperCase()
     switch(currentMode) {
         case 'normal':
             modeIndicator.style.backgroundColor = '#1a73e8'
             modeIndicator.style.color = 'white'
-            updateCursorBoxWidth()
+            updateCursorOverlay("block")
             break
         case 'insert':
             modeIndicator.style.backgroundColor = '#34a853'
             modeIndicator.style.color = 'white'
+            hideCursorBoxOverlay()
             break
         case 'visual':
         case 'visualLine':
             modeIndicator.style.backgroundColor = '#fbbc04'
             modeIndicator.style.color = 'black'
-            updateCursorBoxWidth()
+            updateCursorOverlay("block")
             break
         case 'waitForFirstInput':
         case 'waitForSecondInput':
         case 'waitForVisualInput':
         case 'waitForRegister':
+        case 'waitForFindChar':
         case 'replaceChar':
             modeIndicator.style.backgroundColor = '#ea4335'
             modeIndicator.style.color = 'white'
+            updateCursorOverlay("underline")
             break
     }
 }
@@ -356,7 +352,6 @@ function switchModeToVisual() {
     updateModeIndicator(mode)
     sendKeyEvent('right', { shift: true })
     visualSelectionChars = 1
-    updateCursorBoxWidth()
 }
 
 async function switchModeToVisualLine() {
@@ -364,17 +359,27 @@ async function switchModeToVisualLine() {
     updateModeIndicator(mode)
     sendKeyEvent('home')
     sendKeyEvent('down', { shift: true })
-    updateCursorBoxWidth()
     // Learn exactly how many characters this initial line-based selection
     // spans, so a later w/e/b/f/t extension in visual-line mode can
     // correctly account for what's already selected. One-time read -- V is
     // a discrete action, not a hot loop, so this doesn't cost anything on
-    // the path the latency complaints were actually about.
-    const text = await withClipboardSaved(async (previousClipboard) => {
-        clickMenu(menuItems.copy)
-        return await pollClipboardForChange(previousClipboard)
-    })
-    visualSelectionChars = (text !== null) ? text.length : 0
+    // the path the latency complaints were actually about. Guarded by
+    // oracleBusy like every other oracle read, so this can't overlap with
+    // anything else touching the clipboard-based text oracle.
+    if (oracleBusy) {
+        visualSelectionChars = 0
+        return
+    }
+    oracleBusy = true
+    try {
+        const text = await withClipboardSaved(async (previousClipboard) => {
+            clickMenu(menuItems.copy)
+            return await pollClipboardForChange(previousClipboard)
+        })
+        visualSelectionChars = (text !== null) ? text.length : 0
+    } finally {
+        oracleBusy = false
+    }
 }
 
 function switchModeToNormal() {
@@ -382,23 +387,12 @@ function switchModeToNormal() {
     mode = 'normal'
     updateModeIndicator(mode)
     visualSelectionChars = 0
-
-    const ct = getCursorTop()
-    if (ct) {
-        ct.style.opacity = 1
-        ct.style.display = "block"
-        ct.style.backgroundColor = "black"
-    }
-    updateCursorBoxWidth()
 }
 
 function switchModeToInsert() {
     mode = 'insert'
     updateModeIndicator(mode)
     visualSelectionChars = 0
-    hideCursorBoxOverlay()
-    const ct = getCursorTop()
-    if (ct) ct.style.opacity = 0
 }
 
 function switchModeToWait() {
@@ -437,7 +431,18 @@ let pendingFindOperator = null   // null for a plain/visual motion, else 'c'/'d'
 let pendingFindCount = 1
 let pendingFindReturnMode = "normal" // mode to resume in: 'normal' | 'visual' | 'visualLine'
 let lastFind = null              // { type, char } for ';' and ','
-let findBusy = false             // re-entrancy guard around the async clipboard read
+
+// Single, unified re-entrancy guard around every use of the clipboard-based
+// text oracle (readAfterCursor/readBeforeCursor and anything that calls
+// them: f/F/t/T, w/e/b, ^/_, and the one-time visual-line-mode selection
+// read). Previously f/t and w/e/b each had their own separate busy flag,
+// which meant they only guarded against *themselves* overlapping, not
+// against each other, or against anything else touching the oracle
+// concurrently -- a real gap that (combined with a since-removed
+// oracle-based cosmetic cursor-width refresh) could let two overlapping
+// select+Copy+retract cycles fight over the same selection. Everything
+// that starts an oracle read now checks and sets this one flag.
+let oracleBusy = false
 
 let longStringOp = ""
 let operatorCount = 0 
@@ -915,7 +920,7 @@ async function performFind(type, char, count, operator, returnMode) {
 // same issue, by not consuming the translated `key` for its actual character
 // either -- see the `mode == 'replaceChar'` branch in eventHandler.)
 function handleFindCharInput(rawKey) {
-    if (findBusy) return
+    if (oracleBusy) return
     if (rawKey.length !== 1) {
         pendingFindType = null
         pendingFindOperator = null
@@ -930,19 +935,23 @@ function handleFindCharInput(rawKey) {
     pendingFindOperator = null
     pendingFindCount = 1
 
-    findBusy = true
+    oracleBusy = true
     performFind(type, rawKey, count, operator, returnMode).finally(() => {
-        findBusy = false
+        oracleBusy = false
     })
 }
 
 function repeatLastFind(reverse, operator = null, returnMode = "normal") {
     if (!lastFind) return
+    if (oracleBusy) return
     let { type, char } = lastFind
     if (reverse) {
         type = { f: "F", F: "f", t: "T", T: "t" }[type]
     }
-    performFind(type, char, 1, operator, returnMode)
+    oracleBusy = true
+    performFind(type, char, 1, operator, returnMode).finally(() => {
+        oracleBusy = false
+    })
 }
 
 function goToStartOfLine() {
@@ -959,28 +968,34 @@ function goToEndOfLine() {
 // unlike f/t/w/e/b it reads both directions -- a rarer-invoked motion, so
 // the extra read is an acceptable trade for correctness here.
 async function goToFirstNonBlank(operator, returnMode) {
-    const before = await readBeforeCursor()
-    const after = await readAfterCursor()
-    if (before === null || after === null) {
-        finishFind(returnMode)
-        return
-    }
-    const full = before + after
-    const match = full.search(/\S/)
-    const firstNonBlank = (match === -1) ? 0 : match // an all-blank line: approximate as column 0 rather than real Vim's "last character" -- documented gap
-    const delta = firstNonBlank - before.length
-    if (delta === 0) {
-        if (operator) {
-            runLongStringOp(operator, false)
-        } else if (returnMode === "visual" || returnMode === "visualLine") {
-            mode = returnMode
-            updateModeIndicator(mode)
-        } else {
-            switchModeToNormal()
+    if (oracleBusy) return
+    oracleBusy = true
+    try {
+        const before = await readBeforeCursor()
+        const after = await readAfterCursor()
+        if (before === null || after === null) {
+            finishFind(returnMode)
+            return
         }
-        return
+        const full = before + after
+        const match = full.search(/\S/)
+        const firstNonBlank = (match === -1) ? 0 : match // an all-blank line: approximate as column 0 rather than real Vim's "last character" -- documented gap
+        const delta = firstNonBlank - before.length
+        if (delta === 0) {
+            if (operator) {
+                runLongStringOp(operator, false)
+            } else if (returnMode === "visual" || returnMode === "visualLine") {
+                mode = returnMode
+                updateModeIndicator(mode)
+            } else {
+                switchModeToNormal()
+            }
+            return
+        }
+        applyMotionSteps(delta > 0, false, Math.abs(delta), operator, returnMode)
+    } finally {
+        oracleBusy = false
     }
-    applyMotionSteps(delta > 0, false, Math.abs(delta), operator, returnMode)
 }
 
 function selectToStartOfLine() {
@@ -1106,17 +1121,16 @@ function fallbackWordEnd(shift) {
 // one is already in flight (there's no "waiting for input" mode transition
 // for these, unlike f/t, so eventHandler would otherwise happily dispatch a
 // second call mid-read).
-let wordMotionBusy = false
 let pendingWordCount = 1
 let pendingLineCount = 1
 
 async function performWordMotion(kind, classify, count, operator, returnMode) {
-    if (wordMotionBusy) return
-    wordMotionBusy = true
+    if (oracleBusy) return
+    oracleBusy = true
     try {
         await performWordMotionInner(kind, classify, count, operator, returnMode)
     } finally {
-        wordMotionBusy = false
+        oracleBusy = false
     }
 }
 
@@ -1689,7 +1703,7 @@ function handleKeyEventNormal(key) {
             switchModeToInsert()
         }
     }
-    scheduleBoxWidthRefresh()
+    refreshCursorOverlayForCurrentMode()
 }
 
 function handleKeyEventVisualLine(key) {
@@ -1801,7 +1815,7 @@ function handleKeyEventVisualLine(key) {
             break
 
     }
-    scheduleBoxWidthRefresh()
+    refreshCursorOverlayForCurrentMode()
 }
 
 let menuItemElements = {}
@@ -1918,5 +1932,5 @@ switchModeToNormal()
 // element actually shows up fixes this without needing any user action.
 waitForElement(
     () => getCursorTop(),
-    () => { if (mode === "normal") updateCursorBoxWidth() },
+    () => { if (mode === "normal") updateCursorOverlay("block") },
 )
