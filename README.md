@@ -89,7 +89,12 @@ live, on-demand read every time, not a cached copy of the document, so it
 stays correct even while collaborators are editing elsewhere in the doc; the
 only risk window is the read itself, which only touches one side of the
 cursor (whichever the motion needs) and takes on the order of a hundred
-milliseconds or so. See MISSING_VIM_FEATURES.md for the latency and scoping
+milliseconds or so. Reads write a unique marker to the clipboard first, so
+"nothing was copied" (empty selection, e.g. at the end of a line) is
+distinguishable from "copied the same text", and any key you press while a
+read is in flight is queued and replayed in order afterwards. Visual mode
+never reads while a selection is live: `v` takes one snapshot of the line
+before it creates the selection, and everything after that is arithmetic. See MISSING_VIM_FEATURES.md for the latency and scoping
 caveats.
 
 ### Numbered Prefixed Motions
@@ -181,28 +186,49 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
   - This is still one of the newer, less-tested parts of DocsKeys -- see
     MISSING_VIM_FEATURES.md for the caveats.
 
-Note: DocsKeys' `iw`/`aw` (and `ip`/`ap`) text objects currently behave
-identically -- both act like the "inner" variant. Real Vim's "a" (around)
-variants additionally grab surrounding whitespace; DocsKeys can now read
-enough of the line to do this (the same word/WORD tokenizer that powers
-`w`/`e`/`b`), it's just not wired up yet. See MISSING_VIM_FEATURES.md.
+Note: in *operator-pending* position (`diw`, `daw`, `dip`, `dap`, ...) DocsKeys'
+`iw`/`aw` (and `ip`/`ap`) still behave identically and `diw` has a known bug
+(see MISSING_VIM_FEATURES.md, "Known bugs found during review"). In *visual*
+mode `iw`/`aw` are now distinct and follow Vim's rules.
 
 #### Line Operations
 - `o` - Add new line below and enter insert mode
 - `O` - Add new line above and enter insert mode
 
 ### Visual Mode Commands
-When in visual mode (`v` or `V`):
-- All movement keys (`h`, `j`, `k`, `l`, `w`/`W`, `e`/`E`, `b`/`B`, `{`, `}`,
-  `g`, `G`, `0`/`^`/`_`, `$`) extend the selection
-- `iw`/`aw`, `ip`/`ap` - extend the selection to the current word/paragraph
+`v` starts charwise visual mode, `V` linewise. The selection is inclusive of the
+character under the cursor and the anchor character stays selected when the
+cursor passes it (`vh` selects two characters), as in Vim.
+
+**How `v` works.** When you press `v`, DocsKeys reads the current line once
+(before any selection exists -- see "How DocsKeys reads the document") and
+then computes every motion on that snapshot, so inside that line these are
+exact and instant, with no further clipboard use: `h` `l` `w` `W` `e` `E` `b`
+`B` `f` `F` `t` `T` `;` `,` `0` `^` `_` `$` `o` `O` `iw` `aw` `iW` `aW`.
+Counts work (`3w`, `2l`, `3fx`).
+
+Once the selection leaves that line (`j`, `k`, `{`, `}`, `g`, `G`, or a word
+motion running off the end of the line), Docs' native selection motions take
+over: `h`/`l`/`j`/`k`/`0`/`$` and word jumps still work, but `f`/`F`/`t`/`T`,
+`^` and `iw`/`aw` decline until you press `v` again. Visual LINE mode (`V`)
+is always in this native mode.
+
+- `iw`/`aw`, `iW`/`aW` - select the word/WORD (with a one-character selection);
+  repeating extends the selection. `aw` includes trailing white space, or
+  leading if there is none. `ip`/`ap` - select the paragraph (switches to
+  linewise, as in Vim)
+- `o` / `O` - go to the other end of the selection
 - `"{register}` - use a named register for the following `d`/`c`/`y`/`p`
-- `d` - Delete selected text
-- `c` - Change selected text
-- `y` - Yank selected text
+- `d` / `x` - Delete selected text
+- `c` / `s` - Change selected text
+- `y` - Yank selected text (the cursor goes to the start of the selection)
 - `p` - Paste over selected text
+- `Esc` - leave visual mode, cursor on the character the cursor was on. While
+  a pending `i`/`a`, `f`/`t`, `"` or count is waiting, `Esc` cancels just that
+  and stays in visual mode.
 
 Visual-mode changes are not dot-repeatable (see MISSING_VIM_FEATURES.md).
+`$` stops at the last character rather than also selecting the line break.
 
 ### Mode indicators
 
@@ -272,6 +298,8 @@ script's in-memory state. Nothing else is stored or sent anywhere.
   haven't been tested against a live Google Docs page -- see
   MISSING_VIM_FEATURES.md for both.
 - Custom key mappings are not supported
+- See the "Known bugs found during review" list in MISSING_VIM_FEATURES.md for the
+  open items scheduled for the next iteration
 - PR's are welcome to add these features
 
 ## License

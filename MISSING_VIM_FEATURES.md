@@ -47,6 +47,200 @@ commands entry below for the most extreme version of that same call.
 
 ## Implemented in this pass
 
+**Verification note.** Vim behavior below was checked against Vim's own
+documentation (visual.txt, motion.txt via vimhelp.org / neovim.io): the Visual
+selection includes the character under the cursor (`:help visual-use`), `o`
+goes to the other end (`v_o`), `aw` includes trailing white space or else
+leading (`v_aw`), `iw`/`aw` extend when repeated in Visual mode, and `ip`/`ap`
+make the selection linewise. Docs-side behavior (Copy disabled on an empty
+selection, a plain arrow on an empty selection just moves the caret, Home/End
+on wrapped lines) is *assumed*, not confirmed against a live page -- all the new
+code was exercised against a simulated Docs editor (the `tests/` folder:
+~2,000 randomized visual-mode steps compared against a Vim reference model,
+plus targeted scenarios), which cannot confirm those assumptions. See
+"Assumptions needing a live check" below.
+
+- **MUST-FIX, fixed: `v` broken after `h`/`j`/`k`, and `w`/`e`/`b`/`f`/`t`
+  "same".** Three separate causes, all real:
+  1. *The cosmetic box-cursor width refresh ran inside visual mode.* 150ms
+     after any keystroke it did shift+End, Copy, then retracted by the amount
+     it read -- against a live visual selection, with a bookkeeping value
+     (`visualSelectionChars`) that is 0 after `h` or `j`/`k`. The retract then
+     walked the focus all the way back onto the anchor: "takes you back to the
+     start". (`l` "worked most of the time" only because it keeps the value
+     positive.) The refresh is now normal-mode only.
+  2. *Oracle reads assumed a rightward, same-line selection.* Shift+End/Home
+     extend relative to the anchor, so after `h`/`k`/leftward `b`/`F`/`T` the
+     copied text and the retract length were wrong. Visual mode no longer reads
+     anything while a selection is live: `v` snapshots the line once (before
+     the selection exists) and every motion is computed from the snapshot.
+  3. *`v` then `h` produced an EMPTY selection* (Docs anchor at the cursor,
+     focus one to the right, `h` moves focus back onto the anchor), so a
+     following `d` Backspaced one unrelated character. Vim's selection is
+     inclusive; the model now flips the Docs-side anchor when the cursor
+     crosses it (`vh` selects two characters), using relative key presses only.
+- **Keystrokes typed during a document read are now queued and replayed.**
+  Previously, while a read had a temporary selection in place, plain
+  h/j/k/l/x/dd etc. acted on that selection (an `x` in that window deleted the
+  highlighted rest-of-line -- reproduced against the old file: "abc def ghi",
+  `l`, pause ~155ms, `x` gave "abc d") and the guarded ones (w/e/b/f/t/^) were
+  silently dropped. `r{char}` typed during a read is cancelled (its native
+  keydown was swallowed) rather than half-applied.
+- **Stale-clipboard bug in every read.** At the end of a line / on an empty
+  line, Docs' Copy is a no-op, the old poll returned the user's *previous
+  clipboard* as if it were the line, and f/t/w/e/b then moved by garbage step
+  counts (reproduced: `fo` at end of "hello world" jumped to column 0). Reads
+  now write a sentinel first, so "nothing copied" is unambiguous (and an
+  identical-text copy no longer waits out the timeout).
+- **Clipboard restore race.** Two reads back to back could snapshot the first
+  read's temporary text as "the user's clipboard" and later restore that.
+  `v` reads both sides under one save/restore, and every read now waits for the
+  previous restore to land.
+- **Counted visual motions dropped out of visual mode** (`3w`, `2l`): the
+  handler received `"multipleMotion"` as its return mode, and the count always
+  restored `"visualLine"` even for charwise `v`. Fixed; `3fx` in visual mode
+  now finds the 3rd occurrence.
+- **`iw`/`aw` in visual mode**: the prefix was never recorded (so they were
+  identical), any other key silently switched to visual LINE mode, and `viw`
+  always ended in visual line mode. Now `iw`/`aw`/`iW`/`aW` follow Vim's rules
+  and stay charwise; `ip`/`ap` still go linewise (correct per `:help v_ip`).
+- **Escape in visual sub-states** (pending `f`, `i`/`a`, `"`, count) left the
+  selection highlighted while DocsKeys thought it was in normal mode. Escape
+  now cancels just the pending sub-command and stays in visual mode.
+- **Cursor after leaving visual mode**: `Esc` now leaves the caret on the
+  cursor character (it used to land one past it for forward selections and on
+  the anchor's side for backward ones); `y` in charwise visual mode now
+  collapses to the start of the selection like Vim (the selection used to stay
+  highlighted).
+- **`V` + `"ap`**: the linewise-mode Left keypress ran before the async paste,
+  so the paste landed at the selection's start instead of replacing it.
+- **`;` / `,` flipped the stored direction** (after `,`, a `;` went backward);
+  they now leave the last find unchanged, like Vim.
+- **`V` no longer performs a clipboard read** when entered (it existed only to
+  feed the old bookkeeping).
+- New in visual mode: `o`/`O`, `x` (= `d`), `s` (= `c`), true `aw`/`aW`.
+
+### Assumptions needing a live check (please verify on a real Doc)
+1. Docs' Edit > Copy does nothing when nothing is selected (the sentinel logic
+   treats "still the sentinel after 250ms" as "empty selection").
+2. A plain Left/Right on an *empty* selection made by shift+arrows moves the
+   caret by one character (used when the Docs-side anchor has to move).
+3. Home/End on a wrapped paragraph stop at the visual-line boundary, and the
+   copy of that range has no newline in it (the `v` snapshot falls back to the
+   old native behavior if the text contains a line-break character).
+4. Left after Copy (used by visual `y`) collapses the selection without
+   affecting the copy. (Visual LINE `y` already relied on this.)
+5. `DEBUG_TIMING` (top of `content.js`) logs the read timings; the first read
+   at a new end-of-line position waits out the 250ms empty-read timeout, and
+   keys typed in that window are queued, so it can feel like a short stall.
+
+### Known deviations kept deliberately in visual mode
+- `$` selects up to the last character; real Vim's `v$` also selects the line
+  break (not confirmed either way in the docs found; excluding it avoids
+  accidentally joining lines).
+- Leaving the line (`j`/`k`/`{`/`}`/`g`/`G`) drops the exact model for the rest
+  of that visual session. The anchor character is kept selected across the
+  first vertical move (orientation is normalised first), but a vertical move
+  *up into a shorter line* lands one character short, and `w`/`e`/`b` that run
+  off the end of the line use Docs' native word jump (one character short of
+  Vim's landing character).
+- Word/find reads count UTF-16 code units; see bug 4 below.
+
+## Known bugs found during review -- NEXT ITERATION (not fixed this pass)
+Marked here per request; ordered by how likely they are to bite. "verified"
+means confirmed by reading the code *and* reproduced in the simulated editor
+or by direct logic; "unverified" needs a live check first.
+
+1. **`diw` / `daw` / `ciw` are wrong (verified by code reading).**
+   `waitForSecondInput` implements `iw` as "`b` then `dw`". From the FIRST
+   character of a word, `b` jumps to the *previous* word, so `diw` there
+   deletes the previous word plus spaces. It also mishandles punctuation and
+   white space, and `aw` is identical to `iw`. Fix: reuse the new
+   `textObjectRange()` (already exact for visual mode) on a line read.
+2. **`y` operator leaves the selection highlighted** (`yw`, `yy`, `y$`, ...):
+   Vim moves the cursor to the start of the yanked text; DocsKeys leaves the
+   highlight and the caret at the end (verified by code reading).
+3. **`V` (visual line) has no anchor-line model.** `Vk` on the first line
+   collapses to an EMPTY selection; a following `d` Backspaces one unrelated
+   character (data-loss class, same shape as the fixed `vh` bug). `V` + `o`,
+   `V` + `w`/`e`/`b`/`f` are native/declined. Fix: the same relative-key model
+   with lines as the unit (Up/Down) instead of characters.
+4. **Non-BMP characters and combining marks (emoji, accents) miscount.** Reads
+   count UTF-16 code units; arrow keys move by grapheme. Any read of a line
+   containing them makes w/e/b/f/t/`v` land off. Fix: segment with
+   `Intl.Segmenter` and index by grapheme.
+5. **`;` after `t`/`T` gets stuck** when the character is directly ahead
+   (unverified against `:help cpo-;` -- Vim's default `cpo` lacks `;`, which I
+   believe means Vim jumps to the *next* occurrence instead of not moving).
+6. **Native Ctrl shortcuts pass through during a read** (Ctrl+V/C/Z etc. are
+   not queued): for the ~100-300ms a read takes, a paste would hit the
+   temporary selection and the temporary clipboard contents.
+7. **`tempnormal` still goes stale** after `Ctrl+o` + visual/operator (already
+   documented below, still open).
+8. **Cosmetic width refresh still runs a clipboard read after every pause in
+   normal mode.** Now queue-safe, but it is the only remaining always-on
+   reader. Consider replacing it with a measurement that never touches the
+   selection, or removing it.
+9. **Visual-mode box cursor is drawn at Docs' focus caret**, which for a
+   forward selection is one character right of Vim's cursor character
+   (cosmetic).
+10. **Async gap in `d`/`c` with a register**: the clipboard is read before the
+    edit runs; a key typed inside that few-millisecond gap isn't queued.
+11. **`x`/`s`/`J`/`p` ignore counts**; visual `D`/`C`/`Y`/`J`/`u`/`r`/`~` are
+    not implemented.
+12. **All-blank line**: `^` goes to column 0 instead of the last character.
+
+## Implemented in the previous pass (partly superseded -- see the visual-mode rewrite above)
+
+- **The real bug behind visual-mode w/e/b/f/t being "totally broken" after
+  h/j/k/l, and selections growing in the wrong direction.** Deeper than
+  the last two passes' fixes: the whole technique behind `readAfterCursor()`/
+  `readBeforeCursor()` assumes the visual-mode anchor and the current
+  cursor/focus are on the *same line* -- true right after `v` (or after
+  `h`/`l`, which stay on the line), but `j`/`k`/`{`/`}`/`g`/`G` move focus to
+  a genuinely different line. Once that happens, Shift+End/Shift+Home
+  extends focus to the end of *focus's new line*, and the copied text ends
+  up spanning whatever lies between that point and the anchor -- which can
+  be entire unrelated lines in between, not "text from the cursor forward"
+  in any sense. This isn't a precision loss that slicing can patch up; the
+  read captures fundamentally the wrong content, which explains selections
+  growing in unexpected directions and by unexpected amounts. Fixed with a
+  new `visualCrossedLines` flag: once anchor and focus are no longer known
+  to be on the same line (or even just no longer known to be at a known
+  offset -- `0`/`$` also set it, since the exact anchor-relative distance
+  becomes unknown even though they don't leave the line), `w`/`e`/`b`
+  bypass the oracle entirely and fall back to native Ctrl+arrow motions
+  (safe -- Docs' own selection handling, not ours -- just less exactly
+  Vim-precise), and `f`/`F`/`t`/`T`/`^`/`_` (which have no native
+  equivalent to fall back to) decline with a console warning rather than
+  risk acting on a wrong read. `v`/`V` reset the flag; `V` actually starts
+  with it already set to `true`, since visual*line* mode spans onto a
+  second line from the moment it's entered, so the same-line assumption
+  never held for it in the first place. Verified with a standalone test
+  that mocks the oracle functions to throw if called: confirms
+  `performWordMotionInner()` never touches them once `visualCrossedLines`
+  is set, and still correctly uses them when it's not.
+- **Box cursor is more transparent** (`rgba(0,0,0,0.25)`, down from `0.5`).
+- **Accurate per-character width is back, safely this time.** Removed last
+  pass specifically because it checked `oracleBusy` but never set it,
+  creating a real race. It now sets the same flag every other oracle
+  caller respects, so a real motion firing while this cosmetic read is in
+  flight simply no-ops for that one keystroke (consistent with how any two
+  oracle users already contend for it) instead of racing.
+- **Native cursor now hidden while the overlay is shown**, restored only
+  when entering insert mode (the one path that un-hides it) -- so you no
+  longer see both a translucent overlay and Docs' own blinking caret at
+  once in normal/visual mode.
+- **Known remaining gap, narrower than what this pass fixed**: reversing
+  direction *within the same line* (e.g. `v`, then `w` a few times, then
+  enough `b` presses to cross back past the anchor) isn't caught by
+  `visualCrossedLines` the way an actual line change is, and can still read
+  a subtly wrong (too-short) range -- the anchor and focus are still
+  genuinely on the same line, so the flag has no reason to trip, but the
+  read's interpretation of "already selected" assumed the selection was
+  still growing in its original direction. Not fixed this pass; flagged
+  here rather than left silently broken.
+
 - **Real concurrency bug: a cosmetic, debounced box-width refresh could race
   with an actual motion.** The previous pass's debounced width refresh
   checked whether a real motion was already using the text oracle before
@@ -361,7 +555,7 @@ commands entry below for the most extreme version of that same call.
     an acceptable, self-correcting-ish edge case given how much this was
     the actual latency complaint.
 
-## Implemented in the previous pass
+## Implemented two passes ago
 
 - **`e` bug fix (landing mid-word, e.g. between 'o' and 'n' in "discussions").**
   Root cause: the previous fix for the `ee`/`2e` repeat-press bug (see
@@ -686,9 +880,9 @@ commands entry below for the most extreme version of that same call.
 
 ## Known limitations / inconsistencies (not bugs per se)
 
-- **`iw`/`aw` (and `ip`/`ap`) are currently identical.** Both act like the
-  "inner" variant; the "a" variants don't extend the selection to include
-  surrounding whitespace the way real Vim does.
+- **`iw`/`aw` (and `ip`/`ap`) are identical in operator-pending position**
+  (`diw`/`daw`, see Known bugs #1 above). In visual mode `iw`/`aw` are now
+  distinct and follow Vim.
 - **`e`'s fix is a single-space approximation.** See "Implemented in this
   pass" above -- multiple spaces/tabs between words, or words directly
   adjacent to punctuation, can still land `e` one or more characters short of
