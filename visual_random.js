@@ -50,8 +50,9 @@ function makeLine() {
         if (ok) {
           const fwd = type === "f" || type === "t", till = type === "t" || type === "T"
           let target = null
-          if (fwd) { const r = ctx.findForward(line.slice(c), ch, 1); if (r.found) { const st = till ? r.matchIndex - 1 : r.matchIndex; if (st >= 0) target = c + st } }
-          else { const r = ctx.findBackward(line.slice(0, c), ch, 1); if (r.found) { const st = till ? r.distance - 1 : r.distance; if (st >= 0) target = c - st } }
+          const skip = (k === ";" || k === ",") && till   // Vim default cpo (no ';'): ; and , after t/T skip an adjacent match
+          if (fwd) { const r = ctx.findForward(line.slice(c), ch, 1, skip); if (r.found) { const st = till ? r.matchIndex - 1 : r.matchIndex; if (st >= 0) target = c + st } }
+          else { const r = ctx.findBackward(line.slice(0, c), ch, 1, skip); if (r.found) { const st = till ? r.distance - 1 : r.distance; if (st >= 0) target = c - st } }
           if (k !== ";" && k !== ",") { if (target !== null) last = { type, ch } }
           else if (target !== null) last = { type: last.type, ch: last.ch } // ; and , keep original
           if (target !== null) nc = target

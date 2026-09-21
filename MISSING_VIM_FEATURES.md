@@ -146,49 +146,87 @@ plus targeted scenarios), which cannot confirm those assumptions. See
   Vim's landing character).
 - Word/find reads count UTF-16 code units; see bug 4 below.
 
-## Known bugs found during review -- NEXT ITERATION (not fixed this pass)
-Marked here per request; ordered by how likely they are to bite. "verified"
-means confirmed by reading the code *and* reproduced in the simulated editor
-or by direct logic; "unverified" needs a live check first.
+## Implemented in the latest pass (bug-list iteration)
 
-1. **`diw` / `daw` / `ciw` are wrong (verified by code reading).**
-   `waitForSecondInput` implements `iw` as "`b` then `dw`". From the FIRST
-   character of a word, `b` jumps to the *previous* word, so `diw` there
-   deletes the previous word plus spaces. It also mishandles punctuation and
-   white space, and `aw` is identical to `iw`. Fix: reuse the new
-   `textObjectRange()` (already exact for visual mode) on a line read.
-2. **`y` operator leaves the selection highlighted** (`yw`, `yy`, `y$`, ...):
-   Vim moves the cursor to the start of the yanked text; DocsKeys leaves the
-   highlight and the caret at the end (verified by code reading).
-3. **`V` (visual line) has no anchor-line model.** `Vk` on the first line
-   collapses to an EMPTY selection; a following `d` Backspaces one unrelated
-   character (data-loss class, same shape as the fixed `vh` bug). `V` + `o`,
-   `V` + `w`/`e`/`b`/`f` are native/declined. Fix: the same relative-key model
-   with lines as the unit (Up/Down) instead of characters.
-4. **Non-BMP characters and combining marks (emoji, accents) miscount.** Reads
-   count UTF-16 code units; arrow keys move by grapheme. Any read of a line
-   containing them makes w/e/b/f/t/`v` land off. Fix: segment with
-   `Intl.Segmenter` and index by grapheme.
-5. **`;` after `t`/`T` gets stuck** when the character is directly ahead
-   (unverified against `:help cpo-;` -- Vim's default `cpo` lacks `;`, which I
-   believe means Vim jumps to the *next* occurrence instead of not moving).
-6. **Native Ctrl shortcuts pass through during a read** (Ctrl+V/C/Z etc. are
-   not queued): for the ~100-300ms a read takes, a paste would hit the
-   temporary selection and the temporary clipboard contents.
-7. **`tempnormal` still goes stale** after `Ctrl+o` + visual/operator (already
-   documented below, still open).
-8. **Cosmetic width refresh still runs a clipboard read after every pause in
-   normal mode.** Now queue-safe, but it is the only remaining always-on
-   reader. Consider replacing it with a measurement that never touches the
-   selection, or removing it.
-9. **Visual-mode box cursor is drawn at Docs' focus caret**, which for a
-   forward selection is one character right of Vim's cursor character
-   (cosmetic).
-10. **Async gap in `d`/`c` with a register**: the clipboard is read before the
-    edit runs; a key typed inside that few-millisecond gap isn't queued.
-11. **`x`/`s`/`J`/`p` ignore counts**; visual `D`/`C`/`Y`/`J`/`u`/`r`/`~` are
-    not implemented.
-12. **All-blank line**: `^` goes to column 0 instead of the last character.
+Vim behavior checked against Vim's own sources/docs: `:help cpo-;` and patch
+7.3.235 (search.c `searchc()`: for `;`/`,` with count 1 and no `;` in the
+default `cpo` "aABceFs", a match directly next to the cursor is skipped),
+`:help v_aw`/`iw`/`aw`/`v_o`, `:help y` (cursor goes to the start of the
+yanked text), `:help ^`.
+Everything below was exercised in the simulated editor (`tests/fixes.js`,
+`tests/overlay.js`, plus the older suites); none of it has been run against a
+live Google Doc.
+
+- **`diw`/`daw`/`ciw`/`yiw`/`diW`/`daW` fixed** (was "`b` then `dw`"). One line
+  read + the exact `textObjectRange()` used by visual mode. `iw`/`aw` now
+  differ; a count (`d2aw`) extends the object; dot-repeat re-reads at the new
+  position. `ip`/`ap` unchanged.
+- **`V` rewritten around a line model.** `Vk` on the first line no longer
+  makes an empty selection; `Vk` selects the line above, `Vj` shrinks it
+  again, `V3j`, `VG`, `Vg`, `V{`/`V}` work, and h/l/w/b/e/W/B/E/f/t/;/,/0/^/$
+  do nothing (they used to extend the highlight by characters and words).
+  Relative key presses only, no reads (see the comment above `visualLineOrient`).
+- **Empty-selection guard.** d/c/y/x/s in V, and in charwise visual once the
+  selection has left its line (native mode), first Copy-check that the
+  selection is not empty; if it is, nothing is changed. This is the
+  data-loss class behind the old `vh` and `Vk` bugs.
+- **Emoji / combining marks / ZWJ sequences.** All reads are split into
+  grapheme arrays (`Intl.Segmenter`) and every index is a grapheme index.
+  Word classes are Unicode aware (accented and non-Latin letters are word
+  characters; emoji are their own class, as in Vim's `utf_class()`). The
+  temporary read selection is now collapsed with one plain Left/Right instead
+  of N counted shift-presses. (`f`/`t` also accept an emoji argument.)
+- **`y` with an operator** (`yw`, `yy`, `y$`, `yiw`, `yfx`, ...) collapses the
+  selection to its start like Vim (`yb` moves the caret back).
+- **`;`/`,` after `t`/`T`** jump to the next occurrence (Vim default). Also
+  fixed `findBackward()` re-finding the last element on negative
+  `lastIndexOf` indices with arrays/counts.
+- **Ctrl shortcuts during a read** are held: Ctrl/Cmd+C/X/V/Z/Y are replayed
+  through the Edit menu afterwards, other Ctrl/Alt/Meta letter and editing keys
+  are dropped for the (sub-second) window.
+- **Held keys.** Key-repeat events that arrive while a read is in flight are
+  dropped instead of queued, so a held `w` stops when you let go.
+  Empty-read timeout is adaptive (>= 90ms, ~3x measured copy latency; was a
+  flat 250ms at line ends -- most of the lag when `w` crossed a line).
+- **Box cursor.** Re-positioned every animation frame from the native caret's
+  rectangle, so it follows arrow keys, mouse clicks and scrolling; blink "off"
+  frames keep the last geometry. The exact-width refresh selects ONE character
+  (not the rest of the line), debounce 40ms (was 150ms), and also runs when
+  the caret moves without DocsKeys' help.
+- **No stray selections in normal mode.** A failed read now marks the state for
+  a check that collapses any leftover selection; a mouse drag / double-click /
+  shift-click / Ctrl+A / Ctrl+Shift+arrows in normal mode is detected and turns
+  into Visual mode (as in Vim), so the badge always matches the screen.
+  A click while in a visual mode drops the exact model (native motions).
+- **Clipboard restore races.** An oracle stays "busy" until its clipboard
+  restore has landed; unregistered `p`/`y` wait for pending restores.
+- `^` on an all-blank line goes to the last character (old bug 12).
+
+## Known bugs / gaps -- NEXT ITERATION
+
+1. **Visual line at the document edges.** The V model counts lines; Docs
+   clamps silently at the first/last line, so after `Vk` on the first line a
+   following `j` can leave an empty/shifted selection (the guard then makes
+   `d` a no-op instead of deleting something). On the last line the selection
+   ends at the document end rather than after a line break, so `Vd` there
+   leaves an empty line. Counting is in Docs *display* lines (wrapped rows).
+2. **`yy`/`Y`/`yj` leave the caret at the line start** (Vim keeps the column).
+3. **Selection watchdog is event-driven.** It only looks after a failed read or
+   a mouse/keyboard event that can create a selection; a selection made by
+   some other route in normal mode is not noticed until then.
+4. **A held `w` is throttled to read speed** (about one word per read); the
+   exact Vim word semantics need the read, and native Ctrl+Right can't
+   replace it.
+5. **`tempnormal` still goes stale** after `Ctrl+o` + visual/operator.
+6. **Async gap in `d`/`c` with a register** (key typed inside the few-ms
+   clipboard read isn't queued); the visual guard adds ~one copy round-trip to
+   `d`/`c` in V and native visual.
+7. **`x`/`s`/`J`/`p` ignore counts**; visual `D`/`C`/`Y`/`J`/`u`/`r`/`~` are not
+   implemented.
+8. **Assumptions to verify on a live Doc** (in addition to the list above):
+   plain Left/Right on a non-empty selection collapses to its start/end;
+   arrow keys step over whole graphemes; the native caret element's rectangle
+   follows the selection focus and is zero-height while blinking off.
 
 ## Implemented in the previous pass (partly superseded -- see the visual-mode rewrite above)
 

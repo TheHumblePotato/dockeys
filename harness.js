@@ -25,6 +25,20 @@ class DocSim {
         if (end === -1) end = this.text.length
         return { start, end }
     }
+    prevB(f) { // previous grapheme boundary (arrow keys step over whole graphemes)
+        if (f <= 0) return 0
+        if (!DocSim.seg) return f - 1
+        let last = 0
+        for (const s of DocSim.seg.segment(this.text)) { if (s.index >= f) break; last = s.index }
+        return last
+    }
+    nextB(f) {
+        const n = this.text.length
+        if (f >= n) return n
+        if (!DocSim.seg) return f + 1
+        for (const s of DocSim.seg.segment(this.text)) { if (s.index > f) return s.index }
+        return n
+    }
     hasSel() { return this.anchor !== this.focus }
     selRange() { return [Math.min(this.anchor, this.focus), Math.max(this.anchor, this.focus)] }
     selText() { const [s, e] = this.selRange(); return this.text.slice(s, e) }
@@ -44,10 +58,11 @@ class DocSim {
                 this.text = this.text.slice(0, s) + this.text.slice(e)
                 this.setCaret(s)
             } else if (k === "backspace" && this.focus > 0) {
-                this.text = this.text.slice(0, this.focus - 1) + this.text.slice(this.focus)
-                this.setCaret(this.focus - 1)
+                const p = this.prevB(this.focus)
+                this.text = this.text.slice(0, p) + this.text.slice(this.focus)
+                this.setCaret(p)
             } else if (k === "delete" && this.focus < this.text.length) {
-                this.text = this.text.slice(0, this.focus) + this.text.slice(this.focus + 1)
+                this.text = this.text.slice(0, this.focus) + this.text.slice(this.nextB(this.focus))
             }
             return
         }
@@ -59,8 +74,8 @@ class DocSim {
             this.setCaret(k === "left" ? s : e)
             return
         }
-        if (k === "left") f = ctrl ? this.wordLeft(f) : Math.max(0, f - 1)
-        else if (k === "right") f = ctrl ? this.wordRight(f) : Math.min(this.text.length, f + 1)
+        if (k === "left") f = ctrl ? this.wordLeft(f) : this.prevB(f)
+        else if (k === "right") f = ctrl ? this.wordRight(f) : this.nextB(f)
         else if (k === "home") f = ctrl ? 0 : this.lineInfo(f).start
         else if (k === "end") f = ctrl ? this.text.length : this.lineInfo(f).end
         else if (vertical) {
@@ -109,6 +124,8 @@ class DocSim {
     }
 }
 
+DocSim.seg = (typeof Intl !== 'undefined' && Intl.Segmenter) ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null
+
 function makeEnv(text, opts = {}) {
     const sim = new DocSim(text)
     if (opts.copyDelay !== undefined) sim.copyDelay = opts.copyDelay
@@ -154,6 +171,11 @@ function makeEnv(text, opts = {}) {
     })
     vm.runInContext(fs.readFileSync(opts.file || path.join(__dirname, "..", "content.js"), "utf8"), ctx)
     const get = (expr) => vm.runInContext(expr, ctx)
+    // The cosmetic idle refresh (box width / selection check) is 40ms in the
+    // extension; the fixed sleeps in the older tests were written against the
+    // old 150ms, so default to that here. Pass { refreshMs: 40 } to test the
+    // real timing.
+    vm.runInContext(`ACCURATE_WIDTH_REFRESH_DEBOUNCE_MS = ${opts.refreshMs !== undefined ? opts.refreshMs : 150}`, ctx)
     async function settle() {
         for (let i = 0; i < 400; i++) {
             let q = 0; try { q = get("keyQueue.length") } catch (e) {}
@@ -170,12 +192,12 @@ function makeEnv(text, opts = {}) {
         const cmd = get(`translateKey(${JSON.stringify(raw)})`)
         if (inv[cmd] === undefined) inv[cmd] = raw
     }
-    async function press(k, wait = true) {
+    async function press(k, wait = true, extra = {}) {
         const raw = (k === "Escape") ? k : (inv[k] !== undefined ? inv[k] : k)
-        return pressRaw(raw, wait)
+        return pressRaw(raw, wait, extra)
     }
-    async function pressRaw(k, wait = true) {
-        keydownHandler({ key: k, ctrlKey: false, altKey: false, metaKey: false, preventDefault() {}, stopImmediatePropagation() {} })
+    async function pressRaw(k, wait = true, extra = {}) {
+        keydownHandler(Object.assign({ key: k, ctrlKey: false, altKey: false, metaKey: false, shiftKey: false, preventDefault() {}, stopImmediatePropagation() {} }, extra))
         if (wait) { await sleep(1); await settle() }
     }
     async function pressAll(str) { for (const ch of str) await press(ch) }

@@ -71,8 +71,9 @@ including which of these are "not practical" vs. just "not done yet."
   first DocsKeys motions that actually read document text -- see "How f/F/t/T
   read the document" below for how, and MISSING_VIM_FEATURES.md for the
   caveats (scoped to the current wrapped line, not the full paragraph;
-  `;`/`,` only work as plain motions so far, not after an operator or in
-  visual mode).
+  `;`/`,` repeat the last find; after `t`/`T`, like Vim's default
+  `cpoptions`, they skip a match right next to the cursor and jump to the
+  next one).
 
 ### How DocsKeys reads the document
 
@@ -186,10 +187,12 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
   - This is still one of the newer, less-tested parts of DocsKeys -- see
     MISSING_VIM_FEATURES.md for the caveats.
 
-Note: in *operator-pending* position (`diw`, `daw`, `dip`, `dap`, ...) DocsKeys'
-`iw`/`aw` (and `ip`/`ap`) still behave identically and `diw` has a known bug
-(see MISSING_VIM_FEATURES.md, "Known bugs found during review"). In *visual*
-mode `iw`/`aw` are now distinct and follow Vim's rules.
+`iw`/`aw`/`iW`/`aW` work as operator targets (`diw`, `daw`, `ciw`, `yiw`,
+`d2aw`, ...) with Vim's rules: `iw` is the run of same-class characters under
+the cursor, `aw` adds trailing white space (or leading, if there is none).
+They read the current line once, like `f`/`t`. `ip`/`ap` are unchanged.
+Operator yanks (`yw`, `yy`, `y$`, `yiw`) leave the caret at the start of the
+yanked text, like Vim.
 
 #### Line Operations
 - `o` - Add new line below and enter insert mode
@@ -211,7 +214,10 @@ Once the selection leaves that line (`j`, `k`, `{`, `}`, `g`, `G`, or a word
 motion running off the end of the line), Docs' native selection motions take
 over: `h`/`l`/`j`/`k`/`0`/`$` and word jumps still work, but `f`/`F`/`t`/`T`,
 `^` and `iw`/`aw` decline until you press `v` again. Visual LINE mode (`V`)
-is always in this native mode.
+is separate: it always selects whole lines. `j`/`k` (with counts), `G`, `g`,
+`{`, `}` move it, `d`/`c`/`y`/`x`/`s`/`p` act on it, and every other motion
+(`h`, `l`, `w`, `b`, `f`, `$`, ...) does nothing, so the highlight can never
+include partial lines.
 
 - `iw`/`aw`, `iW`/`aW` - select the word/WORD (with a one-character selection);
   repeating extends the selection. `aw` includes trailing white space, or
@@ -229,6 +235,19 @@ is always in this native mode.
 
 Visual-mode changes are not dot-repeatable (see MISSING_VIM_FEATURES.md).
 `$` stops at the last character rather than also selecting the line break.
+
+### Selections and the box cursor
+
+The box cursor follows the real caret every frame, so arrow keys, mouse clicks
+and scrolling move it too. A selection can only exist in a visual mode: a
+mouse drag, double-click, shift-click, Ctrl+A or Ctrl+Shift+arrows in normal
+mode starts Visual mode (the badge always matches the screen), and anything
+DocsKeys itself leaves behind is collapsed. `d`/`c`/`y` in V, or in visual mode
+after the selection left its line, check that the selection isn't empty first
+and do nothing if it is. Holding down a motion such as `w` stops as soon as you
+release it (key-repeat that arrives during a document read is dropped, not
+queued). Text is handled per grapheme, so emoji and accented characters count
+as one character.
 
 ### Mode indicators
 
