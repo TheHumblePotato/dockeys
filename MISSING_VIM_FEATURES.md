@@ -146,61 +146,63 @@ plus targeted scenarios), which cannot confirm those assumptions. See
   Vim's landing character).
 - Word/find reads count UTF-16 code units; see bug 4 below.
 
-## Implemented in the latest pass (bug-list iteration)
+## Implemented in the latest pass (follow-up iteration)
 
-Vim behavior checked against Vim's own sources/docs: `:help cpo-;` and patch
-7.3.235 (search.c `searchc()`: for `;`/`,` with count 1 and no `;` in the
-default `cpo` "aABceFs", a match directly next to the cursor is skipped),
-`:help v_aw`/`iw`/`aw`/`v_o`, `:help y` (cursor goes to the start of the
-yanked text), `:help ^`.
-Everything below was exercised in the simulated editor (`tests/fixes.js`,
-`tests/overlay.js`, plus the older suites); none of it has been run against a
-live Google Doc.
-
-- **`diw`/`daw`/`ciw`/`yiw`/`diW`/`daW` fixed** (was "`b` then `dw`"). One line
-  read + the exact `textObjectRange()` used by visual mode. `iw`/`aw` now
-  differ; a count (`d2aw`) extends the object; dot-repeat re-reads at the new
-  position. `ip`/`ap` unchanged.
-- **`V` rewritten around a line model.** `Vk` on the first line no longer
-  makes an empty selection; `Vk` selects the line above, `Vj` shrinks it
-  again, `V3j`, `VG`, `Vg`, `V{`/`V}` work, and h/l/w/b/e/W/B/E/f/t/;/,/0/^/$
-  do nothing (they used to extend the highlight by characters and words).
-  Relative key presses only, no reads (see the comment above `visualLineOrient`).
-- **Empty-selection guard.** d/c/y/x/s in V, and in charwise visual once the
-  selection has left its line (native mode), first Copy-check that the
-  selection is not empty; if it is, nothing is changed. This is the
-  data-loss class behind the old `vh` and `Vk` bugs.
-- **Emoji / combining marks / ZWJ sequences.** All reads are split into
-  grapheme arrays (`Intl.Segmenter`) and every index is a grapheme index.
-  Word classes are Unicode aware (accented and non-Latin letters are word
-  characters; emoji are their own class, as in Vim's `utf_class()`). The
-  temporary read selection is now collapsed with one plain Left/Right instead
-  of N counted shift-presses. (`f`/`t` also accept an emoji argument.)
-- **`y` with an operator** (`yw`, `yy`, `y$`, `yiw`, `yfx`, ...) collapses the
-  selection to its start like Vim (`yb` moves the caret back).
-- **`;`/`,` after `t`/`T`** jump to the next occurrence (Vim default). Also
-  fixed `findBackward()` re-finding the last element on negative
-  `lastIndexOf` indices with arrays/counts.
-- **Ctrl shortcuts during a read** are held: Ctrl/Cmd+C/X/V/Z/Y are replayed
-  through the Edit menu afterwards, other Ctrl/Alt/Meta letter and editing keys
-  are dropped for the (sub-second) window.
-- **Held keys.** Key-repeat events that arrive while a read is in flight are
-  dropped instead of queued, so a held `w` stops when you let go.
-  Empty-read timeout is adaptive (>= 90ms, ~3x measured copy latency; was a
-  flat 250ms at line ends -- most of the lag when `w` crossed a line).
-- **Box cursor.** Re-positioned every animation frame from the native caret's
-  rectangle, so it follows arrow keys, mouse clicks and scrolling; blink "off"
-  frames keep the last geometry. The exact-width refresh selects ONE character
-  (not the rest of the line), debounce 40ms (was 150ms), and also runs when
-  the caret moves without DocsKeys' help.
-- **No stray selections in normal mode.** A failed read now marks the state for
-  a check that collapses any leftover selection; a mouse drag / double-click /
-  shift-click / Ctrl+A / Ctrl+Shift+arrows in normal mode is detected and turns
-  into Visual mode (as in Vim), so the badge always matches the screen.
-  A click while in a visual mode drops the exact model (native motions).
-- **Clipboard restore races.** An oracle stays "busy" until its clipboard
-  restore has landed; unregistered `p`/`y` wait for pending restores.
-- `^` on an all-blank line goes to the last character (old bug 12).
+- **Box cursor is now zoom-aware.** Its width came from measuring a
+  character against the hidden keystroke-capture iframe's own CSS
+  font-size, which does not track Google Docs' own zoom control (the
+  percentage dropdown) -- so the box stayed sized for 100% zoom regardless
+  of the actual zoom level, even though its height (read directly from the
+  real caret's rect) already did track it. Fixed by comparing the real
+  caret's rendered height against what that font-size "should" produce at
+  100% and scaling the measured width by the ratio -- see
+  `zoomFactorFor()`. Approximate (assumes a roughly constant line-height
+  ratio); unverified against a live page, like the rest of the font
+  measurement.
+- **Scrolling.** `Ctrl+d`/`Ctrl+u` (half screen, moves the cursor),
+  `Ctrl+f`/`Ctrl+b` (full screen, sent as native PageDown/PageUp -- Docs
+  already handles these as an editing shortcut, the same category of native
+  key Home/End already are), and `Ctrl+e`/`Ctrl+y` (one line, cursor
+  untouched -- nudges the scroll container's `scrollTop` directly, best
+  effort, warns if the container isn't found). Half/full-screen line counts
+  are estimated from `window.innerHeight` and the real caret's own height,
+  the same estimation style already used for the box cursor.
+- **Box cursor hides when the caret scrolls off-screen**, instead of being
+  left drawn at a stale or clipped position (the caret's own rect is still
+  valid and off-viewport when this happens, rather than zero -- distinct
+  from the blink "off" phase, which already has its own handling). It
+  reappears automatically once the caret scrolls back into view.
+- **`"+` (and `"*`, aliased to it) are now real system-clipboard registers**
+  (:help quoteplus). Previously `"+dw` silently fell through
+  `waitForRegisterInput` (no case matched `+`) and ran as a bare, unnamed
+  `dw` -- which deletes, so it looked like it worked, but the cut never
+  reached the OS clipboard the way Vim's `"+d` does. `"+d`/`"+c` now Copy
+  before deleting and skip the save-and-restore every other register does,
+  so the result is left on the clipboard; `"+y` and `"+p` are aliases for
+  plain `y`/`p`, which already go straight to the clipboard. `"*` has no
+  separate concept in a Chrome extension's clipboard API (no X11 primary
+  selection), so it's treated identically to `"+` -- a documented
+  approximation, not a full two-clipboard model.
+- **`3x`/`2s` now dot-repeat the COUNT, not one character.** `x`/`s` never
+  had a counted branch in `handleMultipleMotion`; a count fell through to
+  the generic `repeatMotion(handleKeyEventNormal, times, key)` path, which
+  did delete the right number of characters (each call is a real delete)
+  but only ever recorded the LAST call's single-character fn as the
+  dot-repeatable change, so `3x.` deleted 1 character instead of 3. Fixed
+  the same way `D`/`C`/`Y` already were: routed through `pendingLineCount`
+  so the whole count is one call, one recorded change.
+- **`~` (toggle case) implemented.** Previously listed as not practical
+  because it needs the character under the cursor -- true when this file
+  was write-only, but the oracle read already built for `f`/`t`/`w`/`e`/`b`
+  solves exactly that, and the write-to-clipboard-then-Paste technique
+  already used for pasting named registers is exactly the mechanism needed
+  to put computed text into the document (DocsKeys can never type text
+  itself). Scoped to `count` characters from the cursor, not crossing the
+  line (same scope as every other oracle motion here); a count (`3~`)
+  toggles that many and advances the cursor past them, matching Vim;
+  case-less characters (digits, punctuation, most non-Latin scripts) are
+  left unchanged via a plain upper/lower string comparison. Dot-repeatable.
+  Does not touch any register, matching `:help ~`.
 
 ## Known bugs / gaps -- NEXT ITERATION
 
@@ -866,8 +868,6 @@ live Google Doc.
   inserts at the cursor; without register type-tracking (charwise vs.
   linewise) there's no reliable way to make `P` behave differently from `p`,
   and shipping it as a no-op alias would be misleading rather than helpful.
-- **`~`** (toggle case of character under cursor) -- needs to read the
-  character first.
 - **Marks** (`m{x}`, `` `{x} ``, `'{x}`) -- would need to persist cursor
   positions across time with no reliable way to translate a saved position
   back into cursor movement after the document has changed.

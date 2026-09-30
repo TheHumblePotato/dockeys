@@ -136,6 +136,10 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
 - `Esc` - Return to normal mode
 - `Ctrl` + `o` - Temporary normal mode from insert mode (run one normal-mode
   command, then automatically return to insert mode)
+- `Ctrl` + `d` / `Ctrl` + `u` - Scroll/move the cursor half a screen down/up
+- `Ctrl` + `f` / `Ctrl` + `b` - Scroll/move the cursor a full screen down/up
+- `Ctrl` + `e` / `Ctrl` + `y` - Scroll the view one line down/up, without
+  moving the cursor (best-effort; see MISSING_VIM_FEATURES.md)
 
 #### Text Manipulation
 - `d` + motion - Delete. Supports `dw`/`dW`, `de`/`dE`, `db`/`dB`, `dh`, `dl`,
@@ -157,6 +161,10 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
   behavior as `yy`/`dd` (`3Y` yanks 3 full lines).
 - `r` + character - Replace the character under the cursor with the next
   character you type, without leaving normal mode
+- `~` - Toggle the case of the character(s) under the cursor and move the
+  cursor past them; a count (`3~`) toggles that many. Case-less characters
+  (digits, punctuation, ...) are left unchanged, matching Vim. Doesn't touch
+  a register.
 - `p` - Paste
 - `u` - Undo
 - `Ctrl` + `r` - Redo
@@ -173,6 +181,12 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
   Vim:
   - Plain `y` with no register goes straight to the OS clipboard, exactly as
     before -- use it to copy something out of Google Docs.
+  - `"+` (and `"*`, treated the same -- see below) is the real system
+    clipboard, matching Vim's `"+`/`"*`: `"+y`/`"+p` behave exactly like
+    plain `y`/`p`, and `"+d`/`"+c` cut to the OS clipboard instead of the
+    cut register (`"-`). Unlike `"{a-z}`, using `"+` does NOT save and
+    restore your previous clipboard contents afterward -- that's the whole
+    point of asking for the system register.
   - Plain `d`/`c` with no register no longer touch the OS clipboard at all --
     they land in a dedicated cut register (`"-`) instead, so repeated
     deleting doesn't overwrite whatever you meant to paste elsewhere. `"-p`
@@ -185,7 +199,9 @@ words (equivalent to `d3w`), and `2cw`, `5yy`, etc. behave the same way.
   - `"_` is the black-hole register: `"_dd` deletes without storing the text
     anywhere.
   - This is still one of the newer, less-tested parts of DocsKeys -- see
-    MISSING_VIM_FEATURES.md for the caveats.
+    MISSING_VIM_FEATURES.md for the caveats. (`"*` has no real equivalent in
+    a Chrome extension -- there's no X11-style primary selection -- so it's
+    simply aliased to `"+`.)
 
 `iw`/`aw`/`iW`/`aW` work as operator targets (`diw`, `daw`, `ciw`, `yiw`,
 `d2aw`, ...) with Vim's rules: `iw` is the run of same-class characters under
@@ -239,7 +255,10 @@ Visual-mode changes are not dot-repeatable (see MISSING_VIM_FEATURES.md).
 ### Selections and the box cursor
 
 The box cursor follows the real caret every frame, so arrow keys, mouse clicks
-and scrolling move it too. A selection can only exist in a visual mode: a
+and scrolling move it too, and its size tracks Google Docs' own zoom level.
+If the caret scrolls off-screen the box simply hides, rather than being left
+behind at a stale position; it comes back on its own once the caret scrolls
+back into view. A selection can only exist in a visual mode: a
 mouse drag, double-click, shift-click, Ctrl+A or Ctrl+Shift+arrows in normal
 mode starts Visual mode (the badge always matches the screen), and anything
 DocsKeys itself leaves behind is collapsed. `d`/`c`/`y` in V, or in visual mode

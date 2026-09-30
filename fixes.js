@@ -102,6 +102,54 @@ async function fresh(text, off, opts) { const e = makeEnv(text, opts); e.sim.set
   e = await fresh("hello world", 3, { refreshMs: 40 }); e.sim.clipboard = "MINE"; await e.press("l"); await e.sleep(250)
   eq("40ms refresh restores clipboard and caret", [e.sim.clipboard, e.sim.focus, e.sim.hasSel()], ["MINE", 4, false])
 
+
+  // ---- "+ / "* system-clipboard registers
+  e = await fresh("foo bar baz", 0); e.sim.clipboard = "PREV"
+  await e.press("\""); await e.press("+"); await e.pressAll("dw"); await e.sleep(60)
+  eq("\"+dw cuts to the real clipboard", [e.sim.text, e.sim.clipboard], ["bar baz", "foo "])
+  e = await fresh("foo bar", 0); e.sim.clipboard = "PREV"
+  await e.press("\""); await e.press("*"); await e.press("y"); await e.press("w"); await e.sleep(40)
+  eq("\"*yw is an alias for \"+y", e.sim.clipboard, "foo ")
+  e = await fresh("a b", 0); e.sim.clipboard = "SYS"
+  await e.press("\""); await e.press("+"); await e.press("p"); await e.sleep(40)
+  eq("\"+p pastes the real clipboard", e.sim.text, "SYSa b")
+  e = await fresh("foo bar", 0); e.sim.clipboard = "KEEP"
+  await e.press("\""); await e.press("a"); await e.pressAll("dw"); await e.sleep(60)
+  eq("named \"a register still restores the real clipboard (unaffected by +)", e.sim.clipboard, "KEEP")
+
+  // ---- counted x / s, and dot-repeat of the count
+  e = await fresh("abcdefgh", 0); await e.pressAll("3x"); await e.sleep(30); eq("3x", e.sim.text, "defgh")
+  await e.press("."); await e.sleep(30); eq("3x . repeats the COUNT, not just one char", e.sim.text, "gh")
+  e = await fresh("hello", 0); await e.pressAll("2s"); await e.sleep(30); eq("2s", [e.sim.text, e.get("mode")], ["llo", "insert"])
+  e = await fresh("x", 0); await e.press("x"); await e.sleep(20); eq("bare x still works (count defaults to 1)", e.sim.text, "")
+
+  // ---- scroll commands: don't crash, don't leave a stray selection, and are queued-safe during a read
+  e = await fresh("a b c d e f", 0, { refreshMs: 40 })
+  await e.press("f", true, { ctrlKey: true }); await e.sleep(20)
+  eq("Ctrl+f no-ops safely with no scroll container in the test sim", e.sim.hasSel(), false)
+  await e.press("d", true, { ctrlKey: true }); await e.sleep(20)
+  eq("Ctrl+d moves the caret and leaves no selection", e.sim.hasSel(), false)
+  e = await fresh("one two three four five", 0)
+  await e.press("w", false); await e.press("d", false, { ctrlKey: true }); await e.settle(); await e.sleep(30)
+  eq("Ctrl+d during a read is dropped, not acted on mid-read", e.sim.hasSel(), false)
+
+
+  // ---- ~ (toggle case)
+  e = await fresh("hello World 42", 0); await e.press("~"); await e.sleep(40)
+  eq("~ toggles one char, advances the cursor", [e.sim.text, e.sim.focus], ["Hello World 42", 1])
+  e = await fresh("hello World 42", 6); await e.press("~"); await e.sleep(40)
+  eq("~ on an uppercase char lowercases it", e.sim.text, "hello world 42")
+  e = await fresh("hello World 42", 12); await e.press("~"); await e.sleep(40)
+  eq("~ on a digit is a no-op (no case) but still advances", [e.sim.text, e.sim.focus], ["hello World 42", 13])
+  e = await fresh("abcdef", 1); await e.pressAll("3~"); await e.sleep(40)
+  eq("3~ toggles 3 chars and advances by 3", [e.sim.text, e.sim.focus], ["aBCDef", 4])
+  e = await fresh("abc", 1); await e.press("~"); await e.sleep(40); e.sim.setCaret(0); await e.press("."); await e.sleep(40)
+  eq("~ is dot-repeatable at the new position", e.sim.text, "ABc")
+  e = await fresh("ab", 1); e.sim.clipboard = "KEEP"; await e.press("~"); await e.sleep(60)
+  eq("~ restores the real clipboard afterward", e.sim.clipboard, "KEEP")
+  e = await fresh("xy", 1); await e.press("~"); await e.sleep(40)
+  eq("~ at the last character of the line doesn't run past it", e.sim.text, "xY")
+
   console.log(fails ? `${fails} FAILURES` : "ALL OK")
   process.exit(fails ? 1 : 0)
 })()

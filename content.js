@@ -102,6 +102,15 @@ const CURSOR_UNDERLINE_HEIGHT_PX = 3
 // per-frame render doesn't call getComputedStyle 60 times a second.
 let cachedFontInfo = null
 let cachedFontInfoAt = 0
+// Font info always comes from the hidden docs-texteventtarget-iframe's
+// contenteditable element, which is a small, fixed-size keystroke-capture
+// target -- its CSS font-size does NOT track Google Docs' own zoom control
+// (the percentage dropdown in the toolbar, which scales rendered text
+// independently of that hidden element's style). Without correcting for
+// this, the box cursor's WIDTH stayed sized for 100% zoom no matter the
+// actual zoom level, even though its height (read directly from the real
+// on-screen caret's own bounding rect) already tracked zoom correctly. Cache
+// is short (400ms) since zoom can change anytime.
 function getCursorFontInfo() {
     const now = Date.now()
     if (cachedFontInfo && now - cachedFontInfoAt < 400) return cachedFontInfo
@@ -118,6 +127,24 @@ function getCursorFontInfo() {
     } catch (err) {
         return null
     }
+}
+
+// Ratio between how tall the real on-screen caret actually is and how tall a
+// line of this font "should" be at 100% zoom (fontSize * a typical line-height
+// ratio). Docs' zoom scales the real caret's rendered height but not the
+// hidden iframe element's CSS font-size, so this ratio tracks the zoom level
+// without needing to read Docs' zoom UI directly (its control's exact
+// selector/value format is unconfirmed against a live page, so measuring the
+// visible effect is more robust than parsing the setting). Clamped to a sane
+// range so a bad reading (e.g. a blink "off" zero-height rect) can't blow the
+// box up or shrink it to nothing.
+const ZOOM_REFERENCE_LINE_HEIGHT_RATIO = 1.15
+function zoomFactorFor(fontInfo, nativeCursorRectHeight) {
+    const fontSizePx = parseFloat(fontInfo.fontSize)
+    if (!fontSizePx || !nativeCursorRectHeight) return 1
+    const factor = nativeCursorRectHeight / (fontSizePx * ZOOM_REFERENCE_LINE_HEIGHT_RATIO)
+    if (!isFinite(factor) || factor <= 0) return 1
+    return Math.min(4, Math.max(0.25, factor))
 }
 
 let measureCanvas = null
@@ -162,11 +189,23 @@ function renderOverlay() {
     let rect
     try { rect = nativeCursor.getBoundingClientRect() } catch (err) { return null }
     if (!rect || !rect.height) return null
+    // The caret's rect is still meaningful (not clipped to zero) when it has
+    // scrolled out of view -- Docs positions it absolutely within the page,
+    // it just happens to land outside the current viewport. Draw nothing
+    // rather than a box at a misleading position; it reappears on its own as
+    // soon as the caret scrolls back on screen, no explicit "resume" needed.
+    const vw = (typeof window !== "undefined" && window.innerWidth) || Infinity
+    const vh = (typeof window !== "undefined" && window.innerHeight) || Infinity
+    if (rect.bottom <= 0 || rect.top >= vh || rect.right <= 0 || rect.left >= vw) {
+        if (cursorBoxOverlay && cursorBoxOverlay.style.display !== "none") cursorBoxOverlay.style.display = "none"
+        return null
+    }
+    const zoom = zoomFactorFor(fontInfo, rect.height)
     let width = null
     if (accurateWidth && Math.abs(accurateWidth.left - rect.left) < 1 && Math.abs(accurateWidth.top - rect.top) < 1) {
-        width = accurateWidth.width
+        width = accurateWidth.width * zoom / (accurateWidth.zoom || 1)
     }
-    if (!width) width = measureCharWidth(fontInfo)
+    if (!width) width = measureCharWidth(fontInfo) * zoom
     if (!width) return null
     const overlay = getCursorBoxOverlay()
     const key = `${shape}|${rect.left}|${rect.top}|${rect.height}|${rect.bottom}|${width}`
@@ -302,9 +341,14 @@ async function runAccurateWidthRefresh() {
         lastEmptyWidthReadKey = null
         const fontInfo = getCursorFontInfo()
         if (!fontInfo || !rect0 || !rect0.height) return
-        const width = measureCharWidth(fontInfo, toGraphemes(result.text)[0])
-        if (!width) return
-        accurateWidth = { left: rect0.left, top: rect0.top, width }
+        const rawWidth = measureCharWidth(fontInfo, toGraphemes(result.text)[0])
+        if (!rawWidth) return
+        const zoom = zoomFactorFor(fontInfo, rect0.height)
+        // Stored pre-zoom, along with the zoom it was measured at, so
+        // renderOverlay() can re-scale it if the zoom level changes again
+        // before the caret next moves (rather than caching a width that's
+        // now wrong for the current zoom).
+        accurateWidth = { left: rect0.left, top: rect0.top, width: rawWidth, zoom }
         renderOverlay()
     } finally {
         releaseOracleQuiet()
@@ -352,6 +396,8 @@ const keyCodes = {
     enter: 13,
     space: 32,
     esc: 27,
+    pageup: 33,
+    pagedown: 34,
     end: 35,
     home: 36,
     left: 37,
@@ -1114,6 +1160,18 @@ function saveRegisters() {
 // mode: the next y/d/c adds to what's already there instead of overwriting.
 // "_ is the black-hole register: anything "written" there is discarded, and
 // it always reads back empty, same as real Vim.
+// "+" is Vim's real system-clipboard register (:help quoteplus); DocsKeys had
+// no case for it at all, so `"+dw`/`"+yy`/`"+p` silently fell through to
+// whatever pendingRegister already was (typically none), i.e. a bare dw/yy/p
+// -- `"+d` looked like it worked (it deletes) but the cut never actually
+// reached the OS clipboard the way Vim's `"+d` does. "*" (the X11 primary
+// selection, :help quotestar) has no separate concept in a Chrome extension
+// clipboard API, so it's treated as an alias for "+" -- an approximation
+// noted in the README, not a full implementation of Vim's two-clipboard
+// model.
+const SYSTEM_REGISTER = "+"
+function isSystemRegister(reg) { return reg === "+" || reg === "*" }
+
 function waitForRegisterInput(key) {
     if (/^[a-z0-9]$/.test(key)) {
         pendingRegister = key
@@ -1121,7 +1179,7 @@ function waitForRegisterInput(key) {
     } else if (/^[A-Z]$/.test(key)) {
         pendingRegister = key.toLowerCase()
         pendingRegisterAppend = true
-    } else if (key === "-" || key === "_") {
+    } else if (key === "-" || key === "_" || key === "+" || key === "*") {
         pendingRegister = key
         pendingRegisterAppend = false
     }
@@ -1184,9 +1242,18 @@ function queueRegisterCapture(targetReg, append, previousClipboard) {
 }
 
 async function deleteOrChangeSelection(reg, append, isChange, linewise) {
-    const targetReg = (reg === BLACKHOLE_REGISTER) ? null : (reg || CUT_REGISTER)
+    const toSystemClip = isSystemRegister(reg)
+    const targetReg = (reg === BLACKHOLE_REGISTER || toSystemClip) ? null : (reg || CUT_REGISTER)
     let previousClipboard = null
-    if (targetReg) {
+    if (toSystemClip) {
+        // Same Copy-before-delete as any other register (Docs' Cut menu item
+        // is deliberately never used for deletion -- see the block comment
+        // above), but with no save/restore: the whole point of "+ is that the
+        // cut text is LEFT on the real clipboard afterwards, unlike a plain
+        // d/c (CUT_REGISTER) or a named "reg, both of which restore the
+        // user's previous clipboard so they're untouched by a delete.
+        clickMenu(menuItems.copy)
+    } else if (targetReg) {
         try {
             previousClipboard = await readClipboardSettled()
         } catch (err) {
@@ -1221,9 +1288,9 @@ function collapseCharwiseVisualToStart() {
 }
 
 async function yankSelection(reg, append) {
-    if (!reg) {
+    if (!reg || isSystemRegister(reg)) {
         await clipboardRestorePending // a pending restore must not overwrite the yank
-        clickMenu(menuItems.copy) // straight to the OS clipboard, exactly as before -- no added latency
+        clickMenu(menuItems.copy) // straight to the OS clipboard -- "+y is Vim's system-clipboard yank, identical to a bare y here since the unnamed register already IS the OS clipboard for yanks
         collapseCharwiseVisualToStart()
         switchModeToNormal()
         return
@@ -1241,7 +1308,7 @@ async function yankSelection(reg, append) {
 
 
 async function pasteRegister(name) {
-    if (!name) {
+    if (!name || isSystemRegister(name)) {
         // Wait for any in-flight clipboard restore (from a document read) so
         // it can't land AFTER the paste and be pasted, or overwrite a copy.
         await clipboardRestorePending
@@ -1987,6 +2054,120 @@ async function performWordMotionInner(kind, classify, count, operator, returnMod
     applyMotionSteps(forward, inclusive, steps, operator, returnMode)
 }
 
+// --- Scrolling (Ctrl+d/u/f/b/e/y) ---------------------------------------
+//
+// Vim distinguishes moving the cursor by a page (Ctrl+f/b) or half a page
+// (Ctrl+d/u, also changing the scroll-lock position) from scrolling the
+// view WITHOUT moving the cursor at all (Ctrl+e/y, one line at a time). None
+// of these have a single native browser key that does the Vim-exact thing,
+// so each is approximated differently:
+//   Ctrl+f / Ctrl+b -- sent as native PageDown/PageUp. Google Docs already
+//     handles these as its own "next/previous page" editing shortcut (the
+//     same category of native key Home/End/Ctrl+Home/Ctrl+End already are in
+//     this file), so this reuses an existing, already-relied-on mechanism
+//     rather than a new one.
+//   Ctrl+d / Ctrl+u -- Vim moves the cursor (and the view) by exactly half
+//     the window's text lines. DocsKeys has no API for Docs' viewport line
+//     count, so it estimates one from window.innerHeight and the real
+//     caret's own on-screen height (already read for the box cursor), and
+//     moves the cursor that many lines with plain Up/Down -- Docs' own
+//     "keep the caret on screen" scrolling then does the rest. Approximate
+//     (assumes no wrapped/variable-height lines in the estimate), consistent
+//     with the rest of this file's "estimate from the caret's rect" approach.
+//   Ctrl+e / Ctrl+y -- scroll the view by one line WITHOUT moving the
+//     cursor. There's no synthetic key for this; it directly nudges the
+//     scrollTop of Docs' scrolling container. Google Docs' current class
+//     name for that container is not confirmed against a live page (same
+//     category of guess as kix-cursor-caret elsewhere in this file) --
+//     falls back to scrolling the page's main scrollable element, and
+//     no-ops with a console warning if neither is found.
+function estimateLinesPerScreen() {
+    const ct = getCursorTop()
+    if (!ct || typeof window === "undefined" || !window.innerHeight) return null
+    let h
+    try { h = ct.getBoundingClientRect().height } catch (err) { return null }
+    if (!h) return null
+    return Math.max(1, Math.round((window.innerHeight * 0.9) / h))
+}
+
+function halfScreenScroll(down) {
+    const lines = estimateLinesPerScreen()
+    const count = lines ? Math.max(1, Math.round(lines / 2)) : 10
+    repeatMotion(() => sendKeyEvent(down ? "down" : "up"), count)
+}
+
+function fullScreenScroll(down) {
+    sendKeyEvent(down ? "pagedown" : "pageup")
+}
+
+let docsScrollContainer = null
+function getDocsScrollContainer() {
+    if (docsScrollContainer && docsScrollContainer.isConnected) return docsScrollContainer
+    docsScrollContainer = document.querySelector(".kix-appview-editor")
+        || document.querySelector(".kix-rotatingtilemanager-content")
+        || document.scrollingElement
+        || null
+    return docsScrollContainer
+}
+
+function scrollOneLine(down) {
+    const el = getDocsScrollContainer()
+    const ct = getCursorTop()
+    let lineHeight = 20
+    try { const h = ct && ct.getBoundingClientRect().height; if (h) lineHeight = h } catch (err) {}
+    if (!el || typeof el.scrollTop !== "number") {
+        console.warn("DocsKeys: couldn't find the document's scroll container for Ctrl+e/Ctrl+y (best-effort feature)")
+        return
+    }
+    el.scrollTop += down ? lineHeight : -lineHeight
+}
+
+// --- ~ (toggle case) ------------------------------------------------------
+// Previously listed as "not implemented, needs to read the character under
+// the cursor" -- true when this file was write-only, but the oracle built
+// for f/t/w/e/b already solves exactly that read, and the save/restore
+// write-to-clipboard-then-Paste technique that already backs named
+// registers is exactly the mechanism needed to put computed text (which
+// DocsKeys can never type itself) into the document. Scoped to `count`
+// characters starting at the cursor, not crossing the line -- same scope as
+// every other oracle-based motion here (f/t/w/e/b), and avoids the same
+// line-boundary ambiguity `x`'s known register gap flags. Case-less
+// characters (digits, punctuation, emoji, most non-cased scripts) are left
+// unchanged, via a plain String case-comparison rather than a script-aware
+// table, same approximation Vim itself makes for non-Latin-1 characters
+// without 'casemap'.
+function toggleGraphemeCase(ch) {
+    const upper = ch.toUpperCase()
+    const lower = ch.toLowerCase()
+    if (ch !== lower && ch === upper) return lower
+    if (ch !== upper && ch === lower) return upper
+    return ch
+}
+
+async function performTildeOp(count) {
+    if (oracleBusy) return
+    if (!beginOracle()) return
+    try {
+        await withClipboardSaved(async (previousClipboard) => {
+            const raw = await readAfterCore(previousClipboard)
+            if (raw === null) return
+            const chars = toGraphemes(raw)
+            const n = Math.min(count, chars.length)
+            if (n === 0) return
+            const toggled = chars.slice(0, n).map(toggleGraphemeCase).join("")
+            repeatMotion(() => sendKeyEvent("right", { shift: true }), n)
+            try {
+                await navigator.clipboard.writeText(toggled)
+                clickMenu(menuItems.paste) // lands the cursor right after the pasted text, matching Vim's ~ moving the cursor forward by `count`
+            } catch (err) {
+                console.warn("DocsKeys: ~ couldn't write the toggled text (best-effort feature)", err)
+            }
+        })
+    } finally {
+        releaseOracle()
+    }
+}
+
 function goToDocStart(shift = false) {
     if (isMac) {
         sendKeyEvent("up", { meta: true, shift })
@@ -2349,7 +2530,7 @@ function handleMultipleMotion(key) {
         return
     }
 
-    if (targetMode === "normal" && (key === "D" || key === "C" || key === "Y")) {
+    if (targetMode === "normal" && (key === "D" || key === "C" || key === "Y" || key === "x" || key === "s" || key === "~")) {
         pendingLineCount = times
         handleKeyEventNormal(key)
         multipleMotion.times = 0
@@ -2469,6 +2650,28 @@ function eventHandler(e) {
             return
         }
         clickMenu(menuItems.redo)
+        return;
+    }
+    if (e.ctrlKey && (mode == 'normal' || mode == 'visual' || mode == 'visualLine') &&
+        (key == 'd' || key == 'u' || key == 'f' || key == 'b' || key == 'e' || key == 'y')) {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        if (oracleBusy) return // scrolling mid-read would move the caret out from under the temporary selection
+        switch (key) {
+            case 'd': halfScreenScroll(true); break
+            case 'u': halfScreenScroll(false); break
+            case 'f': fullScreenScroll(true); break
+            case 'b': fullScreenScroll(false); break
+            case 'e': scrollOneLine(true); break
+            case 'y': scrollOneLine(false); break
+        }
+        if (key !== 'e' && key !== 'y' && (mode === 'visual' || mode === 'visualLine')) {
+            // These move the cursor across lines; the exact charwise model
+            // (if any) can no longer be trusted, same as any other
+            // line-leaving motion.
+            visualModel = null
+        }
+        refreshCursorOverlayForCurrentMode()
         return;
     }
     if (e.altKey || e.ctrlKey || e.metaKey) {
@@ -2729,11 +2932,15 @@ function handleKeyEventNormal(key) {
             repeatLastFind(true)
             break
         case "x":
-            { const fn = () => { sendKeyEvent("delete") }
+            { const xcount = pendingLineCount || 1
+              pendingLineCount = 1
+              const fn = () => { repeatMotion(() => sendKeyEvent("delete"), xcount) }
               fn(); recordChange(fn) }
             break
 				case "s":
-            { const fn = () => { sendKeyEvent("delete"); switchModeToInsert() }
+            { const scount = pendingLineCount || 1
+              pendingLineCount = 1
+              const fn = () => { repeatMotion(() => sendKeyEvent("delete"), scount); switchModeToInsert() }
               fn(); recordChange(fn) }
             break
         case "J":
@@ -2742,6 +2949,12 @@ function handleKeyEventNormal(key) {
                 sendKeyEvent("delete")
                 sendKeyEvent("space")
               }
+              fn(); recordChange(fn) }
+            break
+        case "~":
+            { const tcount = pendingLineCount || 1
+              pendingLineCount = 1
+              const fn = () => { performTildeOp(tcount) }
               fn(); recordChange(fn) }
             break
         default:

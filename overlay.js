@@ -12,7 +12,10 @@ const eq = (n, g, x) => { const ok = JSON.stringify(g) === JSON.stringify(x); if
   d.createElement = () => ({ style: {}, appendChild() {}, isConnected: true, getContext: () => ({ set font(v) {}, measureText: () => ({ width: 9 }) }) })
   const overlay = () => e.get("cursorBoxOverlay")
   e.get("updateCursorOverlay('block')")
-  eq("box drawn over caret", [overlay().style.left, overlay().style.top, overlay().style.width, caret.style.opacity], ["100px", "200px", "9px", "0"])
+  // width is scaled by the caret's own zoom-implied ratio; at fontSize=16,
+  // rect.height=16 this is 16/(16*1.15) = 1/1.15 of the raw 9px measurement.
+  eq("box drawn over caret", [overlay().style.left, overlay().style.top, caret.style.opacity], ["100px", "200px", "0"])
+  eq("width reflects the raw measurement scaled by the caret's implied zoom", Math.abs(parseFloat(overlay().style.width) - 9 / 1.15) < 0.01, true)
   caret.rect = { left: 100, top: 120, width: 1, height: 16, bottom: 136 }; e.get("overlayFrame()")
   eq("follows a scroll (frame loop)", overlay().style.top, "120px")
   caret.rect = { left: 140, top: 120, width: 1, height: 16, bottom: 136 }; e.get("overlayFrame()")
