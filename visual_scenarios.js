@@ -6,7 +6,7 @@ async function fresh(text, off) { const e = makeEnv(text); e.sim.setCaret(off); 
 ;(async () => {
   let e
   e = await fresh(T, 9 + 3); await e.press("v"); await e.press("k")
-  eq("v k", e.sim.selText(), T.slice(3, 13)); eq("v k mode/model", [e.get("mode"), e.get("visualModel")], ["visual", null])
+  eq("v k", e.sim.selText(), T.slice(3, 13)); eq("v k mode/model", [e.get("mode"), e.get("!!visualModel")], ["visual", true])
   await e.press("d"); await e.sleep(20); eq("v k d", e.sim.text, T.slice(0, 3) + T.slice(13))
   e = await fresh(T, 9 + 3); await e.press("v"); await e.press("j")
   eq("v j", e.sim.selText(), T.slice(12, 18 + 3 + 1))
@@ -55,7 +55,7 @@ async function fresh(text, off) { const e = makeEnv(text); e.sim.setCaret(off); 
   // v at EOL / line start / empty line / word-end fallback
   e = await fresh("hello\nworld", 5); await e.press("v"); eq("v at EOL selects last char", [e.sim.selText(), e.get("visualModel").a], ["o", 4])
   e = await fresh("hello\nworld", 0); e.sim.clipboard = "JUNK"; await e.press("v"); await e.sleep(30); eq("v at line start", [e.sim.selText(), e.sim.clipboard], ["h", "JUNK"])
-  e = await fresh("a\n\nb", 2); await e.press("v"); await e.sleep(50); eq("v on empty line no crash", [e.get("mode"), e.get("visualModel")], ["visual", null])
+  e = await fresh("a\n\nb", 2); await e.press("v"); await e.sleep(50); eq("v on empty line keeps the full model", [e.get("mode"), e.get("!!visualModel"), e.sim.selText()], ["visual", true, "\n"])
   e = await fresh("one two\nthree four", 4); await e.press("v"); await e.press("w"); await e.sleep(10)
   console.log("     v w on last word (native fallback): sel", JSON.stringify(e.sim.selText()), "model", e.get("visualModel"))
   await e.press("h"); eq("h after fallback still visual", e.get("mode"), "visual")

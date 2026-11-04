@@ -58,6 +58,7 @@ waitForElement(
         const attach = () => iframe.contentDocument.addEventListener('keydown', eventHandler, true)
         attach()
         iframe.addEventListener('load', attach)
+        trackDocumentChanges()
     },
 )
 
@@ -217,19 +218,31 @@ function renderOverlay() {
         return null
     }
     const zoom = zoomFactorFor(fontInfo, rect.height)
-    const width = measureCharWidth(fontInfo) * zoom
+    const model = mode === "visual" ? visualModel : null
+    const width = measureCharWidth(fontInfo, model ? model.text[model.c] : "0") * zoom
     if (!width) return null
+    let left = rect.left, top = rect.top, bottom = rect.bottom
+    if (model && model.dF > model.c) {
+        const cursorPoint = model.boundaries && model.boundaries.get(model.c)
+        const focusPoint = model.boundaries && model.boundaries.get(model.dF)
+        if (cursorPoint && comparePoints(focusPoint, cursorDocumentPoint()) === 0) {
+            const scroller = getDocsScrollContainer()
+            left = cursorPoint.x - ((scroller && scroller.scrollLeft) || 0)
+            top = cursorPoint.y - ((scroller && scroller.scrollTop) || 0)
+            bottom = top + rect.height
+        } else left -= width
+    }
     const overlay = getCursorBoxOverlay()
-    const key = `${shape}|${rect.left}|${rect.top}|${rect.height}|${rect.bottom}|${width}`
+    const key = `${shape}|${left}|${top}|${rect.height}|${bottom}|${width}`
     if (key !== lastOverlayKey) {
         overlay.style.backgroundColor = CURSOR_BOX_COLOR
-        overlay.style.left = `${rect.left}px`
+        overlay.style.left = `${left}px`
         overlay.style.width = `${width}px`
         if (shape === "underline") {
-            overlay.style.top = `${rect.bottom - CURSOR_UNDERLINE_HEIGHT_PX}px`
+            overlay.style.top = `${bottom - CURSOR_UNDERLINE_HEIGHT_PX}px`
             overlay.style.height = `${CURSOR_UNDERLINE_HEIGHT_PX}px`
         } else {
-            overlay.style.top = `${rect.top}px`
+            overlay.style.top = `${top}px`
             overlay.style.height = `${rect.height}px`
         }
         lastOverlayKey = key
@@ -275,7 +288,10 @@ let pendingSelectionCheck = null   // null | "user" | "glitch"
 function markSelectionCheck(reason) {
     if (pendingSelectionCheck === "user") return
     pendingSelectionCheck = reason
-    if (mode === "normal") scheduleSelectionCheck()
+    if (reason === "user" && mode === "normal") {
+        pendingSelectionCheck = null
+        handleUnexpectedSelection(reason)
+    }
 }
 function noteSelectionGlitch() {
     // No scheduling here (a persistently failing read must not re-trigger
@@ -298,12 +314,9 @@ function handleUnexpectedSelection(reason) {
 // Selection checks only run after an explicit mouse/keyboard selection.
 // Cosmetic rendering must never move the caret or use the clipboard: doing
 // that during a scroll makes Docs scroll straight back to the cursor.
-let SELECTION_CHECK_DEBOUNCE_MS = 40
-let selectionCheckTimer = null
 function scheduleSelectionCheck() {
-    if (mode !== "normal" || pendingSelectionCheck === null) return
-    clearTimeout(selectionCheckTimer)
-    selectionCheckTimer = setTimeout(runSelectionCheck, SELECTION_CHECK_DEBOUNCE_MS)
+    // Recovery waits for the next explicit command. Idle Copy/menu activity
+    // can focus Docs and pull a freely scrolled viewport back to the caret.
 }
 
 async function runSelectionCheck() {
@@ -311,8 +324,8 @@ async function runSelectionCheck() {
     const check = pendingSelectionCheck
     pendingSelectionCheck = null
     try {
-        const selected = await withClipboardSaved((previous) => copySelectionForOracle(previous))
-        if (selected === null) pendingSelectionCheck = check
+        const selected = await withViewportPreserved(() => withClipboardSaved((previous) => copySelectionForOracle(previous)))
+        if (selected === null) sendKeyEvent("left")
         else if (selected !== "" && mode === "normal") handleUnexpectedSelection(check)
     } finally {
         releaseOracleQuiet()
@@ -401,21 +414,20 @@ function translateKey(key) {
     return settings.dvorak && dvorakToQwerty[key] !== undefined ? dvorakToQwerty[key] : key;
 }
 
-const wordModifierKey = isMac ? 'alt' : 'control'
 const paragraphModifierKey = isMac ? 'alt' : 'control'
-
-function wordMods(shift = false) {
-    return { shift, [wordModifierKey]: true }
-}
 
 function paragraphMods(shift = false) {
     return { shift, [paragraphModifierKey]: true }
 }
 
 function sendKeyEvent(key, mods = {}) {
+    if (!viewportRead) viewportEpoch++
+    if (["delete", "backspace", "enter", "space"].includes(key) ||
+        (!viewportRead && !managedTextMotion && mode !== "visual")) invalidateTextSnapshot()
     const keyCode = keyCodes[key]
     const defaultMods = { shift: false, control: false, alt: false, meta: false }
     window.dispatchEvent(new CustomEvent("doc-keys-simulate-keypress", { detail: { keyCode, mods: { ...defaultMods, ...mods } } }));
+    restoreReadViewport()
 }
 
 const modeIndicator = document.createElement('div')
@@ -480,6 +492,8 @@ function updateModeIndicator(currentMode) {
         case 'waitForFindChar':
         case 'replaceChar':
         case 'multipleMotion':
+        case 'search':
+        case 'gPrefix':
             modeIndicator.style.backgroundColor = '#ea4335'
             modeIndicator.style.color = 'white'
             updateCursorOverlay("underline")
@@ -493,15 +507,9 @@ function repeatMotion(motion, times, key) {
   }
 }
 
-// --- Visual mode model -----------------------------------------------------
-// Read the starting display line before selecting. Within that snapshot,
-// motions use grapheme indices and synchronous Shift+arrows. Native motions
-// take over when leaving it; line reads must never run on a live selection.
-// a/c: inclusive Vim anchor and cursor character indices.
-// dA/dF: Docs anchor/focus boundaries, where boundary i precedes character i.
-// Forward: dA=a, dF=c+1. Backward: dA=a+1, dF=c.
-// Crossing the anchor changes its boundary so the anchor character remains
-// selected in both directions.
+// Snapshot indices are graphemes. a/c are inclusive Vim anchor/cursor
+// characters; dA/dF are Docs boundaries between characters. Forward selects
+// [a,c+1); backward selects [c,a+1). The anchor character stays included.
 let visualModel = null
 let nativeVisualFocusAfter = true
 
@@ -513,7 +521,16 @@ function visualDocsFor(a, c) {
 function visualShiftFocus(from, to) {
     const d = to - from
     if (d === 0) return
-    repeatMotion(() => sendKeyEvent(d > 0 ? "right" : "left", { shift: true }), Math.abs(d))
+    const m = visualModel
+    if (!m.boundaries || m.boundaries.size > 5000) m.boundaries = new Map()
+    let at = from
+    m.boundaries.set(at, cursorDocumentPoint())
+    repeatMotion(() => {
+        if (d > 0 && at === to - 1) m.boundaries.set(at, cursorDocumentPoint())
+        sendKeyEvent(d > 0 ? "right" : "left", { shift: true })
+        at += Math.sign(d)
+    }, Math.abs(d))
+    m.boundaries.set(at, cursorDocumentPoint())
 }
 
 // Plain caret move; only ever used on an EMPTY selection (see below).
@@ -536,7 +553,7 @@ function visualRealizeDocs(tA, tF) {
     if (tA === m.dA) {
         visualShiftFocus(m.dF, tF)
     } else {
-        visualShiftFocus(m.dF, m.dA)
+        if (m.dF !== m.dA) sendKeyEvent(m.dA < m.dF ? "left" : "right")
         visualMoveCaret(m.dA, tA)
         visualShiftFocus(tA, tF)
     }
@@ -546,16 +563,20 @@ function visualRealizeDocs(tA, tF) {
 
 function visualSetSelection(a, c) {
     const m = visualModel
-    const last = m.text.length - 1
+    const last = m.fullDocument ? m.text.length : m.text.length - 1
     a = Math.max(0, Math.min(last, a))
     c = Math.max(0, Math.min(last, c))
     const { tA, tF } = visualDocsFor(a, c)
-    visualRealizeDocs(tA, tF)
+    visualRealizeDocs(Math.min(m.text.length, tA), Math.min(m.text.length, tF))
     m.a = a
     m.c = c
+    nativeVisualFocusAfter = c >= a
+    nativeVisualAnchorAfter = c < a
+    visualAnchorPoint = m.boundaries && m.boundaries.get(a)
 }
 
 function visualMoveCursor(c) {
+    delete visualModel.goal
     visualSetSelection(visualModel.a, c)
 }
 
@@ -636,14 +657,6 @@ function visualNativeMotion(forward, nativeFn) {
     finishNativeVisualMotion(forward)
 }
 
-function visualNativeWordMotion(kind) {
-    const forward = kind !== "b"
-    visualNativeMotion(forward, () => {
-        if (kind === "e") fallbackWordEnd(true)
-        else fallbackWordMotion(forward, true)
-    })
-}
-
 function nativeVerticalStep(down, shift = false) {
     const before = cursorDocumentPoint()
     sendKeyEvent(down ? "down" : "up", { shift })
@@ -669,21 +682,9 @@ function firstNonBlankIndex(text) {
 }
 
 // Word/WORD motion inside the visual model: pure computation on the snapshot.
-function visualWordMotion(kind, classify) {
+function visualWordMotion(kind, classify, count = 1) {
     const m = visualModel
-    const forward = (kind === "w" || kind === "e")
-    const finder = kind === "e" ? findWordEnd
-        : kind === "w" ? findWordStart
-        : findWordStartBackward // "b"
-    const text = forward ? m.text.slice(m.c) : m.text.slice(0, m.c)
-    const steps = countedWordSteps(text, classify, 1, finder, !forward)
-    if (steps === -1) {
-        // Ran off the line (e.g. `w` on the last word): let Docs' native
-        // word jump take it across the line break, same as normal mode does.
-        visualNativeWordMotion(kind)
-        return
-    }
-    visualMoveCursor(forward ? m.c + steps : m.c - steps)
+    visualMoveCursor(DocsKeysVim.word(m.text, m.c, kind, count, classify === classifyWORDChar, true).target)
 }
 
 // `aw`/`iw`/`aW`/`iW` object range containing index `idx`. Vim's rules
@@ -694,10 +695,12 @@ function visualWordMotion(kind, classify) {
 // the word after it.
 function visualRunAt(text, idx, classify) {
     const cls = classify(text[idx])
+    if (text[idx] === "\n") return [idx, idx]
+    const bounds = DocsKeysVim.line(text, idx)
     let s = idx
     let e = idx
-    while (s > 0 && classify(text[s - 1]) === cls) s--
-    while (e + 1 < text.length && classify(text[e + 1]) === cls) e++
+    while (s > bounds.start && classify(text[s - 1]) === cls) s--
+    while (e + 1 < bounds.end && classify(text[e + 1]) === cls) e++
     return [s, e]
 }
 
@@ -708,10 +711,10 @@ function textObjectRange(text, idx, classify, around) {
         if (e + 1 < text.length) return [s, visualRunAt(text, e + 1, classify)[1]]
         return [s, e]
     }
-    if (e + 1 < text.length && classify(text[e + 1]) === "blank") {
+    if (e + 1 < text.length && text[e + 1] !== "\n" && classify(text[e + 1]) === "blank") {
         return [s, visualRunAt(text, e + 1, classify)[1]]
     }
-    if (s > 0 && classify(text[s - 1]) === "blank") {
+    if (s > 0 && text[s - 1] !== "\n" && classify(text[s - 1]) === "blank") {
         return [visualRunAt(text, s - 1, classify)[0], e]
     }
     return [s, e]
@@ -729,11 +732,21 @@ function visualSelectTextObject(around, classify) {
         visualSetSelection(s, e)
     } else if (m.c > m.a) {
         if (m.c + 1 < m.text.length) {
-            const e = textObjectRange(m.text, m.c + 1, classify, around)[1]
+            let next = m.c + 1
+            if (m.text[next] === "\n") {
+                while (next < m.text.length && DocsKeysVim.blank(m.text[next])) next++
+            }
+            if (next >= m.text.length) return
+            const e = textObjectRange(m.text, next, classify, around)[1]
             visualSetSelection(m.a, e)
         }
     } else if (m.c - 1 >= 0) {
-        const s = textObjectRange(m.text, m.c - 1, classify, around)[0]
+        let previous = m.c - 1
+        if (m.text[previous] === "\n") {
+            while (previous >= 0 && DocsKeysVim.blank(m.text[previous])) previous--
+        }
+        if (previous < 0) return
+        const s = textObjectRange(m.text, previous, classify, around)[0]
         visualSetSelection(m.a, s)
     }
 }
@@ -760,31 +773,18 @@ function switchModeToVisual() {
 // its text isn't a single plain line) it degrades to the old native
 // behavior: a one-character shift+Right selection and no model.
 async function startVisualSelection() {
-    if (!beginOracle()) {
-        sendKeyEvent("right", { shift: true })
-        return
-    }
+    if (!beginOracle()) return
     try {
-        const ctx = await readLineContext()
+        const snapshot = await getTextSnapshot()
         if (mode !== "visual") return
-        const beforeG = ctx ? toGraphemes(ctx.before) : []
-        const afterG = ctx ? toGraphemes(ctx.after) : []
-        const text = beforeG.concat(afterG)
-        if (!ctx || text.length === 0 || /[\r\n\u000b\u2028\u2029]/.test(ctx.before + ctx.after)) {
+        if (!snapshot) {
             sendKeyEvent("right", { shift: true })
-            visualModel = null
             return
         }
-        let a = beforeG.length
-        if (a >= text.length) {
-            // Caret sits after the last character (after `$`/`A`+Esc). Vim's
-            // cursor would be ON the last character, so `v` must select that
-            // one, not the line break.
-            sendKeyEvent("left")
-            a = text.length - 1
-        }
-        sendKeyEvent("right", { shift: true })
-        visualModel = { text, a, c: a, dA: a, dF: a + 1 }
+        const at = DocsKeysVim.cursor(snapshot.text, snapshot.at)
+        moveSnapshotCaret(snapshot, at)
+        visualModel = { text: snapshot.text, a: at, c: at, dA: at, dF: at, fullDocument: true }
+        visualSetSelection(at, at)
     } finally {
         releaseOracle()
         refreshCursorOverlayForCurrentMode()
@@ -970,7 +970,7 @@ function handleKeyEventVisualLineMode(key) {
         case "j": vlMoveVertical(1); break
         case "k": vlMoveVertical(-1); break
         case "G": vlGoto(true); break
-        case "g": vlGoto(false); break
+        case "g": startGPrefix(1, null, "visualLine"); break
         case "}": vlParagraph(true); break
         case "{": vlParagraph(false); break
         case "\"":
@@ -1015,6 +1015,13 @@ function handleKeyEventVisualLineMode(key) {
 // line and `vh`. Exact charwise visual mode never produces an empty selection,
 // so it stays synchronous.
 function visualOperator(op) {
+    if (visualModel && visualModel.dA === visualModel.dF) {
+        pendingRegister = null
+        pendingRegisterAppend = false
+        if (op === "c") switchModeToInsert()
+        else switchModeToNormal()
+        return
+    }
     const guarded = mode === "visualLine" || (mode === "visual" && !visualModel)
     if (!guarded || !beginOracle()) {
         runLongStringOp(op)
@@ -1508,22 +1515,22 @@ async function readBeforeCore(previousClipboard) {
 // Single-direction reads: every normal-mode caller (f/t, w/e, F/T, b) only
 // needs one side of the caret, so this is one clipboard round-trip each.
 async function readAfterCursor() {
-    return withClipboardSaved((previousClipboard) => readAfterCore(previousClipboard))
+    return withViewportPreserved(() => withClipboardSaved((previousClipboard) => readAfterCore(previousClipboard)))
 }
 async function readBeforeCursor() {
-    return withClipboardSaved((previousClipboard) => readBeforeCore(previousClipboard))
+    return withViewportPreserved(() => withClipboardSaved((previousClipboard) => readBeforeCore(previousClipboard)))
 }
 
-// Both sides of the caret under ONE clipboard save/restore (used by `v` and
-// `^`). Returns { before, after } or null.
+// Display-line context for first-nonblank and operator text objects.
+// Returns { before, after } or null under one clipboard save/restore.
 async function readLineContext() {
-    return withClipboardSaved(async (previousClipboard) => {
+    return withViewportPreserved(() => withClipboardSaved(async (previousClipboard) => {
         const before = await readBeforeCore(previousClipboard)
         if (before === null) return null
         const after = await readAfterCore(previousClipboard)
         if (after === null) return null
         return { before, after }
-    })
+    }))
 }
 
 // `text` (a string or a grapheme array) is the text from the cursor to
@@ -1626,11 +1633,12 @@ function applyFindResult(type, steps, operator, returnMode) {
 // character is simply where the cursor ends up (the selection is inclusive).
 function performVisualFind(type, char, count, skipAdjacent = false) {
     const m = visualModel
+    const bounds = DocsKeysVim.line(m.text, m.c)
     const forward = (type === "f" || type === "t")
     const isTill = (type === "t" || type === "T")
     let target
     if (forward) {
-        const result = findForward(m.text.slice(m.c), char, count, skipAdjacent)
+        const result = findForward(m.text.slice(m.c, bounds.end), char, count, skipAdjacent)
         if (!result.found) {
             console.warn(`DocsKeys: no match for ${type}${char} on this line`)
             finishFind("visual")
@@ -1643,7 +1651,7 @@ function performVisualFind(type, char, count, skipAdjacent = false) {
         }
         target = m.c + steps
     } else {
-        const result = findBackward(m.text.slice(0, m.c), char, count, skipAdjacent)
+        const result = findBackward(m.text.slice(bounds.start, m.c), char, count, skipAdjacent)
         if (!result.found) {
             console.warn(`DocsKeys: no match for ${type}${char} on this line`)
             finishFind("visual")
@@ -1760,6 +1768,14 @@ function goToEndOfLine() {
     sendKeyEvent("end")
 }
 
+function goToLastCharacter() {
+    sendKeyEvent("end")
+    const end = cursorDocumentPoint()
+    sendKeyEvent("left")
+    const last = cursorDocumentPoint()
+    if (end && last && Math.abs(end.y - last.y) > 1) sendKeyEvent("right")
+}
+
 // Real Vim's `^`/`_` land on the line's first non-blank character; `0` always
 // lands on column 0. DocsKeys previously treated all three identically. This
 // needs the *whole* current line (not just one side of the cursor), so
@@ -1831,87 +1847,6 @@ function classifyWORDChar(ch) {
     return /\s/.test(ch) ? "blank" : "nonblank"
 }
 
-// Forward, within `text` = cursor-to-end-of-line (text[0] = char under cursor).
-// Finds the end of the current word if there's more of it ahead, otherwise
-// the end of the next word -- this is what makes repeated `e`/`ee`/`2e`
-// naturally agree, per ":help ee/2e are the same".
-function findWordEnd(text, classify) {
-    const n = text.length
-    if (n === 0) return -1
-    const cls0 = classify(text[0])
-    const atEnd = cls0 !== "blank" && (1 >= n || classify(text[1]) !== cls0)
-    let i
-    if (cls0 === "blank" || atEnd) {
-        i = (cls0 === "blank") ? 0 : 1
-        while (i < n && classify(text[i]) === "blank") i++
-        if (i >= n) return -1
-        const cls = classify(text[i])
-        while (i + 1 < n && classify(text[i + 1]) === cls) i++
-        return i
-    }
-    let i2 = 0
-    while (i2 + 1 < n && classify(text[i2 + 1]) === cls0) i2++
-    return i2
-}
-
-// Forward, within `text` = cursor-to-end-of-line. Finds the start of the next word.
-function findWordStart(text, classify) {
-    const n = text.length
-    if (n === 0) return -1
-    let i = 0
-    const cls0 = classify(text[0])
-    if (cls0 !== "blank") {
-        while (i < n && classify(text[i]) === cls0) i++
-    }
-    while (i < n && classify(text[i]) === "blank") i++
-    if (i >= n) return -1
-    return i
-}
-
-// Backward, within `text` = start-of-line-to-cursor. Finds the start of the
-// previous word, returned as a distance (steps left) from the cursor.
-function findWordStartBackward(text, classify) {
-    let i = text.length
-    if (i === 0) return -1
-    i--
-    while (i >= 0 && classify(text[i]) === "blank") i--
-    if (i < 0) return -1
-    const cls = classify(text[i])
-    while (i - 1 >= 0 && classify(text[i - 1]) === cls) i--
-    return text.length - i
-}
-
-// Applies one of the four finder functions `count` times in a row, each time
-// re-slicing the text so the previous match becomes the new "cursor".
-function countedWordSteps(text, classify, count, finder, backward) {
-    let t = text
-    let total = 0
-    for (let n = 0; n < count; n++) {
-        const step = finder(t, classify)
-        if (step === -1) return -1
-        total += step
-        t = backward ? t.slice(0, t.length - step) : t.slice(step)
-    }
-    return total
-}
-
-// Fallback for when a motion runs off the end of what we've read (i.e. it
-// would need to continue onto another line): reproduces the old
-// native-Ctrl+Right/Ctrl+Left-based behavior for exactly that one press.
-function fallbackWordMotion(forward, shift) {
-    sendKeyEvent(forward ? "right" : "left", wordMods(shift))
-}
-function fallbackWordEnd(shift) {
-    // The old repeat-nudge heuristic -- kept only as the cross-line fallback,
-    // where its "assume we're at a previous end-of-word" premise is a much
-    // smaller approximation than it was as the primary implementation.
-    sendKeyEvent("right", { shift })
-    sendKeyEvent("right", { shift })
-    sendKeyEvent("right", wordMods(shift))
-    sendKeyEvent("left", { shift })
-    sendKeyEvent("left", { shift })
-}
-
 // Guards against a second w/e/b press firing an overlapping async read while
 // one is already in flight (there's no "waiting for input" mode transition
 // for these, unlike f/t, so eventHandler would otherwise happily dispatch a
@@ -1919,88 +1854,9 @@ function fallbackWordEnd(shift) {
 let pendingWordCount = 1
 let pendingLineCount = 1
 
-async function performWordMotion(kind, classify, count, operator, returnMode) {
-    if (oracleBusy) return
-    // Operators and WORD/e motions keep Vim boundaries. Normal w/b may use
-    // Docs' synchronous word navigation, with no clipboard round trip.
-    if (!operator && returnMode === "normal" && settings.wordMotion === "native" &&
-        classify === classifyWordChar && (kind === "w" || kind === "b")) {
-        repeatMotion(() => fallbackWordMotion(kind === "w", false), count)
-        switchModeToNormal()
-        return
-    }
-    if (returnMode === "visual" || returnMode === "visualLine") {
-        // No oracle in visual modes -- see "Visual mode model". Charwise
-        // visual with a line model never gets here (handleKeyEventVisualLine
-        // computes it directly); this is the model-less native fallback.
-        fallbackToNativeWordMotion(kind, (kind === "e" || kind === "w"), operator, returnMode)
-        return
-    }
-    if (!beginOracle()) return
-    try {
-        await performWordMotionInner(kind, classify, count, operator, returnMode)
-    } finally {
-        releaseOracle()
-    }
-}
-
-function fallbackToNativeWordMotion(kind, forward, operator, returnMode, count = 1) {
-    const shift = !!operator || returnMode === "visual" || returnMode === "visualLine"
-    if (!operator && returnMode === "visual") {
-        visualNativeWordMotion(kind)
-    } else {
-        repeatMotion(() => {
-            if (kind === "e") fallbackWordEnd(shift)
-            else fallbackWordMotion(forward, shift)
-        }, count)
-    }
-    if (operator) {
-        runLongStringOp(operator, false)
-    } else if (returnMode === "visual" || returnMode === "visualLine") {
-        // Can't know exactly how far the native Ctrl+Right/Left jump moved,
-        // so the line model (if any) can't be kept in sync: drop it. Native
-        // motions and the exact-in-line model never mix.
-        visualModel = null
-        mode = returnMode
-        updateModeIndicator(mode)
-    } else {
-        switchModeToNormal()
-    }
-}
-
-async function performWordMotionInner(kind, classify, count, operator, returnMode) {
-    const forward = (kind === "e" || kind === "w")
-    const inclusive = (kind === "e")
-
-    if (returnMode === "visual" || returnMode === "visualLine") {
-        // Never read the document with a visual selection live (see "Visual
-        // mode model"); performWordMotion() already routes visual modes to
-        // the native fallback, this is belt-and-braces.
-        fallbackToNativeWordMotion(kind, forward, operator, returnMode)
-        return
-    }
-
-    const raw = forward ? await readAfterCursor() : await readBeforeCursor()
-
-    if (raw === null) {
-        finishFind(returnMode) // oracle read failed -- bail out to normal, same as f/t
-        return
-    }
-    const text = toGraphemes(raw)
-
-    const finder = kind === "e" ? findWordEnd
-        : kind === "w" ? findWordStart
-        : findWordStartBackward // "b"
-    const steps = countedWordSteps(text, classify, count, finder, !forward)
-
-    if (steps === -1) {
-        // Ran off the end of the current line -- fall back to the native
-        // motion for this one press rather than silently doing nothing.
-        fallbackToNativeWordMotion(kind, forward, operator, returnMode, count)
-        return
-    }
-
-    applyMotionSteps(forward, inclusive, steps, operator, returnMode)
+function performWordMotion(kind, classify, count, operator, returnMode) {
+    if (returnMode === "visual") return visualSnapshotWord(kind, classify === classifyWORDChar, count)
+    return snapshotWordMotion(kind, classify === classifyWORDChar, count, operator)
 }
 
 // --- Scrolling -------------------------------------------------------------
@@ -2038,10 +1894,11 @@ function fullScreenScroll(down) {
 let docsScrollContainer = null
 function getDocsScrollContainer() {
     if (docsScrollContainer && docsScrollContainer.isConnected) return docsScrollContainer
-    docsScrollContainer = document.querySelector(".kix-appview-editor")
-        || document.querySelector(".kix-rotatingtilemanager-content")
-        || document.scrollingElement
-        || null
+    const candidates = [document.querySelector(".kix-appview-editor"),
+        document.querySelector(".kix-appview-editor-container"),
+        document.querySelector(".kix-rotatingtilemanager-content"), document.scrollingElement].filter(Boolean)
+    docsScrollContainer = candidates.find((el) => el.clientHeight > 0 && el.scrollHeight > el.clientHeight + 1)
+        || candidates[0] || null
     return docsScrollContainer
 }
 
@@ -2259,11 +2116,20 @@ function waitForFirstInput(key) {
         operatorCount = operatorCount * 10 + Number(key)
         return
     }
-    const count = operatorCount || 1
+    const count = (operatorCount || 1) * operatorPrefixCount
     operatorCount = 0
+    operatorPrefixCount = 1
     const op = longStringOp 
 
     switch (key) {
+        case "/":
+        case "?":
+            startSearch(key === "/", op, count, "normal")
+            break
+        case "n":
+        case "N":
+            repeatSearch(key === "N", count, op, "normal")
+            break
         case "i":
         case "a":
             operatorObjectPrefix = key
@@ -2312,10 +2178,10 @@ function waitForFirstInput(key) {
             runDotRepeatable(() => { selectToEndOfLine(); runLongStringOp(op) }, op)
             break
 					case "G":
-            runDotRepeatable(() => { goToDocEnd(true); runLongStringOp(op) }, op)
+            gotoTextLine(null, op, "normal")
             break
         case "g":
-            runDotRepeatable(() => { goToDocStart(true); runLongStringOp(op) }, op)
+            startGPrefix(count, op, "normal")
             break
         case "f":
         case "F":
@@ -2394,6 +2260,21 @@ function handleMultipleMotion(key) {
 
     const times = multipleMotion.times || 1
     const targetMode = multipleMotion.mode
+    if (key === "g" || key === "G") {
+        mode = targetMode
+        multipleMotion.times = 0
+        if (key === "g") startGPrefix(times, null, targetMode)
+        else gotoTextLine(times, null, targetMode)
+        return
+    }
+    if (["/", "?", "n", "N", "*", "#"].includes(key)) {
+        pendingSearchCount = times
+        mode = targetMode
+        multipleMotion.times = 0
+        if (targetMode === "normal") handleKeyEventNormal(key)
+        else handleKeyEventVisualLine(key)
+        return
+    }
 
     if (targetMode === "visual" || targetMode === "visualLine") {
         // Restore the real visual mode BEFORE dispatching: the visual
@@ -2403,6 +2284,10 @@ function handleMultipleMotion(key) {
         // to always restore "visualLine", even for charwise `v`.
         mode = targetMode
         multipleMotion.times = 0
+        if (targetMode === "visual" && ["w", "W", "b", "B", "e", "E"].includes(key)) {
+            visualSnapshotWord(key.toLowerCase(), key === key.toUpperCase(), times)
+            return
+        }
         if (key === "f" || key === "F" || key === "t" || key === "T") {
             pendingFindCount = times
             handleKeyEventVisualLine(key)
@@ -2418,8 +2303,9 @@ function handleMultipleMotion(key) {
     }
 
     if (targetMode === "normal" && (key === "c" || key === "d" || key === "y")) {
-        operatorCount = times
         handleKeyEventNormal(key)
+        operatorPrefixCount = times
+        operatorCount = 0
         multipleMotion.times = 0
         return
     }
@@ -2470,6 +2356,8 @@ function handleMultipleMotion(key) {
 // DocsKeys' mode and the on-screen selection disagreeing.
 function visualModeToResumeOnEscape() {
     switch (mode) {
+        case "gPrefix":
+            return gPrefixState && gPrefixState.returnMode !== "normal" ? gPrefixState.returnMode : null
         case "waitForFindChar":
             return (pendingFindReturnMode === "visual" || pendingFindReturnMode === "visualLine") ? pendingFindReturnMode : null
         case "waitForRegister":
@@ -2518,6 +2406,7 @@ function handleModifiedKey(e) {
     if (mode === "insert") return
     const k = e.key || ""
     if (!oracleBusy) {
+        if (HELD_NAMED_KEYS.includes(k) || ["x", "v", "z", "y"].includes(k.toLowerCase())) invalidateExternalText()
         // Native selection commands (Ctrl+A, Ctrl+Shift+arrows, ...) can
         // create a selection while in normal mode; make sure it is noticed.
         if (e.shiftKey || k.toLowerCase() === "a") markSelectionCheck("user")
@@ -2542,11 +2431,24 @@ function handleModifiedKey(e) {
 
 function eventHandler(e) {
     if (e.isTrusted === false || e.isComposing || e.keyCode === 229) return
+    if (mode === "search") {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        handleSearchInput(e)
+        return
+    }
     if (
         ["Shift","Meta","Control","Alt",""].includes(e.key)
     ) return
 
     hasHandledKey = true
+    if (pendingSelectionCheck && !oracleBusy && mode !== "insert" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        queueKey({ key: e.key })
+        runSelectionCheck()
+        return
+    }
 
     if (e.ctrlKey && e.key === "[") {
         e.preventDefault()
@@ -2632,6 +2534,7 @@ function handleKey(e) {
 
     if (e.key == 'Escape') {
         e.preventDefault()
+        hideSearchLine()
         const resume = visualModeToResumeOnEscape()
         if (resume) {
             pendingFindType = null
@@ -2646,6 +2549,11 @@ function handleKey(e) {
         }
         if (mode == 'visualLine' || mode == 'visual') {
             leaveVisualSelectionForEscape()
+        } else if (mode === "insert") {
+            const before = cursorDocumentPoint()
+            sendKeyEvent("left")
+            const after = cursorDocumentPoint()
+            if (before && after && Math.abs(before.y - after.y) > 1) sendKeyEvent("right")
         }
         pendingRegister = null
         pendingRegisterAppend = false
@@ -2715,6 +2623,9 @@ function handleKey(e) {
             case "multipleMotion":
                 handleMultipleMotion(key)
                 break
+            case "gPrefix":
+                handleGPrefix(key)
+                break
         }
     }
 }
@@ -2760,15 +2671,17 @@ function handleKeyEventNormal(key) {
             break
         }
         case "g":
-            goToDocStart()
+            startGPrefix(1, null, "normal")
             break
         case "G":
-            goToDocEnd()
+            gotoTextLine(null, null, "normal")
             break
         case "c":
         case "d":
         case "y":
             longStringOp = key
+            operatorPrefixCount = 1
+            operatorCount = 0
             mode = "waitForFirstInput"
             break
         case "D":
@@ -2813,7 +2726,7 @@ function handleKeyEventNormal(key) {
             goToStartOfLine()
             break
         case "$":
-            goToEndOfLine()
+            goToLastCharacter()
             break
         case "I":
             goToStartOfLine()
@@ -2845,7 +2758,19 @@ function handleKeyEventNormal(key) {
             if (lastChange) lastChange()
             break
         case "/":
-            clickMenu(menuItems.find)
+        case "?":
+            startSearch(key === "/", null, pendingSearchCount, "normal")
+            pendingSearchCount = 1
+            break
+        case "n":
+        case "N":
+            repeatSearch(key === "N", pendingSearchCount, null, "normal")
+            pendingSearchCount = 1
+            break
+        case "*":
+        case "#":
+            searchWordUnderCursor(key === "*", pendingSearchCount, "normal")
+            pendingSearchCount = 1
             break
         case "f":
         case "F":
@@ -2926,21 +2851,41 @@ function handleKeyEventVisualLine(key) {
             sendKeyEvent("left")
             switchModeToVisualLine()
             break
+        case "/":
+        case "?":
+            startSearch(key === "/", null, pendingSearchCount, "visual")
+            pendingSearchCount = 1
+            break
+        case "n":
+        case "N":
+            repeatSearch(key === "N", pendingSearchCount, null, "visual")
+            pendingSearchCount = 1
+            break
+        case "*":
+        case "#":
+            searchWordUnderCursor(key === "*", pendingSearchCount, "visual")
+            pendingSearchCount = 1
+            break
         case "":
             break
         case "h":
-            if (model) visualMoveCursor(model.c - 1)
+            if (model) visualMoveCursor(Math.max(DocsKeysVim.line(model.text, model.c).start, model.c - 1))
             else visualNativeMotion(false, () => sendKeyEvent("left", { shift: true }))
             break
         case "l":
-            if (model) visualMoveCursor(model.c + 1)
+            if (model) {
+                const line = DocsKeysVim.line(model.text, model.c)
+                if (model.c < line.end) visualMoveCursor(Math.min(Math.max(line.start, line.end - 1), model.c + 1))
+            }
             else visualNativeMotion(true, () => sendKeyEvent("right", { shift: true }))
             break
         case "j":
-            visualNativeMotion(true, () => nativeVerticalStep(true, true))
+            if (model) visualSnapshotVertical(true)
+            else visualNativeMotion(true, () => nativeVerticalStep(true, true))
             break
         case "k":
-            visualNativeMotion(false, () => nativeVerticalStep(false, true))
+            if (model) visualSnapshotVertical(false)
+            else visualNativeMotion(false, () => nativeVerticalStep(false, true))
             break
         case "\"":
             switchModeToWaitForRegister()
@@ -2974,27 +2919,28 @@ function handleKeyEventVisualLine(key) {
             if (model) {
                 visualWordMotion(wordKind, classify)
             } else {
-                fallbackToNativeWordMotion(wordKind, (wordKind === "e" || wordKind === "w"), null, mode)
+                visualSnapshotWord(wordKind, classify === classifyWORDChar)
             }
             break
         }
         case "^":
         case "_":
             if (model) {
-                visualMoveCursor(firstNonBlankIndex(model.text))
+                const line = DocsKeysVim.line(model.text, model.c)
+                visualMoveCursor(line.start + firstNonBlankIndex(model.text.slice(line.start, line.end)))
             } else {
                 console.warn("DocsKeys: ^/_ isn't available in this visual selection (visual line mode, or the selection has moved off the line) -- leave and re-enter visual mode to reset")
             }
             break
         case "0":
-            if (model) visualMoveCursor(0)
+            if (model) visualMoveCursor(DocsKeysVim.line(model.text, model.c).start)
             else visualNativeMotion(false, () => selectToStartOfLine())
             break
         case "$":
             // Real Vim's `$` in Visual mode also selects the line break; this
             // stops at the last character (Docs' shift+End) -- documented
             // deviation, safer than accidentally joining lines.
-            if (model) visualMoveCursor(model.text.length - 1)
+            if (model) visualMoveCursor(DocsKeysVim.line(model.text, model.c).end)
             else visualNativeMotion(true, () => {
                 sendKeyEvent("end", { shift: true })
                 const end = cursorDocumentPoint()
@@ -3004,10 +2950,10 @@ function handleKeyEventVisualLine(key) {
             })
             break
         case "G":
-            visualNativeMotion(true, () => goToDocEnd(true))
+            gotoTextLine(null, null, "visual")
             break
         case "g":
-            visualNativeMotion(false, () => goToDocStart(true))
+            startGPrefix(1, null, "visual")
             break
         case "o":
         case "O":
@@ -3069,6 +3015,7 @@ let menuItems = {
 }
 
 function clickMenu(itemCaption) {
+    if (itemCaption !== menuItems.copy) invalidateTextSnapshot()
     simulateClick(getMenuItem(itemCaption));
 }
 
@@ -3199,6 +3146,7 @@ let mouseDownPos = null
 if (typeof document.addEventListener === "function") {
     document.addEventListener("mousedown", (e) => {
         if (!e.isTrusted || !e.target.closest(".kix-appview-editor")) return
+        invalidateTextSnapshot()
         mouseDownPos = { x: e.clientX, y: e.clientY }
         if (mode === "visual" || mode === "visualLine") {
             visualModel = null

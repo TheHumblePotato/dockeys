@@ -135,11 +135,11 @@
         <label><input type="checkbox" name="startInInsert"> Start new documents in insert mode</label>
         <label>Word motions
             <select name="wordMotion">
-                <option value="native">Fast: native w / b</option>
-                <option value="precise">Precise: Vim punctuation boundaries</option>
+                <option value="native">Fast: cached Vim motions</option>
+                <option value="precise">Precise: fresher Vim motions</option>
             </select>
         </label>
-        <p>Fast w/b use Docs' word boundaries without clipboard reads. Precise motions, e and W/E/B read text through the clipboard. Visual selections keep exact motions within the starting line.</p>
+        <p>Both modes follow Vim word boundaries across paragraphs. Fast reuses reads for up to 2.5 seconds; Precise up to 0.5 seconds. Operators refresh before editing. Both modes need clipboard text access.</p>
         <p id="settings-status" role="status" aria-live="polite">Loading settings…</p>
     </fieldset>
     <div class="header">
@@ -248,7 +248,7 @@
         </div>
         <div class="tip">
              <div class="tip-title">Visual mode tip</div>
-             <div class="tip-content">After <div class="key inline">v</div>, motions are exact within the line you started on. After <div class="key inline">j</div>/<div class="key inline">k</div>/<div class="key inline">{</div>/<div class="key inline">}</div>/<div class="key inline">g</div>/<div class="key inline">G</div> the selection uses Docs' native motions; leave and re-enter Visual mode to get f/t/^/iw back. Visual line mode (<div class="key inline">V</div>) always selects whole lines: <div class="key inline">j</div>/<div class="key inline">k</div>/<div class="key inline">g</div>/<div class="key inline">G</div>/<div class="key inline">{</div>/<div class="key inline">}</div> move it, other motions are ignored.</div>
+             <div class="tip-content">Visual mode includes the anchor and cursor characters. <span class="key inline">w</span> lands on the next word’s first character; <span class="key inline">e</span> lands at a word end. Motions remain exact across paragraphs while the snapshot is valid. <span class="key inline">V</span> selects whole display lines. Use <span class="key inline">gg</span> for the first line; <span class="key inline">g</span> now waits for a second command key.</div>
          </div>
     </div>
 
@@ -337,7 +337,7 @@
             </div>
             <div class="shortcut">
                 <div class="key">/</div>
-                <div class="description">Open Find dialog</div>
+                <div class="description">Search literal text; Enter runs, Esc cancels</div>
             </div>
             <div class="shortcut">
                 <div class="key">x</div>
@@ -363,6 +363,13 @@
         <div class="tip-content">
             If you use Vimium/Surfing Keys, disable it for Google Docs.
         </div>
+    </div>
+
+    <div class="section">
+        <h2 class="section-title">Search and g motions</h2>
+        <p><span class="key inline">/text</span> + Enter searches forward; <span class="key inline">?text</span> searches backward. Queries are literal, with \c / \C case flags and \n for a paragraph break.</p>
+        <p><span class="key inline">n / N</span> repeat; <span class="key inline">* / #</span> search the word under the cursor. Searches wrap. <span class="key inline">d/hi</span> + Enter deletes up to the next “hi”, excluding the match; c/y and counts work too.</p>
+        <p><span class="key inline">ge / gE</span> move to the previous word/WORD end; <span class="key inline">g_</span> goes to the last nonblank. <span class="key inline">gj / gk</span> use native display lines. <span class="key inline">3gg / 3G</span> go to the third paragraph line.</p>
     </div>
 
     <footer>

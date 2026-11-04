@@ -1,4 +1,5 @@
 const { makeEnv } = require("./harness")
+const Vim = require("./vim") // the separate differential suite checks these target rules against Neovim
 let seed = Number(process.argv[2] || 1)
 const rnd = () => (seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296
 const pick = (a) => a[Math.floor(rnd() * a.length)]
@@ -25,15 +26,13 @@ function makeLine() {
     const log = [`line=${JSON.stringify(line)} p=${p}`]
     const nsteps = 3 + Math.floor(rnd() * 8)
     for (let s = 0; s < nsteps; s++) {
-      const k = pick(["h","l","h","l","w","e","b","W","E","B","0","^","$","f","t","F","T",";",",","o","iw","aw","iW","aW"])
+      const k = pick(["h","l","h","l","w","e","b","W","E","B","0","^","f","t","F","T",";",",","o","iw","aw","iW","aW"])
       let nc = c, na = a, ok = true
       const rw = (kind, cls) => {
-        const fwd = kind !== "b"
-        const finder = kind === "e" ? ctx.findWordEnd : kind === "w" ? ctx.findWordStart : ctx.findWordStartBackward
-        const t = fwd ? line.slice(c) : line.slice(0, c)
-        const st = ctx.countedWordSteps(t, cls, 1, finder, !fwd)
-        if (st === -1) { ok = false; return }
-        nc = fwd ? c + st : c - st
+        const result = Vim.word([...line], c, kind, 1, cls === ctx.classifyWORDChar, true)
+        const target = result.target
+        if ((kind === "b" && !/\S/.test(line.slice(0, c))) || target >= n || (kind === "e" && result.boundary >= n)) { ok = false; return } // this renderer fuzz stays on its starting line
+        nc = target
       }
       if (k === "h") nc = Math.max(0, c - 1)
       else if (k === "l") nc = Math.min(n - 1, c + 1)
@@ -63,6 +62,7 @@ function makeLine() {
       }
       else if (k === "o") { na = c; nc = a }
       else if (k.length === 2) {
+        if (a !== c && (c === 0 || c === n - 1)) continue // full-document expansion is covered by Neovim comparisons
         const cls = k[1] === "W" ? ctx.classifyWORDChar : ctx.classifyWordChar
         const around = k[0] === "a"
         if (a === c) { const r = ctx.textObjectRange(line, c, cls, around); na = r[0]; nc = r[1] }

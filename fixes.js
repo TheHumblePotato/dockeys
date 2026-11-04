@@ -53,7 +53,7 @@ async function fresh(text, off, opts) { const e = makeEnv(text, opts); e.sim.set
   eq("V k at top stays on first line, j then adds second line", e.sim.text, "l3\nl4")
   console.log("     (V k j on first line) text =", JSON.stringify(e.sim.text), "mode", e.get("mode"))
   e = await fresh(L, 3); await e.press("V"); await e.press("G"); eq("V G", e.sim.selText(), "l2\nl3\nl4")
-  e = await fresh(L, 6); await e.press("V"); await e.press("g"); eq("V g", e.sim.selText(), "l1\nl2\nl3\n")
+  e = await fresh(L, 6); await e.press("V"); await e.pressAll("gg"); eq("V gg", e.sim.selText(), "l1\nl2\nl3\n")
   e = await fresh(L, 3); await e.press("V"); await e.pressAll("2j"); eq("V 2j", e.sim.selText(), "l2\nl3\nl4")
   e = await fresh(L, 6); await e.press("V"); await e.pressAll("kkj"); eq("V k k j", e.sim.selText(), "l2\nl3\n")
   e = await fresh(L, 6); await e.press("V"); await e.pressAll("2k"); await e.press("d"); await e.sleep(60); eq("V 2k d", e.sim.text, "l4")
@@ -68,7 +68,7 @@ async function fresh(text, off, opts) { const e = makeEnv(text, opts); e.sim.set
   e = await fresh(E, 0); await e.pressAll("ww"); eq("ww over emoji", e.sim.focus, E.indexOf("yy"))
   e = await fresh(E, 0); await e.press("f"); await e.pressRaw("z"); eq("fz after emoji", e.sim.focus, E.indexOf("z"))
   e = await fresh(E, 0); await e.press("f"); await e.pressRaw("😀"); eq("f😀", e.sim.focus, 1)
-  e = await fresh(E, E.length); await e.press("b"); eq("b", e.sim.focus, E.indexOf("z"))
+  e = await fresh(E, E.length); await e.press("b"); eq("b normalizes an insertion caret to the last character first", e.sim.focus, E.indexOf("yy"))
   e = await fresh(E, 0); await e.pressAll("dw"); await e.sleep(30); eq("dw before emoji", e.sim.text, "😀 yy z")
   const C = "cafe\u0301 ok"   // e + combining acute
   e = await fresh(C, 0); await e.press("w"); eq("w over combining mark", e.sim.focus, C.indexOf("ok"))

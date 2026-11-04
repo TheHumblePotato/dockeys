@@ -7,11 +7,12 @@ async function main() {
     e.sim.clipboard = "clipboard"
     await e.pressAll("2w")
     assert.equal(e.sim.focus, 8)
+    const warmCopies = e.sim.copyCalls
     await e.press("b")
     assert.equal(e.sim.focus, 4)
     await e.press("w", true, { repeat: true })
     assert.equal(e.sim.focus, 8)
-    assert.equal(e.sim.copyCalls, 0)
+    assert.equal(e.sim.copyCalls, warmCopies)
 
     assert.equal(e.sim.clipboard, "clipboard")
     assert.equal(e.get("oracleBusy"), false)
@@ -131,7 +132,7 @@ async function main() {
     for (const jump of ["G", "g"]) {
         e = makeEnv("a\nlonger line\nz\n")
         e.sim.setCaret(2)
-        await e.pressAll("V" + jump)
+        await e.pressAll("V" + (jump === "g" ? "gg" : jump))
         if (jump === "G") {
             await e.pressAll("kk")
             assert.equal(e.sim.selText(), "longer line\n")

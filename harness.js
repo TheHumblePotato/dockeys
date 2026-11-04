@@ -130,7 +130,7 @@ function makeEnv(text, opts = {}) {
     const sim = new DocSim(text)
     if (opts.copyDelay !== undefined) sim.copyDelay = opts.copyDelay
     const listeners = {}
-    const mkEl = () => ({ style: {}, appendChild() {}, addEventListener() {}, getBoundingClientRect() { return { left: 0, top: 0, width: 0, height: 0 } } })
+    const mkEl = () => ({ style: {}, isConnected: true, appendChild() {}, addEventListener() {}, getBoundingClientRect() { return { left: 0, top: 0, width: 0, height: 0 } } })
     const menuEls = ["Copy", "Cut", "Paste", "Redo", "Undo", "Find"].map((c) => ({
         innerText: c,
         dispatchEvent(ev) { if (ev.type === "click") sim.menu(c) },
@@ -189,13 +189,12 @@ function makeEnv(text, opts = {}) {
         setTimeout, clearTimeout, performance, Promise, Date, Math, Number, String, Array, Object, RegExp, Error, Intl,
     })
     vm.runInContext(fs.readFileSync(path.join(__dirname, "settings.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "vim.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "text_model.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "search.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "g_prefix.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(opts.file || path.join(__dirname, "content.js"), "utf8"), ctx)
     const get = (expr) => vm.runInContext(expr, ctx)
-    // The cosmetic idle refresh (box width / selection check) is 40ms in the
-    // extension; the fixed sleeps in the older tests were written against the
-    // old 150ms, so default to that here. Pass { refreshMs: 40 } to test the
-    // real timing.
-    vm.runInContext(`SELECTION_CHECK_DEBOUNCE_MS = ${opts.refreshMs !== undefined ? opts.refreshMs : 150}`, ctx)
     async function settle() {
         for (let i = 0; i < 400; i++) {
             let q = 0; try { q = get("keyQueue.length") } catch (e) {}
