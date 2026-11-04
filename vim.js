@@ -118,13 +118,15 @@ const DocsKeysVim = (() => {
         const end = Math.min(text.length, last.end + 1)
         return { start: last.end === text.length && first.start > 0 ? first.start - 1 : first.start, end }
     }
-    function search(text, at, pattern, forward, count = 1, wrap = true, wholeWord = false) {
-        if (!pattern) return null
-        let ignoreCase = false
-        pattern = pattern.replace(/\\([cC])/g, (_, c) => { ignoreCase = c === "c"; return "" })
+    function searchMatches(text, pattern, wholeWord = false, options = {}) {
+        if (!pattern) return []
+        let ignoreCase = !!options.ignoreCase, explicitCase = null
+        pattern = pattern.replace(/\\([cC])/g, (_, c) => { explicitCase = c === "c"; return "" })
         if (pattern.startsWith("\\V")) pattern = pattern.slice(2)
         pattern = pattern.replace(/\\n/g, "\n")
-        if (!pattern) return null
+        if (explicitCase !== null) ignoreCase = explicitCase
+        else if (ignoreCase && options.smartCase && !wholeWord && /\p{Lu}/u.test(pattern)) ignoreCase = false
+        if (!pattern) return []
         const offsets = [0]
         for (const ch of text) offsets.push(offsets[offsets.length - 1] + ch.length)
         const boundaries = new Map(offsets.map((offset, i) => [offset, i]))
@@ -140,18 +142,25 @@ const DocsKeysVim = (() => {
             if (wholeWord && (classify(text[start - 1]) === "keyword" || classify(text[end]) === "keyword")) continue
             matches.push({ target: start, length: end - start })
         }
+        return matches
+    }
+    function searchFromMatches(matches, at, forward, count = 1, wrap = true) {
         if (!matches.length) return null
-        let current = at, result = null, wrapped = false
-        for (let n = 0; n < count; n++) {
-            result = forward ? matches.find((m) => m.target > current) : matches.findLast((m) => m.target < current)
-            if (!result) {
-                if (!wrap) return null
-                wrapped = true
-                result = forward ? matches[0] : matches[matches.length - 1]
-            }
-            current = result.target
+        let lo = 0, hi = matches.length
+        while (lo < hi) {
+            const mid = Math.floor((lo + hi) / 2)
+            if (matches[mid].target < at || (forward && matches[mid].target === at)) lo = mid + 1
+            else hi = mid
         }
-        return { ...result, wrapped }
+        count = Math.min(Number.MAX_SAFE_INTEGER, Math.max(1, Math.trunc(Number(count) || 1)))
+        const first = forward ? lo : lo - 1, remaining = count - 1
+        const wrapped = first < 0 || first >= matches.length || (forward ? remaining >= matches.length - first : remaining > first)
+        if (wrapped && !wrap) return null
+        const chosen = ((first % matches.length) + (forward ? remaining % matches.length : -(remaining % matches.length)) + matches.length) % matches.length
+        return { ...matches[chosen], wrapped, index: chosen, total: matches.length }
+    }
+    function search(text, at, pattern, forward, count = 1, wrap = true, wholeWord = false, options = {}) {
+        return searchFromMatches(searchMatches(text, pattern, wholeWord, options), at, forward, count, wrap)
     }
     function exclusiveRange(text, at, target, op) {
         const start = Math.min(at, target), end = Math.max(at, target)
@@ -164,7 +173,7 @@ const DocsKeysVim = (() => {
         }
         return { start: Math.min(at, target), end: Math.max(at, target) }
     }
-    return { blank, classify, line, emptyLine, cursor, word, wordRange, search, exclusiveRange }
+    return { blank, classify, line, emptyLine, cursor, word, wordRange, search, searchMatches, searchFromMatches, exclusiveRange }
 })()
 
 if (typeof module !== "undefined") module.exports = DocsKeysVim

@@ -19,11 +19,16 @@ class DocSim {
         this.copyCalls = 0
         this.keyLog = []
     }
-    lineInfo(off) {
+    logicalLineInfo(off) {
         const start = off === 0 ? 0 : this.text.lastIndexOf("\n", off - 1) + 1
         let end = this.text.indexOf("\n", off)
         if (end === -1) end = this.text.length
         return { start, end }
+    }
+    lineInfo(off) { return this.logicalLineInfo(off) }
+    pointAt(off) {
+        const line = this.lineInfo(off)
+        return { x: (off - line.start) * 8 + 50, y: this.text.slice(0, off).split("\n").length * 20 + 40 }
     }
     prevB(f) { // previous grapheme boundary (arrow keys step over whole graphemes)
         if (f <= 0) return 0
@@ -86,7 +91,7 @@ class DocSim {
                 else { const p = this.lineInfo(li.start - 1); f = p.start + Math.min(this.goal, p.end - p.start) }
             } else {
                 if (li.end >= this.text.length) f = this.text.length
-                else { const n = this.lineInfo(li.end + 1); f = n.start + Math.min(this.goal, n.end - n.start) }
+                else { const n = this.lineInfo(li.end + (this.text[li.end] === "\n" ? 1 : 0)); f = n.start + Math.min(this.goal, n.end - n.start) }
             }
         }
         this.focus = f
@@ -148,10 +153,8 @@ function makeEnv(text, opts = {}) {
     const caret = {
         style: {}, isConnected: true, closest: () => owner,
         getBoundingClientRect() {
-            const li = sim.lineInfo(sim.focus)
-            const row = sim.text.slice(0, sim.focus).split("\n").length - 1
-            const left = (sim.focus - li.start) * 8 + 50
-            const top = row * 20 + 60
+            const point = sim.pointAt(sim.focus)
+            const left = point.x, top = point.y
             return { left, top, width: 1, height: 16, bottom: top + 16, right: left + 1 }
         },
     }
@@ -233,10 +236,18 @@ function makeEnv(text, opts = {}) {
     function selectedText() {
         const state = get("linewiseState")
         if (get("mode") !== "visualLine" || !state) return sim.selText()
-        const anchor = state.text.slice(0, state.anchor).join("").length
-        const a = sim.lineInfo(anchor), c = sim.lineInfo(sim.focus)
+        let anchor = 0
+        while (anchor <= sim.text.length) {
+            if (Math.abs(sim.pointAt(anchor).y - state.point.y) < 1) break
+            const row = sim.lineInfo(anchor), next = row.end + (sim.text[row.end] === "\n" ? 1 : 0)
+            if (next <= anchor) break
+            anchor = next
+        }
+        const logical = get("settings.visualVertical") === "logical"
+        const a = logical ? sim.logicalLineInfo(anchor) : sim.lineInfo(anchor)
+        const c = logical ? sim.logicalLineInfo(sim.focus) : sim.lineInfo(sim.focus)
         const end = Math.max(a.end, c.end)
-        return sim.text.slice(Math.min(a.start, c.start), end < sim.text.length ? end + 1 : end)
+        return sim.text.slice(Math.min(a.start, c.start), sim.text[end] === "\n" ? end + 1 : end)
     }
     return { sim, ctx, get, press, pressRaw, pressAll, settle, sleep, documentListeners, selectedText,
         changeSettings(value) {

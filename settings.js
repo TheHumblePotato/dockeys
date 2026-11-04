@@ -10,12 +10,16 @@ const DocsKeysSettings = (() => {
         readStrategy: "auto",
         cursorColor: "#1a73e8",
         visualVertical: "display",
+        searchWrap: true,
+        searchIgnoreCase: false,
+        searchSmartCase: false,
+        searchShowCount: true,
     })
 
     function normalize(value) {
         const out = { ...defaults }
         if (!value || typeof value !== "object") return out
-        for (const name of ["dvorak", "boxCursor", "modeIndicator", "startInInsert"]) {
+        for (const name of ["dvorak", "boxCursor", "modeIndicator", "startInInsert", "searchWrap", "searchIgnoreCase", "searchSmartCase", "searchShowCount"]) {
             if (typeof value[name] === "boolean") out[name] = value[name]
         }
         if (["native", "precise"].includes(value.wordMotion)) out.wordMotion = value.wordMotion
@@ -25,5 +29,15 @@ const DocsKeysSettings = (() => {
         return out
     }
 
-    return { key, defaults, normalize }
+    function storage() {
+        try { return typeof chrome !== "undefined" ? chrome.storage?.local || null : null }
+        catch { return null }
+    }
+
+    function storageError() {
+        try { return typeof chrome !== "undefined" ? chrome.runtime?.lastError : null }
+        catch { return true }
+    }
+
+    return { key, defaults, normalize, storage, storageError }
 })()

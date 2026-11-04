@@ -297,6 +297,7 @@ function cursorPositionKey(nativeCursor) {
 // failed reads are collapsed. Only flagged selections trigger a Copy check.
 let pendingSelectionCheck = null   // null | "user" | "glitch"
 function markSelectionCheck(reason) {
+    if (mode !== "normal") return
     if (pendingSelectionCheck === "user") return
     pendingSelectionCheck = reason
     if (reason === "user" && mode === "normal") {
@@ -364,8 +365,10 @@ let multipleMotion = {
 }
 
 const script = document.createElement("script");
-script.src = chrome.runtime.getURL("page_script.js");
-document.documentElement.appendChild(script);
+try {
+    script.src = chrome.runtime.getURL("page_script.js");
+    document.documentElement.appendChild(script);
+} catch { /* The manifest's MAIN-world bridge is already installed. */ }
 
 const isMac = /Mac/.test(navigator.platform || navigator.userAgent);
 
@@ -436,6 +439,7 @@ function sendKeyEvent(key, mods = {}) {
         viewportEpoch++
         cancelReadScrollSettlement()
     }
+    if (["delete", "backspace", "enter", "space"].includes(key)) documentRevision++
     if (["delete", "backspace", "enter", "space"].includes(key) ||
         (!viewportRead && !managedTextMotion && mode !== "visual")) invalidateTextSnapshot()
     const keyCode = keyCodes[key]
@@ -1127,26 +1131,33 @@ const BLACKHOLE_REGISTER = "_" // writes here are discarded, matching Vim's "_
 const PASTE_SETTLE_DELAY_MS = 40 // was 60/80 (formerly REGISTER_READ_DELAY_MS): only remaining fixed-delay wait, used to let Docs' paste actually consume the clipboard before pasteRegister() restores it. Polling doesn't apply here (we wrote the clipboard ourselves, so there's no "change" to detect -- we're waiting for Docs to *read* it, not write it). Unverified against a live Docs page; raise it if pastes intermittently pick up the wrong text.
 const REGISTER_STORAGE_KEY = "docskeys-registers"
 
-chrome.storage.local.get(REGISTER_STORAGE_KEY, (result) => {
-    if (chrome.runtime.lastError) {
-        console.warn("DocsKeys: couldn't load saved registers", chrome.runtime.lastError)
-        return
-    }
-    if (result && result[REGISTER_STORAGE_KEY]) {
-        registers = result[REGISTER_STORAGE_KEY]
-    }
-})
+try {
+    DocsKeysSettings.storage()?.get(REGISTER_STORAGE_KEY, (result) => {
+        if (DocsKeysSettings.storageError()) return
+        const saved = result?.[REGISTER_STORAGE_KEY]
+        if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+            // A late storage callback must not overwrite a register just used.
+            for (const [name, text] of Object.entries(saved)) {
+                if (typeof text === "string" && !Object.hasOwn(registers, name)) registers[name] = text
+            }
+        }
+    })
+} catch { /* Registers remain usable in memory if the extension was reloaded. */ }
 
+let registerStorageNotice = false
+function registerStorageUnavailable() {
+    if (registerStorageNotice) return
+    registerStorageNotice = true
+    showSearchLine("Registers kept in this tab; refresh Docs to restore saving")
+}
 function saveRegisters() {
     try {
-        chrome.storage.local.set({ [REGISTER_STORAGE_KEY]: registers }, () => {
-            if (chrome.runtime.lastError) {
-                console.warn("DocsKeys: couldn't save registers", chrome.runtime.lastError)
-            }
+        const storage = DocsKeysSettings.storage()
+        if (!storage) { registerStorageUnavailable(); return }
+        storage.set({ [REGISTER_STORAGE_KEY]: registers }, () => {
+            if (DocsKeysSettings.storageError()) registerStorageUnavailable()
         })
-    } catch (err) {
-        console.warn("DocsKeys: couldn't save registers", err)
-    }
+    } catch { registerStorageUnavailable() }
 }
 
 // Named registers persist locally; uppercase appends. "_ discards content.
@@ -2253,8 +2264,9 @@ function handleMultipleMotion(key) {
             else visualSnapshotWord(key.toLowerCase(), key === key.toUpperCase(), times)
             return
         }
-        if (targetMode === "visual" && (key === "j" || key === "k")) {
-            if (settings.visualVertical === "display") visualNativeVertical(key === "j", times)
+        if ((targetMode === "visual" || targetMode === "visualLine") && (key === "j" || key === "k")) {
+            if (targetMode === "visualLine") linewiseMoveVertical(key === "j", times)
+            else if (settings.visualVertical === "display") visualNativeVertical(key === "j", times)
             else visualLogicalVertical(key === "j", times)
             return
         }
@@ -2379,10 +2391,21 @@ function handleModifiedKey(e) {
     if (mode === "insert") return
     const k = e.key || ""
     if (!oracleBusy) {
-        if (HELD_NAMED_KEYS.includes(k) || ["x", "v", "z", "y"].includes(k.toLowerCase())) invalidateExternalText()
+        const primary = isMac ? e.metaKey : e.ctrlKey
+        const edit = primary && !e.altKey && ["x", "v", "z", "y"].includes(k.toLowerCase())
+        if (HELD_NAMED_KEYS.includes(k) || edit) invalidateExternalText()
+        if (edit && mode !== "normal") {
+            // Leave the native range intact for Cut/Paste. Its collapse after
+            // the edit must not leave a stale Visual badge/model behind.
+            visualModel = null
+            clearLinewiseSelection()
+            pendingSelectionCheck = null
+            mode = "normal"
+            updateModeIndicator(mode)
+        }
         // Native selection commands (Ctrl+A, Ctrl+Shift+arrows, ...) can
         // create a selection while in normal mode; make sure it is noticed.
-        if (e.shiftKey || k.toLowerCase() === "a") {
+        if ((e.shiftKey && HELD_NAMED_KEYS.includes(k)) || (primary && !e.altKey && k.toLowerCase() === "a")) {
             if (linewiseState) { clearLinewiseSelection(); mode = "normal" }
             markSelectionCheck("user")
         }
@@ -2424,7 +2447,7 @@ function eventHandler(e) {
     ) return
 
     hasHandledKey = true
-    if (pendingSelectionCheck && !oracleBusy && mode !== "insert" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+    if (pendingSelectionCheck && !oracleBusy && mode === "normal" && !e.ctrlKey && !e.altKey && !e.metaKey && e.key !== "Escape") {
         e.preventDefault()
         e.stopImmediatePropagation()
         queueKey({ key: e.key })
@@ -3011,6 +3034,7 @@ let menuItems = {
 }
 
 function clickMenu(itemCaption) {
+    if ([menuItems.cut, menuItems.paste, menuItems.undo, menuItems.redo].includes(itemCaption)) documentRevision++
     if (itemCaption !== menuItems.copy) invalidateTextSnapshot()
     simulateClick(getMenuItem(itemCaption));
 }
@@ -3106,19 +3130,17 @@ function activateTopLevelMenu(menuCaption) {
 switchModeToNormal()
 
 try {
-    chrome.storage.local.get(DocsKeysSettings.key, (result) => {
-        if (chrome.runtime.lastError) return
-        applySettings(result[DocsKeysSettings.key])
+    DocsKeysSettings.storage()?.get(DocsKeysSettings.key, (result) => {
+        if (DocsKeysSettings.storageError()) return
+        applySettings(result?.[DocsKeysSettings.key])
         if (!hasHandledKey && settings.startInInsert) switchModeToInsert()
     })
-    chrome.storage.onChanged.addListener((changes, area) => {
+    if (typeof chrome !== "undefined") chrome.storage?.onChanged?.addListener((changes, area) => {
         if (area === "local" && changes[DocsKeysSettings.key]) {
             applySettings(changes[DocsKeysSettings.key].newValue)
         }
     })
-} catch (err) {
-    console.warn("DocsKeys: preferences unavailable; using defaults", err)
-}
+} catch { /* Continue with the validated defaults when storage is unavailable. */ }
 
 // switchModeToNormal() above runs immediately on page load, before Google
 // Docs has created its cursor element yet -- so the box-cursor sizing it

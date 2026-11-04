@@ -140,12 +140,16 @@
                 <option value="precise">Precise: fresher Vim motions</option>
             </select>
         </label>
-        <label>Visual j/k
+        <label>Visual movement and linewise selection
             <select name="visualVertical">
                 <option value="display">Displayed rows: fast native movement</option>
                 <option value="logical">Paragraphs: Vim logical lines</option>
             </select>
         </label>
+        <label><input type="checkbox" name="searchWrap"> Wrap searches at document boundaries</label>
+        <label><input type="checkbox" name="searchIgnoreCase"> Ignore case in searches</label>
+        <label><input type="checkbox" name="searchSmartCase"> Smart case: uppercase makes a query case-sensitive</label>
+        <label><input type="checkbox" name="searchShowCount"> Show search match counts</label>
         <p>Both modes follow Vim word boundaries across paragraphs. Fast reuses reads for up to 2.5 seconds; Precise up to 0.5 seconds. Operators refresh before editing.</p>
         <label>Document reads
             <select name="readStrategy">

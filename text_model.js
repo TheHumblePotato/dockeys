@@ -2,6 +2,7 @@
 // guesses: both speed modes use the same Vim rules and differ only in cache age.
 let textSnapshot = null
 let textRevision = 0
+let documentRevision = 0
 let managedTextMotion = 0
 let viewportRead = null
 let viewportEpoch = 0
@@ -14,6 +15,7 @@ function invalidateTextSnapshot() {
 }
 
 function invalidateExternalText() {
+    documentRevision++
     invalidateTextSnapshot()
     if (typeof mode !== "undefined" && mode === "visual") visualModel = null
 }
@@ -249,7 +251,18 @@ async function getWordSnapshot(kind, WORD = false, count = 1) {
 
 function moveSnapshotCaret(snapshot, target) {
     managedTextMotion++
-    try { visualMoveCaret(snapshot.at, target) }
+    try {
+        const direct = Math.abs(target - snapshot.at)
+        const fromStart = snapshot.completeStart || !snapshot.partial ? target + 1 : Infinity
+        const fromEnd = snapshot.completeEnd || !snapshot.partial ? snapshot.text.length - target + 1 : Infinity
+        if (fromStart + 32 < direct && fromStart <= fromEnd) {
+            goToDocStart()
+            visualMoveCaret(0, target)
+        } else if (fromEnd + 32 < direct) {
+            goToDocEnd()
+            visualMoveCaret(snapshot.text.length, target)
+        } else visualMoveCaret(snapshot.at, target)
+    }
     finally { managedTextMotion-- }
     snapshot.at = target
     snapshot.point = cursorDocumentPoint()
@@ -272,6 +285,7 @@ async function applySnapshotRange(snapshot, range, operator) {
 
 async function snapshotWordMotion(kind, WORD, count, operator, returnMode = mode === "visualLine" ? "visualLine" : "normal") {
     if (!beginOracle()) return
+    if (returnMode === "visualLine" && linewiseState) linewiseState.goal = null
     const epoch = scrollIntentRevision
     try {
         let snapshot = operator ? await getTextSnapshot(true) : await getWordSnapshot(kind, WORD, count)

@@ -19,7 +19,7 @@ function run(label, args, timeout = 60000) {
 for (const file of fs.readdirSync(__dirname).filter((name) => name.endsWith(".js"))) {
     run(`syntax ${file}`, ["--check", path.join(__dirname, file)])
 }
-for (const file of ["normal_regression.js", "fixes.js", "visual_scenarios.js", "scroll_zoom.js", "overlay.js", "regressions.js", "integration_regression.js", "iteration_regression.js", "probe_regression.js", "navigation_regression.js", "docs_adapter_regression.js"]) {
+for (const file of ["normal_regression.js", "fixes.js", "visual_scenarios.js", "scroll_zoom.js", "overlay.js", "regressions.js", "integration_regression.js", "iteration_regression.js", "probe_regression.js", "navigation_regression.js", "docs_adapter_regression.js", "selection_search_regression.js"]) {
     run(file, [file])
 }
 run("random visual selections (seed 7, 40 cases)", ["visual_random.js", "7", "40"])
