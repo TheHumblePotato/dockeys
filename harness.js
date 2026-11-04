@@ -130,7 +130,13 @@ function makeEnv(text, opts = {}) {
     const sim = new DocSim(text)
     if (opts.copyDelay !== undefined) sim.copyDelay = opts.copyDelay
     const listeners = {}
-    const mkEl = () => ({ style: {}, isConnected: true, appendChild() {}, addEventListener() {}, getBoundingClientRect() { return { left: 0, top: 0, width: 0, height: 0 } } })
+    const mkEl = () => {
+        const attrs = new Map()
+        return { style: {}, isConnected: true, appendChild() {}, addEventListener() {}, remove() { this.isConnected = false },
+            setAttribute(k, v) { attrs.set(k, v) }, getAttribute(k) { return attrs.get(k) },
+            removeAttribute(k) { attrs.delete(k) }, hasAttribute(k) { return attrs.has(k) },
+            getBoundingClientRect() { return { left: 0, top: 0, width: 0, height: 0 } } }
+    }
     const menuEls = ["Copy", "Cut", "Paste", "Redo", "Undo", "Find"].map((c) => ({
         innerText: c,
         dispatchEvent(ev) { if (ev.type === "click") sim.menu(c) },
@@ -190,9 +196,12 @@ function makeEnv(text, opts = {}) {
     })
     vm.runInContext(fs.readFileSync(path.join(__dirname, "settings.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(path.join(__dirname, "vim.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "read_ui.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "rendered_reader.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(path.join(__dirname, "text_model.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(path.join(__dirname, "search.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(path.join(__dirname, "g_prefix.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "viewport.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(opts.file || path.join(__dirname, "content.js"), "utf8"), ctx)
     const get = (expr) => vm.runInContext(expr, ctx)
     async function settle() {

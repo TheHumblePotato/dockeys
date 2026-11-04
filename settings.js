@@ -7,6 +7,7 @@ const DocsKeysSettings = (() => {
         modeIndicator: true,
         wordMotion: "native",
         startInInsert: false,
+        readStrategy: "auto",
     })
 
     function normalize(value) {
@@ -16,6 +17,7 @@ const DocsKeysSettings = (() => {
             if (typeof value[name] === "boolean") out[name] = value[name]
         }
         if (["native", "precise"].includes(value.wordMotion)) out.wordMotion = value.wordMotion
+        if (["auto", "clipboard", "rendered"].includes(value.readStrategy)) out.readStrategy = value.readStrategy
         return out
     }
 

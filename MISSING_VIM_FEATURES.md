@@ -14,6 +14,16 @@ DocsKeys drives keyboard events and menu commands. It has no supported Google Do
 - No idle clipboard reads. Explicit reads preserve viewport position and newer wheel/touch intent, including late layout callbacks and motions completing after a scroll gesture.
 - Existing DVP/cursor/startup settings, registers, text objects, limited dot repeat, linewise selections, and grapheme handling remain supported.
 
+## Implemented in 1.8
+
+- Prefer read-only annotated SVG runs for local word/find motions and entering Visual mode. Unknown run boundaries promote to a clipboard snapshot rather than inventing spaces or paragraph breaks.
+- Auto, Rendered only (no document probes), and Clipboard compatibility reader settings. The annotation request is undocumented and requires refreshing Docs after updating.
+- Bounded word probes begin with two display lines instead of selecting a document tail. Temporary probe highlights are masked; page-world focus/scroll calls are guarded during reads.
+- Preserve Visual models across tile/selection redraws. Freeze the existing highlight during selection batches; clear temporary masks even when animation frames are throttled.
+- Passive proportional glyph sizing from rendered geometry or existing text hints, including normal hjkl/find/search destinations, without cosmetic clipboard reads.
+- Normal-mode `zz`, `zt`, `zb` position the viewport without moving the cursor or reading text. Counts on these commands are not implemented; use a line motion followed by `zz`.
+- A real Chromium fixture covers masking, Copy, focus/scroll guards, glyph sizing, and Visual redraw stability. See [READING_RESEARCH.md](READING_RESEARCH.md) for the reading design and evidence.
+
 ## Verification boundaries
 
 `npm test` runs the browser-adapter simulator and a headless Neovim comparison when available. The differential suite checks ASCII word motions, punctuation, blank lines, counts, delete/change results, Visual endpoints, selected g commands, and literal-search operators. It is evidence for these cases, not a claim that every Vim rule has been implemented.
@@ -37,7 +47,7 @@ Live Google Docs testing is still required for paragraph/text extraction, format
 - Make logical paragraph lines versus rendered display lines explicit and consistent. Normal `j/k`, linewise `V`, and Home/End remain display based; modeled Visual motions and counted document jumps use paragraph breaks.
 - Support all column-preservation cases, tabs, variable-width graphemes, and virtual-column behavior. `gg/G` currently choose a grapheme column, not a tab-expanded screen column.
 - Audit remaining aliases and boundaries: `_` counts, counted `$`, `g^/g0/g$`, `gI`, and native `h/l` at paragraph boundaries. `I` currently uses Home rather than first nonblank.
-- Implement `H/M/L`, `zt/zz/zb`, sentence motions, and reliable blank-line paragraph motions instead of Docs' paragraph shortcuts.
+- Implement `H/M/L`, counted viewport commands, sentence motions, and reliable blank-line paragraph motions instead of Docs' paragraph shortcuts.
 - Add `%` with bracket nesting and quote/escape handling.
 - Add marks, the jump list, and normal-mode `Ctrl+o/Ctrl+i` with document positions that survive collaborator edits.
 - Preserve the entire span when converting a multiline charwise selection to `V`.
@@ -65,8 +75,11 @@ Live Google Docs testing is still required for paragraph/text extraction, format
 - Add an opt-in live-browser test fixture against real Docs, with a collaborator session and a disposable test document.
 - Handle Docs SPA navigation and replacement of the input iframe element, not just reloading its document.
 - Improve text revision signals for canvas-only remote edits. Mutation/cursor observation plus a bounded cache age is best effort, not a synchronized buffer.
-- Avoid expensive clipboard reads for empty prefixes through a reliable supported selection signal. Do not infer successful text extraction solely from a transient caret rectangle.
-- Improve cursor font/zoom measurement when the hidden input font differs from rendered text; keep cosmetics free of document reads.
+- Extend rendered-text mapping across adjacent styled runs, ligatures, bidirectional text, tables, and offscreen pages. Preserve exact whitespace and logical line boundaries; never concatenate runs speculatively.
+- Investigate a supported read path or stable revision/selection signal. The annotation flag and SVG/selectors are private implementation details, and a saved-file API does not expose the live caret.
+- Reduce full-snapshot reads for global search/operators and very large counts; retain clipboard safety and exact Vim boundaries. Do not infer successful extraction solely from a transient caret rectangle.
+- Improve cursor sizing without annotations, especially native wrapped-line vertical movement, ligatures, and bidirectional text; keep cosmetics free of document probes.
+- Validate selection masks and page-world scroll guards against real Docs versions, browser scroll anchoring, trackpads, and asynchronous menu completion.
 - Audit Mac modifiers, international keyboard layouts, IME composition, tables, lists, footnotes, headers, suggestions, and multi-tab Docs documents.
 - Add accessibility labels and navigation for a richer search command line without stealing the editor's selection or typing focus.
 

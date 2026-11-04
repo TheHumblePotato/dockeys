@@ -84,7 +84,7 @@ async function performSearch(pattern, forward, count = 1, operator = null, whole
     try {
         let snapshot
         if (returnMode === "visual") {
-            const model = visualModel || await recoverVisualSnapshot()
+            const model = await completeVisualSnapshot()
             if (!model) return
             snapshot = { text: model.text, at: model.c }
         } else snapshot = await getTextSnapshot(!!operator)

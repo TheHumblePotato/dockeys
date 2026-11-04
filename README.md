@@ -20,8 +20,11 @@ Settings are saved locally and apply to open documents automatically:
 | Mode badge | On | Show the current mode in the lower-right corner. |
 | Start in insert mode | Off | Choose the initial mode for newly loaded Docs tabs. Changing this does not interrupt an active command. |
 | Word motions | Fast | Both modes use Vim word boundaries across paragraphs. Fast caches reads for up to 2.5 seconds; Precise allows up to 0.5 seconds. Edits and mouse/native navigation invalidate the cache. |
+| Document reads | Auto | Prefer annotated rendered text; fall back to masked clipboard reads. Rendered only disables document probes and declines commands needing unavailable text. Clipboard forces the compatibility reader. |
 
 DVP remains enabled by default for compatibility with this fork. Settings no longer require editing source constants. Both word modes share one motion engine. Fast no longer delegates to native Docs word jumps. Destructive word/search operators refresh their snapshot before selecting text.
+
+After updating to 1.8, reload the extension and fully refresh Docs tabs. The rendered reader requests annotations during document startup. That request is undocumented and may be unavailable in some Docs versions; Auto retains a clipboard fallback. Rendered only currently declines global search and operators requiring a full snapshot. Explicit yank/paste/register commands can still use the clipboard in that setting.
 
 ## Commands
 
@@ -51,6 +54,7 @@ DVP remains enabled by default for compatibility with this fork. Settings no lon
 | Repeat / word search | `n`, `N`, `*`, `#`; counts work |
 | Half / full page | `Ctrl+d/u`, `Ctrl+f/b` |
 | Scroll view one line | `Ctrl+e/y` |
+| Place cursor in viewport | `zz` (center), `zt` (top), `zb` (bottom), in normal mode |
 
 Counts before and after an operator multiply: `2d3w` targets six words. Exact semantics depend on the motion's scope; see the limitations below.
 
@@ -58,7 +62,9 @@ Counts before and after an operator multiply: `2d3w` targets six words. Exact se
 
 Charwise Visual mode includes both the anchor and cursor character, even when crossing the anchor. Vim's `w` lands on the next word's first character and Visual mode includes that character; use `e` to land at a word end. The box is drawn on the logical cursor character, rather than the outer edge of the highlight.
 
-Entering `v` reads a document snapshot. Character, word/WORD, and vertical motions remain in that model across paragraphs; they do not switch to approximate native word jumps. Counts, `o`/`O`, line-local `f/F/t/T`, and word text objects use the same model. `$` includes the paragraph break where one exists. EOF can be a virtual Visual cursor position without selecting a neighboring character.
+Entering `v` uses rendered text where the caret can be mapped confidently, otherwise a masked document snapshot. Commands that need more context promote a local model to a full snapshot in Auto/Clipboard mode. Character, word/WORD, and vertical motions then remain in that model across paragraphs; they do not switch to approximate native word jumps. Counts, `o`/`O`, line-local `f/F/t/T`, and word text objects use the same model. `$` includes the paragraph break where one exists. EOF can be a virtual Visual cursor position without selecting a neighboring character.
+
+Selection and tile redraws retain the Visual model instead of triggering another read. While rebuilding a selection, DocsKeys temporarily keeps the previous highlight visible and masks the intermediate collapse/extend states. Masks have a timeout fallback so background-tab frame throttling cannot leave selections hidden.
 
 `V` maintains whole **display lines**, including line breaks where available. Use `j/k`, counts, `gg/G`, or paragraph motions. Horizontal and word motions are ignored in linewise mode. Page shortcuts preserve whole-line selections. `v` switches a linewise selection to charwise mode. Native mouse selections and `gj/gk` may require rebuilding a text snapshot before subsequent word motions.
 
@@ -86,11 +92,13 @@ Named registers persist in local extension storage. Captures, reads, and restore
 
 ## Performance and scrolling
 
-The cursor overlay uses caret geometry and an estimated character width. It never selects text or reads the clipboard. Mouse-wheel scrolling and `Ctrl+e/y` can therefore move the cursor offscreen without an idle measurement pulling it back into view. The box hides offscreen and follows the caret back into view. Only the local caret is overlaid; collaborator carets retain Docs' appearance.
+The cursor overlay uses caret geometry and annotated glyph widths when available, including proportional fonts and zoom. Otherwise it measures the character known from an existing motion/search snapshot, with an estimated width when no character is known. Native vertical movement may only provide an approximate glyph hint without annotations. Cursor cosmetics never select text or read the clipboard. Mouse-wheel scrolling and `Ctrl+e/y` can move the cursor offscreen without an idle measurement pulling it back into view. The box hides offscreen and follows the caret back into view. Only the local caret is overlaid; collaborator carets retain Docs' appearance.
 
-Both modes read text on demand and reuse it during motion bursts. The first forward word motion copies only the suffix, avoiding an empty-prefix round trip. Backward motions refresh a complete snapshot only when needed. Visual motions do not read again while their model remains valid. Long selections avoid per-character layout reads and unnecessary selection retraction.
+Both modes read text on demand and reuse it during motion bursts. Local word/find motions use annotated SVG text without Copy when available. Fallback word reads start with a two-display-line window on each needed side, expanding only at unknown boundaries. Large counts, global searches, and operators may still require a full snapshot. Visual motions do not read again while their model remains valid. Long selections avoid per-character layout reads and unnecessary selection retraction.
 
-There are no idle text/selection reads. Explicit reads preserve the viewport, including wheel/touch input during a read and late layout frames. A wheel gesture also takes precedence over an older motion completing asynchronously. Caches are invalidated on edits, clicks, native navigation, and observable document/collaborator changes. Canvas-only remote changes may only become visible on expiry; neither mode promises a synchronized Docs buffer.
+There are no idle clipboard/selection probes. Explicit probes hide Docs' temporary blue selection layer, suppress editor focus/programmatic scroll calls in the page world, and preserve the viewport throughout the read and late layout frames. A wheel gesture takes precedence over an older motion completing asynchronously. Caches are invalidated on edits, clicks, native navigation, and observable document/collaborator changes. Canvas-only remote changes may only become visible on expiry; neither mode promises a synchronized Docs buffer. Ordinary navigation can still scroll to reveal its destination, as in Vim.
+
+See [READING_RESEARCH.md](READING_RESEARCH.md) for sources, alternatives, and the limits of annotated-canvas support.
 
 ## Limits and compatibility
 
@@ -107,7 +115,7 @@ See [MISSING_VIM_FEATURES.md](MISSING_VIM_FEATURES.md) for remaining work. Motio
 
 ## Permissions
 
-The extension runs only on Google Docs document URLs. `clipboardRead`/`clipboardWrite` support precise text motions, Visual snapshots, text objects, and registers. Clipboard-based motions decline when the clipboard cannot be saved safely. Basic native editing still works without a text read; word/search commands require readable clipboard text in both modes. `storage` holds preferences and named registers locally. No analytics or document-content network requests are added.
+The extension runs only on Google Docs document URLs. `clipboardRead`/`clipboardWrite` support fallback text motions, full Visual snapshots, global search, text objects, and registers. Clipboard-based motions decline when the clipboard cannot be saved safely. Basic native editing and confidently mapped local rendered-text commands do not need a clipboard probe. `storage` holds preferences and named registers locally. No new permissions, OAuth, analytics, or document-content network requests are added.
 
 ## Development and verification
 
@@ -123,6 +131,8 @@ The runner checks JavaScript syntax, motions/operators, registers, graphemes, Vi
 
 `harness.js` loads the actual content scripts in a simulated Docs editor. Differential checks cover the tested rules, not all Vim commands or the live Google Docs UI.
 
-Before a release, check an actual Docs document with multiple collaborators, page wrapping, zoom changes, native mouse selections, an empty final paragraph, and clipboard permissions denied. This repository run verifies the simulator and bridge, not those live Docs behaviors.
+Run `npm run test:browser` separately for a disposable local Chromium fixture (Chrome/Edge, or set `DOCSKEYS_BROWSER`). It verifies real DOM/CSS/canvas glyph sizing after navigation/find/search, read-free rendered navigation, masked Copy, probe scroll suppression, iframe focus protection, stable Visual highlights, and redraws retaining the Visual model. It uses a fresh browser profile and does not access an authenticated document.
+
+Before a release, check an actual Docs document with multiple collaborators, page wrapping, zoom changes, native mouse selections, an empty final paragraph, and clipboard permissions denied. The simulator and local browser fixture do not verify those live Docs behaviors or guarantee the private annotation/selection selectors remain available.
 
 Inspired by [SheetKeys](https://github.com/philc/sheetkeys). MIT licensed.

@@ -8,8 +8,8 @@ function load(file, context) {
 }
 
 // Exercise popup loading, saving, validation, and updates from another popup.
-const inputs = Object.fromEntries(["dvorak", "boxCursor", "modeIndicator", "startInInsert", "wordMotion"]
-    .map((name) => [name, { type: name === "wordMotion" ? "select-one" : "checkbox" }]))
+const inputs = Object.fromEntries(["dvorak", "boxCursor", "modeIndicator", "startInInsert", "wordMotion", "readStrategy"]
+    .map((name) => [name, { type: ["wordMotion", "readStrategy"].includes(name) ? "select-one" : "checkbox" }]))
 let onChange, onStorage, saved
 const fieldset = { disabled: true, elements: { namedItem: (name) => inputs[name] },
     addEventListener(type, fn) { onChange = fn } }

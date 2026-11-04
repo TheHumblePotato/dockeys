@@ -2,7 +2,7 @@
     "manifest_version": 3,
     "name": "DocsKeys",
     "description": "Vim-style keyboard shortcuts for Google Docs",
-    "version": "1.7.0",
+    "version": "1.8.0",
     "icons": {
         "32": "icons/32.png",
         "128": "icons/128.png"
@@ -18,12 +18,26 @@
     ],
     "content_scripts": [
         {
+            "js": ["page_script.js"],
+            "world": "MAIN",
+            "run_at": "document_start",
+            "matches": ["https://docs.google.com/document/*"]
+        },
+        {
+            "js": ["annotation_bootstrap.js"],
+            "run_at": "document_start",
+            "matches": ["https://docs.google.com/document/*"]
+        },
+        {
             "js": [
                 "settings.js",
                 "vim.js",
+                "read_ui.js",
+                "rendered_reader.js",
                 "text_model.js",
                 "search.js",
                 "g_prefix.js",
+                "viewport.js",
                 "content.js"
             ],
             "matches": [
@@ -34,7 +48,8 @@
     "web_accessible_resources": [
         {
             "resources": [
-                "page_script.js"
+                "page_script.js",
+                "annotate.js"
             ],
             "matches": [
                 "https://docs.google.com/*"

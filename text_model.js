@@ -10,6 +10,7 @@ let scrollIntentRevision = 0
 function invalidateTextSnapshot() {
     textSnapshot = null
     textRevision++
+    invalidateRenderedReader()
 }
 
 function invalidateExternalText() {
@@ -24,7 +25,8 @@ function trackDocumentChanges() {
     const observer = new MutationObserver((records) => {
         if (oracleBusy) return
         const relevant = records.some((record) => {
-            const owner = record.target.closest && record.target.closest(".kix-cursor")
+            const node = record.target.nodeType === 3 ? record.target.parentElement : record.target
+            const owner = node && node.closest && node.closest(".kix-cursor")
             if (record.type === "attributes") {
                 const name = owner && owner.querySelector(".kix-cursor-name")
                 if (!name || !name.textContent.trim()) return false
@@ -35,12 +37,12 @@ function trackDocumentChanges() {
                 return positions(before) !== positions(after)
             }
             if (owner) return false
-            if (record.target.closest && record.target.closest(".kix-selection-overlay")) return false
-            if (record.type === "childList") {
-                const changed = [...record.addedNodes, ...record.removedNodes]
-                return changed.some((node) => !node.closest || !node.closest(".kix-cursor, .kix-selection-overlay"))
-            }
-            return true
+            if (node && node.closest && node.closest(".kix-selection-overlay, [aria-live], .kix-accessibility")) return false
+            // Tile recycling and selection DOM updates are rendering, not
+            // evidence that the document changed. Invalidating here made
+            // every visual motion trigger another whole-document read.
+            if (record.type === "childList") return false
+            return record.type === "characterData" && !!(node && node.closest && node.closest(".kix-lineview-content, .kix-wordhtmlgenerator-word-node"))
         })
         if (relevant) invalidateExternalText()
     })
@@ -59,7 +61,13 @@ async function withViewportPreserved(fn) {
     const el = getDocsScrollContainer()
     const token = { el, top: el ? el.scrollTop : 0, left: el ? (el.scrollLeft || 0) : 0, epoch: viewportEpoch }
     viewportRead = token
-    try { return await fn() }
+    const keepView = () => {
+        if (viewportRead !== token) return
+        restoreReadViewport(token)
+        if (typeof requestAnimationFrame === "function") requestAnimationFrame(keepView)
+    }
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(keepView)
+    try { return await withReadPresentation(fn) }
     finally {
         restoreReadViewport(token)
         viewportRead = null
@@ -102,6 +110,7 @@ function snapshotUsable() {
 
 async function getTextSnapshot(force = false) {
     if (!force && snapshotUsable() && !textSnapshot.partial) return textSnapshot
+    if (settings.readStrategy === "rendered") return null
     const result = await withViewportPreserved(() => withClipboardSaved(async (previous) => {
         if (previous === null) return null
         const before = await readDocumentSide(false, previous)
@@ -115,17 +124,59 @@ async function getTextSnapshot(force = false) {
     return textSnapshot
 }
 
-async function getWordSnapshot(kind) {
-    if (snapshotUsable()) return textSnapshot
-    if (kind === "b" || kind === "ge") return getTextSnapshot()
-    // A forward motion needs only the suffix. Avoid copying an empty prefix
-    // at BOD and halve the first-read clipboard work. Read a complete snapshot
-    // lazily if a later backward motion reaches this suffix's unknown start.
-    const after = await withViewportPreserved(() => withClipboardSaved((previous) => readDocumentSide(true, previous)))
-    if (after === null) return null
-    textSnapshot = { text: toGraphemes(after), at: 0, partial: true,
-        created: Date.now(), revision: textRevision, point: cursorDocumentPoint() }
-    return textSnapshot
+function wordSnapshotCovers(snapshot, kind, WORD, count) {
+    const result = DocsKeysVim.word(snapshot.text, snapshot.at, kind, count, WORD)
+    return kind === "b" || kind === "ge"
+        ? result.target > 0 || snapshot.completeStart || !snapshot.partial
+        : result.boundary < snapshot.text.length || snapshot.completeEnd || !snapshot.partial
+}
+
+async function readBoundedSide(forward, previous, lines) {
+    const origin = cursorDocumentPoint()
+    const edge = forward ? "end" : "home"
+    sendKeyEvent(edge, { shift: true })
+    for (let i = 1; i < lines; i++) {
+        sendKeyEvent(forward ? "right" : "left", { shift: true })
+        sendKeyEvent(edge, { shift: true })
+    }
+    const moved = comparePoints(origin, cursorDocumentPoint())
+    const text = await copySelectionForOracle(previous)
+    if (text === null) {
+        if (moved !== 0) sendKeyEvent(forward ? "left" : "right")
+        return null
+    }
+    if (text.length) sendKeyEvent(forward ? "left" : "right")
+    return text.replace(/\r\n?|[\u000b\u2028\u2029]/g, "\n")
+}
+
+async function getWordSnapshot(kind, WORD = false, count = 1) {
+    if (snapshotUsable() && wordSnapshotCovers(textSnapshot, kind, WORD, count)) return textSnapshot
+    const rendered = renderedWordSnapshot(kind, WORD, count)
+    if (rendered) { textSnapshot = rendered; return rendered }
+    if (settings.readStrategy === "rendered") return null
+    const backwards = kind === "b" || kind === "ge"
+    let previousBefore = null, previousAfter = null
+    for (let lines = 2; lines <= 32; lines *= 2) {
+        const snapshot = await withViewportPreserved(() => withClipboardSaved(async (previous) => {
+            if (previous === null) return null
+            const before = backwards ? await readBoundedSide(false, previous, lines) : ""
+            if (before === null) return null
+            const after = await readBoundedSide(true, previous, lines)
+            if (after === null) return null
+            const value = { text: toGraphemes(before + after), at: toGraphemes(before).length,
+                partial: true, completeStart: backwards && before === previousBefore,
+                completeEnd: after === previousAfter, windowLines: lines,
+                created: Date.now(), revision: textRevision, point: cursorDocumentPoint() }
+            previousBefore = before
+            previousAfter = after
+            return value
+        }))
+        if (!snapshot) return null
+        if (wordSnapshotCovers(snapshot, kind, WORD, count)) { textSnapshot = snapshot; return snapshot }
+    }
+    // Very large counts may genuinely need more context. Keep the explicit
+    // fallback masked; ordinary word motions never select the document tail.
+    return getTextSnapshot(true)
 }
 
 function moveSnapshotCaret(snapshot, target) {
@@ -134,6 +185,7 @@ function moveSnapshotCaret(snapshot, target) {
     finally { managedTextMotion-- }
     snapshot.at = target
     snapshot.point = cursorDocumentPoint()
+    rememberCursorText(snapshot)
 }
 
 async function applySnapshotRange(snapshot, range, operator) {
@@ -154,15 +206,9 @@ async function snapshotWordMotion(kind, WORD, count, operator) {
     if (!beginOracle()) return
     const epoch = scrollIntentRevision
     try {
-        let snapshot = operator ? await getTextSnapshot(true) : await getWordSnapshot(kind)
+        let snapshot = operator ? await getTextSnapshot(true) : await getWordSnapshot(kind, WORD, count)
         if (!snapshot) { switchModeToNormal(); return }
         let at = DocsKeysVim.cursor(snapshot.text, snapshot.at)
-        if (snapshot.partial && (kind === "b" || kind === "ge") &&
-            DocsKeysVim.word(snapshot.text, at, kind, count, WORD).target === 0) {
-            snapshot = await getTextSnapshot(true)
-            if (!snapshot) { switchModeToNormal(); return }
-            at = DocsKeysVim.cursor(snapshot.text, snapshot.at)
-        }
         await withScrollPriority(epoch, async () => {
           moveSnapshotCaret(snapshot, at)
           if (operator) {
@@ -177,12 +223,14 @@ async function snapshotWordMotion(kind, WORD, count, operator) {
     } finally { releaseOracle() }
 }
 
-async function recoverVisualSnapshot() {
-    if (visualModel) return visualModel
-    const selected = await withViewportPreserved(() => withClipboardSaved((previous) => copySelectionForOracle(previous)))
-    if (selected === null) return null
-    const length = toGraphemes(selected).length
-    const forward = nativeVisualFocusAfter
+async function recoverVisualSnapshot(known = null) {
+    if (visualModel && !known) return visualModel
+    if (settings.readStrategy === "rendered") return null
+    const selected = known ? null : await withViewportPreserved(() => withClipboardSaved((previous) => copySelectionForOracle(previous)))
+    if (!known && selected === null) return null
+    const length = known ? Math.abs(known.c - known.a) + 1 : toGraphemes(selected).length
+    const forward = known ? known.c >= known.a : nativeVisualFocusAfter
+    visualModel = null
     if (length) {
         sendKeyEvent(forward ? "right" : "left")
         if (forward) sendKeyEvent("left")
@@ -197,15 +245,28 @@ async function recoverVisualSnapshot() {
     return visualModel
 }
 
+async function completeVisualSnapshot() {
+    if (visualModel && !visualModel.partial) return visualModel
+    return recoverVisualSnapshot(visualModel)
+}
+
 async function visualSnapshotWord(kind, WORD, count = 1) {
-    if (visualModel) {
+    if (visualModel && (!visualModel.partial || wordSnapshotCovers({ ...visualModel, at: visualModel.c }, kind, WORD, count))) {
         visualMoveCursor(DocsKeysVim.word(visualModel.text, visualModel.c, kind, count, WORD, true).target)
         return
     }
     if (!beginOracle()) return
     try {
-        const model = await recoverVisualSnapshot()
+        const model = await completeVisualSnapshot()
         if (model) visualMoveCursor(DocsKeysVim.word(model.text, model.c, kind, count, WORD, true).target)
+    } finally { releaseOracle() }
+}
+
+async function completeVisualThen(key) {
+    if (settings.readStrategy === "rendered" || !beginOracle()) return
+    try {
+        const model = await completeVisualSnapshot()
+        if (model) handleKeyEventVisualLine(key)
     } finally { releaseOracle() }
 }
 

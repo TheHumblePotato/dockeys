@@ -139,7 +139,15 @@
                 <option value="precise">Precise: fresher Vim motions</option>
             </select>
         </label>
-        <p>Both modes follow Vim word boundaries across paragraphs. Fast reuses reads for up to 2.5 seconds; Precise up to 0.5 seconds. Operators refresh before editing. Both modes need clipboard text access.</p>
+        <p>Both modes follow Vim word boundaries across paragraphs. Fast reuses reads for up to 2.5 seconds; Precise up to 0.5 seconds. Operators refresh before editing.</p>
+        <label>Document reads
+            <select name="readStrategy">
+                <option value="auto">Auto: rendered text, then hidden clipboard</option>
+                <option value="rendered">Rendered only: no clipboard probes</option>
+                <option value="clipboard">Clipboard: compatibility mode</option>
+            </select>
+        </label>
+        <p>Auto uses rendered text when available, with hidden clipboard reads as a fallback. Rendered only skips commands that need unavailable text, including full-document search. Reload Docs after updating to enable the rendered reader.</p>
         <p id="settings-status" role="status" aria-live="polite">Loading settings…</p>
     </fieldset>
     <div class="header">
@@ -244,6 +252,10 @@
             <div class="shortcut">
                 <div class="key">Ctrl + d/u/f/b/e/y</div>
                 <div class="description">Scroll half/full screen, or one line (e/y keep the cursor put)</div>
+            </div>
+            <div class="shortcut">
+                <div class="key">zz / zt / zb</div>
+                <div class="description">Place the cursor at the center / top / bottom of the view</div>
             </div>
         </div>
         <div class="tip">

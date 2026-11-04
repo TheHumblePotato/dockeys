@@ -55,7 +55,10 @@ waitForElement(
         return (el && el.contentDocument) ? el : null
     },
     (iframe) => {
-        const attach = () => iframe.contentDocument.addEventListener('keydown', eventHandler, true)
+        const attach = () => {
+            iframe.contentDocument.addEventListener('keydown', eventHandler, true)
+            iframe.contentDocument.addEventListener('beforeinput', invalidateExternalText, true)
+        }
         attach()
         iframe.addEventListener('load', attach)
         trackDocumentChanges()
@@ -157,10 +160,10 @@ let charWidthCacheSize = 0
 function measureCharWidth(fontInfo, char = "0") {
     try {
         const target = (char && char !== "\n" && char !== "\r") ? char : "0"
-        const font = `${fontInfo.fontWeight} ${fontInfo.fontSize} ${fontInfo.fontFamily}`
+        const font = fontInfo.fontCSS || `${fontInfo.fontWeight} ${fontInfo.fontSize} ${fontInfo.fontFamily}`
         const cacheKey = font + "|" + target
         if (charWidthCache[cacheKey] !== undefined) return charWidthCache[cacheKey]
-        if (!measureCanvas) measureCanvas = document.createElement("canvas")
+        if (!measureCanvas || typeof measureCanvas.getContext !== "function") measureCanvas = document.createElement("canvas")
         const ctx = measureCanvas.getContext("2d")
         ctx.font = font
         const width = ctx.measureText(target).width
@@ -189,11 +192,13 @@ function restoreNativeCursor() {
 // While the native caret is in the "off" phase of its blink (display:none ->
 // zero-height rect) the last geometry is simply kept instead of hiding.
 function renderOverlay() {
+    updateSelectionFreezePosition()
+    if (readPresentationDepth) return null // do not follow a probe's temporary caret
     const shape = overlayShapeWanted
     if (!shape || !settings.boxCursor) return null
     const nativeCursor = getCursorTop()
-    const fontInfo = getCursorFontInfo()
-    if (!nativeCursor || !fontInfo) {
+    let fontInfo = getCursorFontInfo()
+    if (!nativeCursor) {
         if (cursorBoxOverlay) cursorBoxOverlay.style.display = "none"
         restoreNativeCursor()
         return null
@@ -206,6 +211,7 @@ function renderOverlay() {
     let rect
     try { rect = nativeCursor.getBoundingClientRect() } catch (err) { return null }
     if (!rect || !rect.height) return null
+    if (!fontInfo) fontInfo = { fontSize: `${rect.height / ZOOM_REFERENCE_LINE_HEIGHT_RATIO}px`, fontFamily: "sans-serif", fontWeight: "400" }
     // The caret's rect is still meaningful (not clipped to zero) when it has
     // scrolled out of view -- Docs positions it absolutely within the page,
     // it just happens to land outside the current viewport. Draw nothing
@@ -219,7 +225,11 @@ function renderOverlay() {
     }
     const zoom = zoomFactorFor(fontInfo, rect.height)
     const model = mode === "visual" ? visualModel : null
-    const width = measureCharWidth(fontInfo, model ? model.text[model.c] : "0") * zoom
+    const glyph = cursorGlyphInfo()
+    if (glyph && glyph.font) fontInfo = { ...fontInfo, fontCSS: glyph.font }
+    const char = model ? model.text[model.c] : glyph && glyph.char
+    const exactWidth = glyph && (model && model.dF > model.c && glyph.previousChar === char ? glyph.previousWidth : glyph.char === char ? glyph.width : null)
+    const width = exactWidth || measureCharWidth(fontInfo, char || "0") * zoom
     if (!width) return null
     let left = rect.left, top = rect.top, bottom = rect.bottom
     if (model && model.dF > model.c) {
@@ -494,6 +504,7 @@ function updateModeIndicator(currentMode) {
         case 'multipleMotion':
         case 'search':
         case 'gPrefix':
+        case 'viewportPrefix':
             modeIndicator.style.backgroundColor = '#ea4335'
             modeIndicator.style.color = 'white'
             updateCursorOverlay("underline")
@@ -550,13 +561,15 @@ function visualMoveCaret(from, to) {
 // anchor boundary, then extend from there.
 function visualRealizeDocs(tA, tF) {
     const m = visualModel
-    if (tA === m.dA) {
-        visualShiftFocus(m.dF, tF)
-    } else {
-        if (m.dF !== m.dA) sendKeyEvent(m.dA < m.dF ? "left" : "right")
-        visualMoveCaret(m.dA, tA)
-        visualShiftFocus(tA, tF)
-    }
+    withStableSelection(() => {
+        if (tA === m.dA) {
+            visualShiftFocus(m.dF, tF)
+        } else {
+            if (m.dF !== m.dA) sendKeyEvent(m.dA < m.dF ? "left" : "right")
+            visualMoveCaret(m.dA, tA)
+            visualShiftFocus(tA, tF)
+        }
+    })
     m.dA = tA
     m.dF = tF
 }
@@ -775,7 +788,8 @@ function switchModeToVisual() {
 async function startVisualSelection() {
     if (!beginOracle()) return
     try {
-        const snapshot = await getTextSnapshot()
+        const rendered = settings.readStrategy !== "clipboard" ? renderedRunAtCaret() : null
+        const snapshot = rendered && rendered.char ? rendered : await getTextSnapshot()
         if (mode !== "visual") return
         if (!snapshot) {
             sendKeyEvent("right", { shift: true })
@@ -783,7 +797,8 @@ async function startVisualSelection() {
         }
         const at = DocsKeysVim.cursor(snapshot.text, snapshot.at)
         moveSnapshotCaret(snapshot, at)
-        visualModel = { text: snapshot.text, a: at, c: at, dA: at, dF: at, fullDocument: true }
+        visualModel = { text: snapshot.text, a: at, c: at, dA: at, dF: at,
+            fullDocument: !snapshot.partial, partial: !!snapshot.partial }
         visualSetSelection(at, at)
     } finally {
         releaseOracle()
@@ -1671,6 +1686,12 @@ function performVisualFind(type, char, count, skipAdjacent = false) {
 
 async function performFind(type, char, count, operator, returnMode, skipAdjacent = false) {
     if (returnMode === "visual" && visualModel !== null) {
+        if (visualModel.partial) {
+            const m = visualModel
+            const forward = type === "f" || type === "t"
+            const match = forward ? findForward(m.text.slice(m.c), char, count, skipAdjacent) : findBackward(m.text.slice(0, m.c), char, count, skipAdjacent)
+            if (!match.found && !await completeVisualSnapshot()) { finishFind(returnMode); return }
+        }
         performVisualFind(type, char, count, skipAdjacent)
         return
     }
@@ -1685,6 +1706,25 @@ async function performFind(type, char, count, operator, returnMode, skipAdjacent
         return
     }
     const forward = (type === "f" || type === "t")
+    const rendered = settings.readStrategy !== "clipboard" ? renderedRunAtCaret() : null
+    if (rendered) {
+        const text = forward ? rendered.text.slice(rendered.at) : rendered.text.slice(0, rendered.at)
+        const match = forward ? findForward(text, char, count, skipAdjacent) : findBackward(text, char, count, skipAdjacent)
+        if (match.found) {
+            const steps = (forward ? match.matchIndex : match.distance) - ((type === "t" || type === "T") ? 1 : 0)
+            if (steps >= 0) {
+                lastFind = { type, char }
+                if (operator) applyFindResult(type, steps, operator, returnMode)
+                else {
+                    moveSnapshotCaret(rendered, rendered.at + (forward ? steps : -steps))
+                    textSnapshot = rendered
+                    finishFind(returnMode)
+                }
+                return
+            }
+        }
+    }
+    if (settings.readStrategy === "rendered") { finishFind(returnMode); return }
     const raw = forward ? await readAfterCursor() : await readBeforeCursor()
     if (raw === null) {
         finishFind(returnMode)
@@ -1712,6 +1752,7 @@ async function performFind(type, char, count, operator, returnMode, skipAdjacent
 
     lastFind = { type, char }
     applyFindResult(type, steps, operator, returnMode)
+    if (!operator) rememberCursorGlyph(forward ? text[steps] : text[text.length - steps])
 }
 
 // Find/replace arguments are literal OS-layout characters. Apply the DVP
@@ -2260,6 +2301,12 @@ function handleMultipleMotion(key) {
 
     const times = multipleMotion.times || 1
     const targetMode = multipleMotion.mode
+    if (key === "z") {
+        mode = targetMode
+        multipleMotion.times = 0
+        startViewportCommand()
+        return
+    }
     if (key === "g" || key === "G") {
         mode = targetMode
         multipleMotion.times = 0
@@ -2356,6 +2403,8 @@ function handleMultipleMotion(key) {
 // DocsKeys' mode and the on-screen selection disagreeing.
 function visualModeToResumeOnEscape() {
     switch (mode) {
+        case "viewportPrefix":
+            return viewportReturnMode === "visual" || viewportReturnMode === "visualLine" ? viewportReturnMode : null
         case "gPrefix":
             return gPrefixState && gPrefixState.returnMode !== "normal" ? gPrefixState.returnMode : null
         case "waitForFindChar":
@@ -2626,6 +2675,9 @@ function handleKey(e) {
             case "gPrefix":
                 handleGPrefix(key)
                 break
+            case "viewportPrefix":
+                handleViewportCommand(key)
+                break
         }
     }
 }
@@ -2640,16 +2692,16 @@ function handleKeyEventNormal(key) {
     
     switch (key) {
         case "h":
-            sendKeyEvent("left")
+            normalNavigation("h")
             break
         case "j":
-            nativeVerticalStep(true)
+            normalNavigation("j")
             break
         case "k":
-            nativeVerticalStep(false)
+            normalNavigation("k")
             break
         case "l":
-            sendKeyEvent("right")
+            normalNavigation("l")
             break
         case "}":
             goToEndOfPara()
@@ -2672,6 +2724,9 @@ function handleKeyEventNormal(key) {
         }
         case "g":
             startGPrefix(1, null, "normal")
+            break
+        case "z":
+            startViewportCommand()
             break
         case "G":
             gotoTextLine(null, null, "normal")
@@ -2841,6 +2896,11 @@ function handleKeyEventVisualLine(key) {
     // The line model exists only in charwise visual mode, and only until the
     // selection leaves the line `v` was pressed on.
     const model = (mode === "visual") ? visualModel : null
+    if (model && model.partial && (["j", "k", "0", "^", "_", "$", "i", "a"].includes(key) ||
+        (key === "h" && model.c === 0) || (key === "l" && model.c >= model.text.length - 1))) {
+        completeVisualThen(key)
+        return
+    }
 
     switch (key) {
         case "v":
@@ -2916,11 +2976,7 @@ function handleKeyEventVisualLine(key) {
         case "W": {
             const wordKind = (key === "b" || key === "B") ? "b" : (key === "e" || key === "E") ? "e" : "w"
             const classify = (key === "B" || key === "E" || key === "W") ? classifyWORDChar : classifyWordChar
-            if (model) {
-                visualWordMotion(wordKind, classify)
-            } else {
-                visualSnapshotWord(wordKind, classify === classifyWORDChar)
-            }
+            visualSnapshotWord(wordKind, classify === classifyWORDChar)
             break
         }
         case "^":

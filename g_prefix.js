@@ -39,7 +39,7 @@ async function gotoTextLine(count, operator = null, returnMode = mode) {
     if (!beginOracle()) return
     try {
         const snapshot = returnMode === "visual"
-            ? (visualModel || await recoverVisualSnapshot()) : await getTextSnapshot(!!operator)
+            ? await completeVisualSnapshot() : await getTextSnapshot(!!operator)
         if (!snapshot) return
         const text = snapshot.text, at = returnMode === "visual" ? snapshot.c : snapshot.at
         const starts = [0]
@@ -65,7 +65,7 @@ async function gotoTextLine(count, operator = null, returnMode = mode) {
 async function lastNonblankMotion(count, operator, returnMode) {
     if (!beginOracle()) return
     try {
-        const snapshot = returnMode === "visual" ? (visualModel || await recoverVisualSnapshot()) : await getTextSnapshot(!!operator)
+        const snapshot = returnMode === "visual" ? await completeVisualSnapshot() : await getTextSnapshot(!!operator)
         if (!snapshot) return
         const at = returnMode === "visual" ? snapshot.c : snapshot.at
         let bounds = DocsKeysVim.line(snapshot.text, at)
