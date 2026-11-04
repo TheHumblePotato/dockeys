@@ -118,9 +118,30 @@
             color: #666;
             text-align: center;
         }
+        fieldset { border: 1px solid var(--border-color); border-radius: 6px; margin: 0 0 20px; padding: 12px; }
+        fieldset label { display: block; margin: 8px 0; }
+        fieldset select { display: block; width: 100%; margin-top: 6px; padding: 6px; }
+        fieldset p { font-size: 12px; line-height: 1.5; margin: 8px 0; color: #555; }
     </style>
+    <script src="settings.js" defer></script>
+    <script src="popup.js" defer></script>
 </head>
 <body>
+    <fieldset id="settings" disabled>
+        <legend>Settings</legend>
+        <label><input type="checkbox" name="dvorak"> Programmer Dvorak (DVP) command keys</label>
+        <label><input type="checkbox" name="boxCursor"> Box cursor in normal and visual modes</label>
+        <label><input type="checkbox" name="modeIndicator"> Show mode badge</label>
+        <label><input type="checkbox" name="startInInsert"> Start new documents in insert mode</label>
+        <label>Word motions
+            <select name="wordMotion">
+                <option value="native">Fast: native w / b</option>
+                <option value="precise">Precise: Vim punctuation boundaries</option>
+            </select>
+        </label>
+        <p>Fast w/b use Docs' word boundaries without clipboard reads. Precise motions, e and W/E/B read text through the clipboard. Visual selections keep exact motions within the starting line.</p>
+        <p id="settings-status" role="status" aria-live="polite">Loading settings…</p>
+    </fieldset>
     <div class="header">
         <h1>DocsKeys</h1>
         <a target="_blank" href="https://www.github.com/tirthd16/dockeys" class="mode-indicator">Github</a>
@@ -227,7 +248,7 @@
         </div>
         <div class="tip">
              <div class="tip-title">Visual mode tip</div>
-             <div class="tip-content">After <div class="key inline">v</div>, motions are exact within the line you started on. After <div class="key inline">j</div>/<div class="key inline">k</div>/<div class="key inline">{</div>/<div class="key inline">}</div>/<div class="key inline">g</div>/<div class="key inline">G</div> the selection uses Docs' native motions; press <div class="key inline">v</div> again to get f/t/^/iw back. Visual line mode (<div class="key inline">V</div>) always selects whole lines: <div class="key inline">j</div>/<div class="key inline">k</div>/<div class="key inline">g</div>/<div class="key inline">G</div>/<div class="key inline">{</div>/<div class="key inline">}</div> move it, other motions are ignored.</div>
+             <div class="tip-content">After <div class="key inline">v</div>, motions are exact within the line you started on. After <div class="key inline">j</div>/<div class="key inline">k</div>/<div class="key inline">{</div>/<div class="key inline">}</div>/<div class="key inline">g</div>/<div class="key inline">G</div> the selection uses Docs' native motions; leave and re-enter Visual mode to get f/t/^/iw back. Visual line mode (<div class="key inline">V</div>) always selects whole lines: <div class="key inline">j</div>/<div class="key inline">k</div>/<div class="key inline">g</div>/<div class="key inline">G</div>/<div class="key inline">{</div>/<div class="key inline">}</div> move it, other motions are ignored.</div>
          </div>
     </div>
 
@@ -264,7 +285,7 @@
             </div>
             <div class="shortcut">
                 <div class="key">Y</div>
-                <div class="description">Yank whole line</div>
+                <div class="description">Yank to end of line (Neovim Y / y$)</div>
             </div>
             <div class="shortcut">
                 <div class="key">r</div>
@@ -332,7 +353,7 @@
              <div class="tip-content">
                 <b>.</b> repeats deletes/changes/paste, but can't retype text you typed during an insert-mode change (e.g. after <span class="key inline">cw</span> you'll need to type the replacement again). Yank and <span class="key inline">r</span> are never repeated by <b>.</b>
                 <br><br>
-                <b>"{reg}</b>, e.g. <span class="key inline">"ayy</span> then <span class="key inline">"ap</span>, uses a named register instead of the clipboard, saving/restoring your real clipboard around the command. Plain <span class="key inline">y</span> still goes straight to the clipboard; plain <span class="key inline">d</span>/<span class="key inline">c</span> now land in a dedicated cut register ("-) instead, so deleting doesn't clobber your clipboard -- "-p pastes it back. Uppercase ("A) appends; "_ discards (black hole). Still one of the newer, less-tested features -- see MISSING_VIM_FEATURES.md.
+                <b>"{reg}</b>, e.g. <span class="key inline">"ayy</span> then <span class="key inline">"ap</span>, uses a named register instead of the clipboard, saving/restoring your real clipboard around the command. Plain <span class="key inline">y</span> still goes straight to the clipboard; plain <span class="key inline">d</span>/<span class="key inline">c</span> now land in a dedicated cut register ("-) instead, so deleting doesn't clobber your clipboard -- "-p pastes it back. Uppercase ("A) appends; "_ discards (black hole). Registers store plain text; see the README for clipboard limitations.
              </div>
          </div>
     </div>

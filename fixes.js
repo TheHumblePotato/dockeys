@@ -50,7 +50,7 @@ async function fresh(text, off, opts) { const e = makeEnv(text, opts); e.sim.set
   e = await fresh(L, 0); await e.press("V"); await e.press("k"); eq("V k on FIRST line: selection not empty", e.sim.selText(), "l1\n")
   await e.press("d"); await e.sleep(60); eq("... and d removes exactly that line", e.sim.text, "l2\nl3\nl4")
   e = await fresh(L, 0); await e.press("V"); await e.pressAll("kj"); await e.press("d"); await e.sleep(80)
-  eq("V k j at top then d never deletes an unrelated char", e.sim.text.replace(/\n/g, "").length >= "l2l3l4".length - 0, true)
+  eq("V k at top stays on first line, j then adds second line", e.sim.text, "l3\nl4")
   console.log("     (V k j on first line) text =", JSON.stringify(e.sim.text), "mode", e.get("mode"))
   e = await fresh(L, 3); await e.press("V"); await e.press("G"); eq("V G", e.sim.selText(), "l2\nl3\nl4")
   e = await fresh(L, 6); await e.press("V"); await e.press("g"); eq("V g", e.sim.selText(), "l1\nl2\nl3\n")

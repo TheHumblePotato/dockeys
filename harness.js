@@ -20,7 +20,7 @@ class DocSim {
         this.keyLog = []
     }
     lineInfo(off) {
-        const start = this.text.lastIndexOf("\n", off - 1) + 1
+        const start = off === 0 ? 0 : this.text.lastIndexOf("\n", off - 1) + 1
         let end = this.text.indexOf("\n", off)
         if (end === -1) end = this.text.length
         return { start, end }
@@ -138,10 +138,23 @@ function makeEnv(text, opts = {}) {
     const menuBtn = { innerText: "Edit", dispatchEvent() {} }
     let keydownHandler = null
     const iframeDoc = { addEventListener(type, fn) { if (type === "keydown") keydownHandler = fn } }
+    const owner = { querySelector: () => null }
+    const caret = {
+        style: {}, isConnected: true, closest: () => owner,
+        getBoundingClientRect() {
+            const li = sim.lineInfo(sim.focus)
+            const row = sim.text.slice(0, sim.focus).split("\n").length - 1
+            const left = (sim.focus - li.start) * 8 + 50
+            const top = row * 20 + 60
+            return { left, top, width: 1, height: 16, bottom: top + 16, right: left + 1 }
+        },
+    }
+    const documentListeners = {}
     const document = {
+        addEventListener(type, fn) { documentListeners[type] = fn },
         getElementsByTagName: () => [{ contentDocument: iframeDoc }],
-        getElementsByClassName: () => [],
-        querySelector: () => null,
+        getElementsByClassName: (c) => c === "kix-cursor-caret" ? [caret] : [],
+        querySelector: (s) => s === ".docs-texteventtarget-iframe" ? { contentDocument: iframeDoc, addEventListener() {} } : null,
         querySelectorAll: (sel) => (sel === ".menu-button" ? [menuBtn] : sel === ".goog-menuitem" ? menuEls : []),
         createElement: mkEl,
         createEvent: () => ({ initMouseEvent(name) { this.type = name } }),
@@ -159,23 +172,30 @@ function makeEnv(text, opts = {}) {
             async writeText(t) { await sleep(sim.clipDelay); sim.clipboard = t },
         },
     }
-    const store = {}
+    // Older suites exercise the precise clipboard path; pass settings: {} to
+    // exercise shipped defaults (including fast native w/b).
+    const store = { "docskeys-settings": opts.settings === undefined ? { wordMotion: "precise" } : opts.settings }
+    const storageListeners = []
     const chrome = {
         runtime: { getURL: (p) => p, lastError: null },
-        storage: { local: { get(k, cb) { cb({}) }, set(o, cb) { if (cb) cb() } } },
+        storage: {
+            local: { get(k, cb) { cb({ [k]: store[k] }) }, set(o, cb) { Object.assign(store, o); if (cb) cb() } },
+            onChanged: { addListener(fn) { storageListeners.push(fn) } },
+        },
     }
     class CustomEvent { constructor(type, init) { this.type = type; this.detail = init && init.detail } }
     const ctx = vm.createContext({
         document, window, navigator, chrome, CustomEvent, console: { log() {}, warn: opts.warn || (() => {}), error() {} },
         setTimeout, clearTimeout, performance, Promise, Date, Math, Number, String, Array, Object, RegExp, Error, Intl,
     })
-    vm.runInContext(fs.readFileSync(opts.file || path.join(__dirname, "..", "content.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "settings.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(opts.file || path.join(__dirname, "content.js"), "utf8"), ctx)
     const get = (expr) => vm.runInContext(expr, ctx)
     // The cosmetic idle refresh (box width / selection check) is 40ms in the
     // extension; the fixed sleeps in the older tests were written against the
     // old 150ms, so default to that here. Pass { refreshMs: 40 } to test the
     // real timing.
-    vm.runInContext(`ACCURATE_WIDTH_REFRESH_DEBOUNCE_MS = ${opts.refreshMs !== undefined ? opts.refreshMs : 150}`, ctx)
+    vm.runInContext(`SELECTION_CHECK_DEBOUNCE_MS = ${opts.refreshMs !== undefined ? opts.refreshMs : 150}`, ctx)
     async function settle() {
         for (let i = 0; i < 400; i++) {
             let q = 0; try { q = get("keyQueue.length") } catch (e) {}
@@ -201,7 +221,12 @@ function makeEnv(text, opts = {}) {
         if (wait) { await sleep(1); await settle() }
     }
     async function pressAll(str) { for (const ch of str) await press(ch) }
-    return { sim, ctx, get, press, pressRaw, pressAll, settle, sleep }
+    return { sim, ctx, get, press, pressRaw, pressAll, settle, sleep, documentListeners,
+        changeSettings(value) {
+            store["docskeys-settings"] = value
+            for (const fn of storageListeners) fn({ "docskeys-settings": { newValue: value } }, "local")
+        },
+    }
 }
 
 module.exports = { makeEnv, sleep, DocSim }

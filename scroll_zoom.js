@@ -7,6 +7,8 @@ function setup() {
   const e = makeEnv("hello world", {})
   const d = e.ctx.document
   const caret = { style: {}, isConnected: true, rect: { left: 50, top: 60, width: 1, height: 16, bottom: 76 }, getBoundingClientRect() { return this.rect } }
+  caret.closest = () => ({ querySelector: () => null })
+  e.get("cursorTop = null")
   d.getElementsByClassName = (c) => (c === "kix-cursor-caret" ? [caret] : [])
   const el = { ownerDocument: { defaultView: { getComputedStyle: () => ({ fontSize: "16px", fontFamily: "Arial", fontWeight: "400" }) } } }
   d.querySelector = (s) => (s === ".docs-texteventtarget-iframe" ? { contentDocument: { activeElement: el, querySelector: () => el } } : null)

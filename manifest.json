@@ -2,7 +2,7 @@
     "manifest_version": 3,
     "name": "DocsKeys",
     "description": "Vim-style keyboard shortcuts for Google Docs",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "icons": {
         "32": "icons/32.png",
         "128": "icons/128.png"
@@ -19,10 +19,11 @@
     "content_scripts": [
         {
             "js": [
+                "settings.js",
                 "content.js"
             ],
             "matches": [
-                "https://docs.google.com/*"
+                "https://docs.google.com/document/*"
             ]
         }
     ],

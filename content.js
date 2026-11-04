@@ -5,6 +5,12 @@
 // something else like Docs' own Copy-click handler being slow on a large
 // document.
 const DEBUG_TIMING = false
+let settings = { ...DocsKeysSettings.defaults }
+
+function applySettings(value) {
+    settings = DocsKeysSettings.normalize(value)
+    updateModeIndicator(mode)
+}
 
 // --- Grapheme-aware text handling -------------------------------------------
 // Arrow keys (and therefore every selection/motion DocsKeys builds out of
@@ -45,42 +51,39 @@ function waitForElement(getElement, callback, { interval = 200, timeoutMs = 2000
 
 waitForElement(
     () => {
-        const el = document.getElementsByTagName('iframe')[0]   
+        const el = document.querySelector('.docs-texteventtarget-iframe')
         return (el && el.contentDocument) ? el : null
     },
     (iframe) => {
-        iframe.contentDocument.addEventListener('keydown', eventHandler, true)
+        const attach = () => iframe.contentDocument.addEventListener('keydown', eventHandler, true)
+        attach()
+        iframe.addEventListener('load', attach)
     },
 )
 
 let cursorTop = null
+function isLocalCursor(caret) {
+    const owner = caret.closest && caret.closest(".kix-cursor")
+    if (!owner) return false
+    const name = owner.querySelector(".kix-cursor-name")
+    return !name || !name.textContent.trim()
+}
+
 function getCursorTop() {
-    if (!cursorTop || !cursorTop.isConnected) {
-        // kix-cursor-caret is the element multiple independent sources
-        // describe as the actual visible blinking cursor (Docs toggles its
-        // `display` between "none"/"inline" for the blink). Falls back to
-        // kix-cursor-top in case the class name varies by Docs
-        // version/rollout -- unverified against a live page.
-        cursorTop = document.getElementsByClassName("kix-cursor-caret")[0]
-            || document.getElementsByClassName("kix-cursor-top")[0]
-            || null
+    if (cursorTop && cursorTop.isConnected && isLocalCursor(cursorTop)) return cursorTop
+    cursorTop = null
+    for (const className of ["kix-cursor-caret", "kix-cursor-top"]) {
+        const candidates = Array.from(document.getElementsByClassName(className))
+        cursorTop = candidates.find(isLocalCursor) || null
+        if (cursorTop) break
     }
+    // Never guess the first caret: it may belong to a collaborator.
     return cursorTop
 }
 
-// Box/underline cursor: an independent overlay element that follows the
-// native caret's on-screen rectangle. The native caret is only ever READ
-// (position) and hidden via opacity while the overlay is shown -- see
-// hideCursorBoxOverlay().
-//
-// FOLLOWING THE CARET. Overlay position used to be refreshed only from
-// DocsKeys' own keystroke handlers, so anything that moved the caret without
-// going through them -- a mouse click, a native arrow key, Docs' own
-// scrolling -- left the box stranded where it was. It is now re-positioned
-// every animation frame (renderOverlay() is a couple of cheap DOM reads and
-// only writes styles when something changed), which covers all of those at
-// once. The same frame loop notices caret movement it didn't cause and
-// schedules the exact-width refresh (see startOverlayFrameLoop()).
+// Independent box/underline overlay following only the local native caret.
+// Every frame reads geometry and updates styles; it never reads document
+// text, touches the clipboard, or changes the selection.
 let cursorBoxOverlay = null
 function getCursorBoxOverlay() {
     if (!cursorBoxOverlay || !cursorBoxOverlay.isConnected) {
@@ -172,9 +175,13 @@ function measureCharWidth(fontInfo, char = "0") {
 
 let overlayShapeWanted = null   // "block" | "underline" | null (= hidden)
 let lastOverlayKey = ""
-// Exact width of the character under the caret, bound to the caret position
-// it was measured at (so it is ignored as soon as the caret moves).
-let accurateWidth = null        // { left, top, width }
+let hiddenNativeCursor = null
+let nativeCursorOpacity = ""
+
+function restoreNativeCursor() {
+    if (hiddenNativeCursor) hiddenNativeCursor.style.opacity = nativeCursorOpacity
+    hiddenNativeCursor = null
+}
 
 // Positions the overlay over the native caret. Returns a rounded position
 // key for the native caret, or null if there is nothing to position against.
@@ -182,10 +189,19 @@ let accurateWidth = null        // { left, top, width }
 // zero-height rect) the last geometry is simply kept instead of hiding.
 function renderOverlay() {
     const shape = overlayShapeWanted
-    if (!shape) return null
+    if (!shape || !settings.boxCursor) return null
     const nativeCursor = getCursorTop()
     const fontInfo = getCursorFontInfo()
-    if (!nativeCursor || !fontInfo) return null
+    if (!nativeCursor || !fontInfo) {
+        if (cursorBoxOverlay) cursorBoxOverlay.style.display = "none"
+        restoreNativeCursor()
+        return null
+    }
+    if (hiddenNativeCursor !== nativeCursor) {
+        restoreNativeCursor()
+        hiddenNativeCursor = nativeCursor
+        nativeCursorOpacity = nativeCursor.style.opacity || ""
+    }
     let rect
     try { rect = nativeCursor.getBoundingClientRect() } catch (err) { return null }
     if (!rect || !rect.height) return null
@@ -201,11 +217,7 @@ function renderOverlay() {
         return null
     }
     const zoom = zoomFactorFor(fontInfo, rect.height)
-    let width = null
-    if (accurateWidth && Math.abs(accurateWidth.left - rect.left) < 1 && Math.abs(accurateWidth.top - rect.top) < 1) {
-        width = accurateWidth.width * zoom / (accurateWidth.zoom || 1)
-    }
-    if (!width) width = measureCharWidth(fontInfo) * zoom
+    const width = measureCharWidth(fontInfo) * zoom
     if (!width) return null
     const overlay = getCursorBoxOverlay()
     const key = `${shape}|${rect.left}|${rect.top}|${rect.height}|${rect.bottom}|${width}`
@@ -233,11 +245,14 @@ function hideCursorBoxOverlay() {
     overlayShapeWanted = null
     lastOverlayKey = ""
     if (cursorBoxOverlay) cursorBoxOverlay.style.display = "none"
-    const nativeCursor = getCursorTop()
-    if (nativeCursor) nativeCursor.style.opacity = ""
+    restoreNativeCursor()
 }
 
 function updateCursorOverlay(shape) {
+    if (!settings.boxCursor) {
+        hideCursorBoxOverlay()
+        return null
+    }
     overlayShapeWanted = shape
     return renderOverlay()
 }
@@ -253,23 +268,14 @@ function cursorPositionKey(nativeCursor) {
     }
 }
 
-// --- Unexpected selections in normal mode ------------------------------------
-// A selection while DocsKeys thinks it is in normal mode is a bug by
-// definition. Two sources:
-//   "user"   -- the person made it (mouse drag / double-click / shift-click,
-//               Ctrl+A, Ctrl+Shift+arrows). Like Vim, a mouse selection
-//               simply starts Visual mode, so the mode badge always agrees
-//               with what is on screen.
-//   "glitch" -- DocsKeys left one behind (a failed document read, ...). It is
-//               collapsed.
-// Detecting a selection costs one Copy, so it only happens when one of those
-// sources flagged it (markSelectionCheck), during the same idle-time pass
-// that refreshes the box width.
+// --- Unexpected selections in normal mode ---------------------------------
+// Explicit mouse/keyboard selections enter Visual mode; selections left by
+// failed reads are collapsed. Only flagged selections trigger a Copy check.
 let pendingSelectionCheck = null   // null | "user" | "glitch"
 function markSelectionCheck(reason) {
     if (pendingSelectionCheck === "user") return
     pendingSelectionCheck = reason
-    if (mode === "normal") scheduleAccurateWidthRefresh()
+    if (mode === "normal") scheduleSelectionCheck()
 }
 function noteSelectionGlitch() {
     // No scheduling here (a persistently failing read must not re-trigger
@@ -279,6 +285,9 @@ function noteSelectionGlitch() {
 function handleUnexpectedSelection(reason) {
     if (reason === "user") {
         visualModel = null
+        visualAnchorPoint = null
+        nativeVisualFocusAfter = true
+        nativeVisualAnchorAfter = false
         mode = "visual"
         updateModeIndicator(mode)
     } else {
@@ -286,88 +295,32 @@ function handleUnexpectedSelection(reason) {
     }
 }
 
-// Debounced exact-character width refresh (+ selection check) for the
-// NORMAL-mode box cursor. Safety rules, each from a real bug found in review:
-//  * NORMAL MODE ONLY -- it temporarily changes the selection.
-//  * It goes through beginOracle()/releaseOracleQuiet(): keys that arrive
-//    while the temporary selection exists are QUEUED and replayed after.
-//  * It selects exactly ONE character (shift+Right, Copy, collapse) instead
-//    of the whole rest of the line, which is what made the box lag behind
-//    the caret.
-//  * The debounce is short; caret movement DocsKeys didn't cause (mouse,
-//    arrows, scrolling) also triggers it, from the frame loop.
-let ACCURATE_WIDTH_REFRESH_DEBOUNCE_MS = 40
-let accurateWidthRefreshTimer = null
-let lastEmptyWidthReadKey = null
-
-function scheduleAccurateWidthRefresh() {
-    if (mode !== "normal") return
-    clearTimeout(accurateWidthRefreshTimer)
-    accurateWidthRefreshTimer = setTimeout(runAccurateWidthRefresh, ACCURATE_WIDTH_REFRESH_DEBOUNCE_MS)
+// Selection checks only run after an explicit mouse/keyboard selection.
+// Cosmetic rendering must never move the caret or use the clipboard: doing
+// that during a scroll makes Docs scroll straight back to the cursor.
+let SELECTION_CHECK_DEBOUNCE_MS = 40
+let selectionCheckTimer = null
+function scheduleSelectionCheck() {
+    if (mode !== "normal" || pendingSelectionCheck === null) return
+    clearTimeout(selectionCheckTimer)
+    selectionCheckTimer = setTimeout(runSelectionCheck, SELECTION_CHECK_DEBOUNCE_MS)
 }
 
-async function runAccurateWidthRefresh() {
-    if (mode !== "normal") return
-    if (!beginOracle()) return
+async function runSelectionCheck() {
+    if (mode !== "normal" || pendingSelectionCheck === null || !beginOracle()) return
+    const check = pendingSelectionCheck
+    pendingSelectionCheck = null
     try {
-        const nativeCursor = getCursorTop()
-        const positionKey = cursorPositionKey(nativeCursor)
-        let rect0 = null
-        try { rect0 = nativeCursor ? nativeCursor.getBoundingClientRect() : null } catch (err) {}
-        const check = pendingSelectionCheck
-        if (check === null && positionKey !== null && positionKey === lastEmptyWidthReadKey) return
-        const result = await withClipboardSaved(async (previousClipboard) => {
-            if (check !== null) {
-                pendingSelectionCheck = null
-                const selected = await copySelectionForOracle(previousClipboard)
-                if (selected === null) {
-                    pendingSelectionCheck = check
-                    return { failed: true }
-                }
-                if (selected !== "") return { selection: true }
-            }
-            return { text: await readCharAfterCore(previousClipboard) }
-        })
-        if (mode !== "normal") return
-        if (result.selection) {
-            handleUnexpectedSelection(check)
-            return
-        }
-        if (result.failed || result.text === null || result.text === undefined) return
-        if (result.text === "") {
-            lastEmptyWidthReadKey = positionKey
-            return
-        }
-        lastEmptyWidthReadKey = null
-        const fontInfo = getCursorFontInfo()
-        if (!fontInfo || !rect0 || !rect0.height) return
-        const rawWidth = measureCharWidth(fontInfo, toGraphemes(result.text)[0])
-        if (!rawWidth) return
-        const zoom = zoomFactorFor(fontInfo, rect0.height)
-        // Stored pre-zoom, along with the zoom it was measured at, so
-        // renderOverlay() can re-scale it if the zoom level changes again
-        // before the caret next moves (rather than caching a width that's
-        // now wrong for the current zoom).
-        accurateWidth = { left: rect0.left, top: rect0.top, width: rawWidth, zoom }
-        renderOverlay()
+        const selected = await withClipboardSaved((previous) => copySelectionForOracle(previous))
+        if (selected === null) pendingSelectionCheck = check
+        else if (selected !== "" && mode === "normal") handleUnexpectedSelection(check)
     } finally {
         releaseOracleQuiet()
     }
 }
 
-// Frame loop: keep the overlay glued to the native caret, and notice caret
-// movement that DocsKeys did not cause. Reads made by the oracle move the
-// native caret around temporarily, so position changes are ignored while a
-// read is in flight and for a short time after it.
-let lastFramePositionKey = null
 function overlayFrame() {
-    let key = null
-    try { key = renderOverlay() } catch (err) {}
-    if (mode === "normal" && key !== null && key !== lastFramePositionKey) {
-        const settling = oracleBusy || Date.now() < ignorePositionUntil
-        lastFramePositionKey = key
-        if (!settling) scheduleAccurateWidthRefresh()
-    }
+    try { renderOverlay() } catch (err) {}
 }
 function startOverlayFrameLoop() {
     if (typeof requestAnimationFrame !== "function") return
@@ -379,6 +332,7 @@ function startOverlayFrameLoop() {
 }
 
 let mode = 'normal'
+let hasHandledKey = false
 let tempnormal = false 
 let multipleMotion = {
     times:0,
@@ -444,7 +398,7 @@ const dvorakToQwerty = (() => {
 })();
 
 function translateKey(key) {
-    return dvorakToQwerty[key] !== undefined ? dvorakToQwerty[key] : key;
+    return settings.dvorak && dvorakToQwerty[key] !== undefined ? dvorakToQwerty[key] : key;
 }
 
 const wordModifierKey = isMac ? 'alt' : 'control'
@@ -484,7 +438,7 @@ document.body.appendChild(modeIndicator)
 function refreshCursorOverlayForCurrentMode() {
     if (mode === "normal") {
         updateCursorOverlay("block")
-        scheduleAccurateWidthRefresh()
+        scheduleSelectionCheck()
     } else if (mode === "visual" || mode === "visualLine") {
         updateCursorOverlay("block")
     } else if (mode === "insert") {
@@ -498,13 +452,15 @@ function refreshCursorOverlayForCurrentMode() {
 }
 
 function updateModeIndicator(currentMode) {
+    modeIndicator.style.display = settings.modeIndicator ? "block" : "none"
+    if (!settings.boxCursor) hideCursorBoxOverlay()
     modeIndicator.textContent = currentMode.toUpperCase()
     switch(currentMode) {
         case 'normal':
             modeIndicator.style.backgroundColor = '#1a73e8'
             modeIndicator.style.color = 'white'
             updateCursorOverlay("block")
-            scheduleAccurateWidthRefresh()
+            scheduleSelectionCheck()
             break
         case 'insert':
             modeIndicator.style.backgroundColor = '#34a853'
@@ -523,6 +479,7 @@ function updateModeIndicator(currentMode) {
         case 'waitForRegister':
         case 'waitForFindChar':
         case 'replaceChar':
+        case 'multipleMotion':
             modeIndicator.style.backgroundColor = '#ea4335'
             modeIndicator.style.color = 'white'
             updateCursorOverlay("underline")
@@ -536,54 +493,17 @@ function repeatMotion(motion, times, key) {
   }
 }
 
-// --- Visual mode model ------------------------------------------------------
-//
-// WHY THIS EXISTS (the "v is totally broken" bug). Visual mode used to work
-// by moving Docs' selection with shift+arrows and, whenever a motion needed
-// to know the text (w/e/b/f/t/^), by *reading* the line through the clipboard
-// oracle while the visual selection was live: shift+End (or shift+Home),
-// Copy, then retract. Two things were wrong with that, and together they
-// made every visual motion other than `l` unreliable:
-//   1. Shift+End/Home always extend relative to the *anchor*, so the read
-//      only lines up with the cursor if the anchor and the cursor are on the
-//      same line AND the selection only ever grew rightwards. After h, j, k
-//      (or a leftwards w/b/F/T) neither is true, and the retract step then
-//      snapped the selection back to the anchor -- "takes you back to the
-//      start".
-//   2. The cosmetic box-cursor width refresh ran the same read 150ms after
-//      any keystroke, so even a plain `vh` and a short pause got clobbered.
-//
-// THE FIX. Visual mode never reads the document while a selection is live.
-// Instead, when `v` is pressed (while there is NO selection yet) the current
-// display line is read once -- text and caret position -- and everything
-// after that is pure arithmetic on that snapshot, turned into shift+arrow
-// presses. Consequences:
-//   * h/l/w/W/e/E/b/B/f/F/t/T/;/,/0/^/_/$/iw/aw/o are exact within the line
-//     `v` was pressed on, and instant (no clipboard round-trips).
-//   * The selection is INCLUSIVE of the character under the cursor, and the
-//     anchor character stays selected when the cursor crosses the anchor
-//     (`vh` selects two characters), matching :help visual-use -- "The text
-//     from the start of the Visual mode up to and including the character
-//     under the cursor is highlighted." Docs' selection is between-character
-//     boundaries, so when the cursor passes the anchor the Docs-side anchor
-//     boundary has to move by one; visualRealizeDocs() does this with
-//     relative key presses only (no absolute positions, no reads).
-//   * j/k/{/}/g/G (anything that leaves the line) drop the model: from then
-//     on the selection is driven by Docs' native shift+motions, and w/e/b
-//     use native word jumps, while f/F/t/T/^ decline. Pressing v again
-//     restores the exact behavior. The orientation is normalised right
-//     before a native vertical move so the anchor character stays included
-//     (see visualNormalizeForNative()).
-//
-// Model fields (all indices are character indices into `text`, the display
-// line Home..End, same "line" as $/0/f/t):
-//   a, c   Vim anchor / cursor character indices (selection = min..max, both
-//          inclusive)
-//   dA, dF where Docs' own anchor / focus boundaries currently are (a
-//          boundary i sits BEFORE character i; boundary n is end of line).
-//          Forward (c >= a):  dA = a,     dF = c + 1
-//          Backward (c < a):  dA = a + 1, dF = c
+// --- Visual mode model -----------------------------------------------------
+// Read the starting display line before selecting. Within that snapshot,
+// motions use grapheme indices and synchronous Shift+arrows. Native motions
+// take over when leaving it; line reads must never run on a live selection.
+// a/c: inclusive Vim anchor and cursor character indices.
+// dA/dF: Docs anchor/focus boundaries, where boundary i precedes character i.
+// Forward: dA=a, dF=c+1. Backward: dA=a+1, dF=c.
+// Crossing the anchor changes its boundary so the anchor character remains
+// selected in both directions.
 let visualModel = null
+let nativeVisualFocusAfter = true
 
 function visualDocsFor(a, c) {
     return c >= a ? { tA: a, tF: c + 1 } : { tA: a + 1, tF: c }
@@ -639,26 +559,105 @@ function visualMoveCursor(c) {
     visualSetSelection(visualModel.a, c)
 }
 
-// Called right before a NATIVE motion (j/k/{/}/g/G, or a word jump that ran
-// off the line) takes over. Puts Docs' selection in the orientation Vim's
-// end result will have, so the native motion starts from the right place:
-//   forward  (cursor ends up after the anchor):  Docs anchor = a,     focus = c + 1
-//   backward (cursor ends up before the anchor): Docs anchor = a + 1, focus = c
-// The second one is what keeps the ANCHOR character selected when `vk` moves
-// up a line (Vim includes it; a bare shift+Up from the initial state would
-// not). Then the model is dropped -- the new line's text is unknown.
-function visualNormalizeForNative(forward) {
-    const m = visualModel
-    if (!m) return
-    if (forward) visualRealizeDocs(m.a, m.c + 1)
-    else visualRealizeDocs(m.a + 1, m.c)
-    visualModel = null
+// Native selections use boundaries between characters; Vim's endpoints
+// are characters. Start every native motion on the cursor character, then
+// restore the inclusive boundary on the correct side of the anchor.
+function cursorDocumentPoint() {
+    const caret = getCursorTop()
+    if (!caret) return null
+    const rect = caret.getBoundingClientRect()
+    if (!rect.height) return null
+    const scroller = getDocsScrollContainer()
+    return { x: rect.left + ((scroller && scroller.scrollLeft) || 0),
+        y: rect.top + ((scroller && scroller.scrollTop) || 0) }
 }
 
-// Runs `nativeFn` (a native shift+motion) with the right pre-normalisation.
+function comparePoints(a, b) {
+    if (!a || !b) return null
+    if (Math.abs(a.y - b.y) > 1) return a.y < b.y ? -1 : 1
+    if (Math.abs(a.x - b.x) > 1) return a.x < b.x ? -1 : 1
+    return 0
+}
+
+let nativeVisualAnchorAfter = false
+let visualAnchorPoint = null
+
+function prepareNativeVisualMotion(forward) {
+    const m = visualModel
+    if (m) {
+        visualRealizeDocs(m.a, m.a)
+        visualAnchorPoint = cursorDocumentPoint()
+        visualRealizeDocs(forward ? m.a : m.a + 1, m.c)
+        nativeVisualAnchorAfter = !forward
+        visualModel = null
+    } else if (nativeVisualFocusAfter) {
+        sendKeyEvent("left", { shift: true })
+    }
+}
+
+function finishNativeVisualMotion(direction) {
+    const relation = comparePoints(cursorDocumentPoint(), visualAnchorPoint)
+    const forward = relation === null ? direction : relation === 0 ? !nativeVisualAnchorAfter : relation > 0
+    if (nativeVisualAnchorAfter === forward) {
+        // The cursor crossed its anchor. Rebuild from the selected grapheme
+        // count to move Docs' anchor by one character. This read happens only
+        // on a crossing, never for ordinary word jumps or cosmetic rendering.
+        repairNativeVisualAnchor(forward)
+        return
+    }
+    if (forward) sendKeyEvent("right", { shift: true })
+    nativeVisualFocusAfter = forward
+}
+
+async function repairNativeVisualAnchor(forward) {
+    if (!beginOracle()) return
+    try {
+        const selected = await withClipboardSaved((previous) => copySelectionForOracle(previous))
+        if (selected === null) return
+        const n = toGraphemes(selected).length
+        if (n > 0) sendKeyEvent("left")
+        if (forward) {
+            sendKeyEvent("left")
+            repeatMotion(() => sendKeyEvent("right", { shift: true }), n + 2)
+        } else {
+            repeatMotion(() => sendKeyEvent("right"), n + 1)
+            repeatMotion(() => sendKeyEvent("left", { shift: true }), n + 1)
+        }
+        nativeVisualAnchorAfter = !forward
+        nativeVisualFocusAfter = forward
+    } finally {
+        releaseOracle()
+    }
+}
+
 function visualNativeMotion(forward, nativeFn) {
-    visualNormalizeForNative(forward)
+    prepareNativeVisualMotion(forward)
     nativeFn()
+    finishNativeVisualMotion(forward)
+}
+
+function visualNativeWordMotion(kind) {
+    const forward = kind !== "b"
+    visualNativeMotion(forward, () => {
+        if (kind === "e") fallbackWordEnd(true)
+        else fallbackWordMotion(forward, true)
+    })
+}
+
+function nativeVerticalStep(down, shift = false) {
+    const before = cursorDocumentPoint()
+    sendKeyEvent(down ? "down" : "up", { shift })
+    let after = cursorDocumentPoint()
+    // Docs moves to EOL/column zero when Up/Down hits a document boundary.
+    // Vim keeps the cursor in its column on that line instead.
+    if (!before || !after || Math.abs(before.y - after.y) > 1) return
+    for (let i = 0; i < 2000 && Math.abs(before.x - after.x) > 1; i++) {
+        const key = before.x < after.x ? "left" : "right"
+        sendKeyEvent(key, { shift })
+        const next = cursorDocumentPoint()
+        if (!next || comparePoints(next, after) === 0) break
+        after = next
+    }
 }
 
 // Vim's `^`: the first non-blank character; on a line of only blanks, the
@@ -681,9 +680,7 @@ function visualWordMotion(kind, classify) {
     if (steps === -1) {
         // Ran off the line (e.g. `w` on the last word): let Docs' native
         // word jump take it across the line break, same as normal mode does.
-        visualNormalizeForNative(forward)
-        if (kind === "e") fallbackWordEnd(true)
-        else fallbackWordMotion(forward, true)
+        visualNativeWordMotion(kind)
         return
     }
     visualMoveCursor(forward ? m.c + steps : m.c - steps)
@@ -749,6 +746,9 @@ let visualObjectReturnMode = "visual"
 function switchModeToVisual() {
     mode = 'visual'
     visualModel = null
+    nativeVisualFocusAfter = true
+    nativeVisualAnchorAfter = false
+    visualAnchorPoint = cursorDocumentPoint()
     updateModeIndicator(mode)
     startVisualSelection()
 }
@@ -791,43 +791,63 @@ async function startVisualSelection() {
     }
 }
 
-// --- Visual LINE mode model ---------------------------------------------------
-//
-// V used to run charwise-native shift+arrows, which is wrong twice over:
-//   * h/l/w/b/e/f... extended the selection by individual characters and
-//     words, so the highlight was not "only whole lines"; and
-//   * V then k did not select the line above: `V` selected [start of line A,
-//     start of line A+1] with the Docs anchor at A, so shift+Up walked the
-//     focus straight back onto the anchor -- an EMPTY selection, and a
-//     following d Backspaced one unrelated character.
-//
-// Same fix as the charwise model, with lines as the unit. Docs' selection
-// always covers WHOLE lines, including the trailing line break of the
-// bottom one:
-//   forward  (cursor on/below the anchor line):
-//                Docs anchor = start of the anchor line,
-//                Docs focus  = start of the line after the cursor line
-//   backward (cursor above the anchor line):
-//                Docs anchor = start of the line after the anchor line,
-//                Docs focus  = start of the cursor line
-// Moving away from the anchor is one shift+Down/Up per line. Moving back
-// towards it, or across it, first collapses the selection and re-anchors on
-// the other side (vlPrepFwd/vlPrepBwd), using only relative key presses --
-// nothing is read. h/l/w/b/e/W/B/E/f/F/t/T/;/,/0/^/$ do nothing in V, as the
-// cursor's column is invisible in a linewise selection. `visualLineRows` is
-// the number of lines currently selected (null = unknown, after G/g/{/}).
-// "Line" here means a Docs display line, the same as $/0/D/C everywhere else.
+// --- Visual line mode -------------------------------------------------------
+// Forward: anchor at the anchor-line start, focus after the cursor line.
+// Backward: anchor after the anchor line, focus at the cursor-line start.
+// Boundary steps keep entire display lines selected without sticky columns.
+// Rows are unknown after absolute/paragraph jumps; saved anchor coordinates
+// detect when shrinking reaches the anchor again. A final empty line needs
+// separate state because including it adds no selection characters.
 let visualLineOrient = "fwd"   // "fwd" | "bwd"
 let visualLineRows = 1
+let visualLineEmptyEndIncluded = false
+let visualLineAnchorEmpty = false
+let visualLineAnchorStart = null
+let visualLineAnchorEnd = null
 
 function switchModeToVisualLine() {
     mode = 'visualLine'
     visualModel = null
     visualLineOrient = "fwd"
     visualLineRows = 1
+    visualLineEmptyEndIncluded = false
+    visualLineAnchorEmpty = false
     updateModeIndicator(mode)
     sendKeyEvent('home')
-    sendKeyEvent('down', { shift: true })
+    visualLineAnchorStart = cursorDocumentPoint()
+    vlStepBoundary(true)
+    visualLineAnchorEnd = cursorDocumentPoint()
+    visualLineAnchorEmpty = visualLineEmptyEndIncluded
+}
+
+// End+Right selects through a line break, but also works on the final line.
+// Left+Home moves to the previous boundary without a sticky goal column.
+// Up/Down alone clip to short lines and can leave a partial line selected.
+function vlStepBoundary(forward, shift = true) {
+    if (!forward && shift && visualLineOrient === "fwd" && visualLineEmptyEndIncluded) {
+        visualLineEmptyEndIncluded = false
+        return true // the final empty line occupies no selection characters
+    }
+    const before = cursorPositionKey(getCursorTop())
+    if (forward) {
+        sendKeyEvent("end", { shift })
+        sendKeyEvent("right", { shift })
+    } else {
+        sendKeyEvent("left", { shift })
+        sendKeyEvent("home", { shift })
+    }
+    const after = cursorPositionKey(getCursorTop())
+    if (before === null || after === null || before !== after) return true
+    if (forward && shift && !visualLineEmptyEndIncluded) {
+        sendKeyEvent("home", { shift: true })
+        const atStart = cursorPositionKey(getCursorTop())
+        sendKeyEvent("end", { shift: true })
+        if (atStart === after) {
+            visualLineEmptyEndIncluded = true
+            return true
+        }
+    }
+    return false
 }
 
 // Forward selection -> backward one anchored after the anchor line. Ends with
@@ -835,8 +855,10 @@ function switchModeToVisualLine() {
 // to the selection's start = start of the anchor line; Down = start of the
 // next line, or the document end for the last line.)
 function vlPrepBwd() {
-    sendKeyEvent("left")
-    sendKeyEvent("down")
+    if (!(visualLineAnchorEmpty && visualLineRows === 1)) sendKeyEvent("left")
+    sendKeyEvent("end")
+    sendKeyEvent("right")
+    visualLineEmptyEndIncluded = false
 }
 
 // Backward selection -> forward one anchored at the start of the anchor line.
@@ -845,24 +867,41 @@ function vlPrepBwd() {
 // empty selection whose caret is at the start of the anchor line.
 function vlPrepFwd() {
     sendKeyEvent("right")
-    sendKeyEvent("left")
-    sendKeyEvent("home")
+    if (!visualLineAnchorEmpty) {
+        sendKeyEvent("left")
+        sendKeyEvent("home")
+    }
+    visualLineEmptyEndIncluded = false
 }
 
 function vlMoveVertical(delta) {
     const down = delta > 0
     const steps = Math.abs(delta)
-    const key = down ? "down" : "up"
     const extending = (visualLineOrient === "fwd") === down
     if (extending) {
-        repeatMotion(() => sendKeyEvent(key, { shift: true }), steps)
-        if (visualLineRows !== null) visualLineRows += steps
+        for (let i = 0; i < steps; i++) {
+            if (!vlStepBoundary(down)) break
+            if (visualLineRows !== null) visualLineRows++
+        }
+        return
+    }
+    if (visualLineRows === null) {
+        const anchor = visualLineOrient === "fwd" ? visualLineAnchorEnd : visualLineAnchorStart
+        if (!anchor || !cursorDocumentPoint()) return
+        for (let i = 0; i < steps; i++) {
+            if (comparePoints(cursorDocumentPoint(), anchor) === 0) {
+                visualLineRows = 1
+                vlMoveVertical(down ? steps - i : i - steps)
+                return
+            }
+            if (!vlStepBoundary(down)) return
+        }
         return
     }
     const rows = visualLineRows === null ? Infinity : visualLineRows
     if (steps < rows) {
         // Shrinking towards the anchor line; the anchor line stays selected.
-        repeatMotion(() => sendKeyEvent(key, { shift: true }), steps)
+        repeatMotion(() => vlStepBoundary(down), steps)
         if (visualLineRows !== null) visualLineRows -= steps
         return
     }
@@ -876,14 +915,23 @@ function vlMoveVertical(delta) {
         vlPrepFwd()
         visualLineOrient = "fwd"
     }
-    repeatMotion(() => sendKeyEvent(key, { shift: true }), newRows)
-    visualLineRows = newRows
+    let movedRows = visualLineOrient === "bwd" && visualLineAnchorEmpty ? 1 : 0
+    for (let i = movedRows; i < newRows; i++) {
+        if (!vlStepBoundary(down)) break
+        movedRows++
+    }
+    visualLineRows = Math.max(1, movedRows)
 }
 
 function vlGoto(toEnd) {
     if (toEnd) {
         if (visualLineOrient === "bwd") { vlPrepFwd(); visualLineOrient = "fwd" }
         goToDocEnd(true)
+        // G includes an empty final line even though it adds no characters.
+        sendKeyEvent("home", { shift: true })
+        const endStart = cursorDocumentPoint()
+        sendKeyEvent("end", { shift: true })
+        visualLineEmptyEndIncluded = comparePoints(endStart, cursorDocumentPoint()) === 0
     } else {
         if (visualLineOrient === "fwd") { vlPrepBwd(); visualLineOrient = "bwd" }
         goToDocStart(true)
@@ -895,15 +943,30 @@ function vlGoto(toEnd) {
 function vlParagraph(forward) {
     if (forward && visualLineOrient === "fwd") {
         goToEndOfPara(true)
+        sendKeyEvent("end", { shift: true })
+        sendKeyEvent("right", { shift: true })
         visualLineRows = null
     } else if (!forward && visualLineOrient === "bwd") {
         goToStartOfPara(true)
+        sendKeyEvent("home", { shift: true })
         visualLineRows = null
     }
 }
 
 function handleKeyEventVisualLineMode(key) {
     switch (key) {
+        case "v":
+            mode = "visual"
+            nativeVisualFocusAfter = visualLineOrient === "fwd"
+            nativeVisualAnchorAfter = !nativeVisualFocusAfter
+            visualAnchorPoint = visualLineAnchorStart
+            updateModeIndicator(mode)
+            break
+        case "V":
+            sendKeyEvent("left")
+            mode = "normal"
+            switchModeToNormal()
+            break
         case "j": vlMoveVertical(1); break
         case "k": vlMoveVertical(-1); break
         case "G": vlGoto(true); break
@@ -961,6 +1024,12 @@ function visualOperator(op) {
         try {
             const selected = await withClipboardSaved((previousClipboard) => copySelectionForOracle(previousClipboard))
             await clipboardRestorePending // the restore must land before the real edit touches the clipboard
+            if (selected === null) {
+                pendingRegister = null
+                pendingRegisterAppend = false
+                console.warn("DocsKeys: couldn't verify the visual selection; nothing was changed")
+                return
+            }
             if (selected === "") {
                 console.warn("DocsKeys: the visual selection is empty; nothing was changed")
                 pendingRegister = null
@@ -983,9 +1052,15 @@ function switchModeToNormal() {
     mode = 'normal'
     visualModel = null
     updateModeIndicator(mode)
+    finishTemporaryNormal()
+}
+
+function finishTemporaryNormal() {
+    if (tempnormal && mode === "normal" && !oracleBusy) switchModeToInsert()
 }
 
 function switchModeToInsert() {
+    tempnormal = false
     mode = 'insert'
     visualModel = null
     updateModeIndicator(mode)
@@ -1015,7 +1090,7 @@ function switchModeToWaitForRegister() {
 
 // --- f/F/t/T (find-character motions) ---
 // These are the first DocsKeys motions that need to know what character is
-// actually in the document. See readCursorLineContext() below for how that's
+// actually in the document. See readLineContext() below for how that's
 // done without a Docs content-reading API: temporarily select to the line's
 // start/end, Copy, and read the OS clipboard (the same clipboard permission
 // already used for registers), then restore the selection and the user's
@@ -1028,19 +1103,12 @@ let pendingFindCount = 1
 let pendingFindReturnMode = "normal" // mode to resume in: 'normal' | 'visual' | 'visualLine'
 let lastFind = null              // { type, char } for ';' and ','
 
-// Single, unified re-entrancy guard around every use of the clipboard-based
-// text oracle (readAfterCursor/readBeforeCursor/readLineContext and anything
-// that calls them: f/F/t/T, w/e/b, ^/_, the `v` line snapshot, and the
-// cosmetic normal-mode cursor-width refresh).
-//
-// While the oracle is busy the selection is TEMPORARILY changed, so a real
-// keystroke must not act on it. Two things used to go wrong: keys that ran
-// anyway (plain h/j/k/l/x/dd aren't guarded) acted on the temporary
-// selection -- an `x` there deleted the highlighted rest-of-line -- and keys
-// that were guarded were silently dropped. Now every key that arrives while
-// the oracle is busy is queued (in order) and replayed as soon as it's
-// released; see eventHandler().
+// One input guard for document reads, selection repair, and clipboard commands.
+// Distinct presses are queued while selections/clipboard values are temporary.
+// Held repeats are dropped while busy to avoid continuing after key release.
+// A generation prevents an older completion from releasing a newer guard.
 let oracleBusy = false
+let oracleGeneration = 0
 const keyQueue = []
 const MAX_QUEUED_KEYS = 64
 let drainingKeyQueue = false
@@ -1048,31 +1116,29 @@ let drainingKeyQueue = false
 function beginOracle() {
     if (oracleBusy) return false
     oracleBusy = true
+    oracleGeneration++
     return true
 }
 
-// Caret movement seen by the frame loop within this long after a read is
-// treated as the read's own doing (it moves the native caret temporarily).
-let ignorePositionUntil = 0
 
-// Release for the cosmetic width/selection pass: must NOT schedule another
-// pass (that would loop).
+// Release after clipboard restoration and any nested clipboard commands.
 function releaseOracleQuiet() {
     // Stay "busy" until the background clipboard restore has landed, so keys
     // replayed from the queue (a held Ctrl+V, `p`, `y`) and any command that
     // follows can never see or write the oracle's temporary clipboard text.
-    clipboardRestorePending.then(() => {
+    const generation = oracleGeneration
+    Promise.all([clipboardRestorePending, clipboardGuardQueue]).then(() => {
+        if (generation !== oracleGeneration) return
         oracleBusy = false
-        ignorePositionUntil = Date.now() + 150
+        finishTemporaryNormal()
         drainKeyQueue()
     })
 }
 
 function releaseOracle() {
     releaseOracleQuiet()
-    // A command that ran while the box was showing has probably moved the
-    // caret; refresh the exact width once things are idle.
-    if (mode === "normal") scheduleAccurateWidthRefresh()
+    // Retry recovery only when a document read flagged a leftover selection.
+    if (mode === "normal") scheduleSelectionCheck()
 }
 
 function queueKey(item) {
@@ -1155,20 +1221,9 @@ function saveRegisters() {
     }
 }
 
-// "a-"z (or 0-9, or -/_) selects that register for the next y/d/c/p.
-// An UPPERCASE letter selects the same (lowercased) register in *append*
-// mode: the next y/d/c adds to what's already there instead of overwriting.
-// "_ is the black-hole register: anything "written" there is discarded, and
-// it always reads back empty, same as real Vim.
-// "+" is Vim's real system-clipboard register (:help quoteplus); DocsKeys had
-// no case for it at all, so `"+dw`/`"+yy`/`"+p` silently fell through to
-// whatever pendingRegister already was (typically none), i.e. a bare dw/yy/p
-// -- `"+d` looked like it worked (it deletes) but the cut never actually
-// reached the OS clipboard the way Vim's `"+d` does. "*" (the X11 primary
-// selection, :help quotestar) has no separate concept in a Chrome extension
-// clipboard API, so it's treated as an alias for "+" -- an approximation
-// noted in the README, not a full implementation of Vim's two-clipboard
-// model.
+// Named registers persist locally; uppercase appends. "_ discards content.
+// "+ is the system clipboard. "* aliases it because the extension has no
+// separate X11 primary selection.
 const SYSTEM_REGISTER = "+"
 function isSystemRegister(reg) { return reg === "+" || reg === "*" }
 
@@ -1193,84 +1248,38 @@ function writeRegister(name, text, append) {
     saveRegisters()
 }
 
-// Everything below this point is the y/d/c <-> clipboard/register wiring.
-// The core tension: Google Docs only exposes "what's selected" through its
-// own Cut/Copy menu items, which always write to the real OS clipboard --
-// there's no clipboard-free way to ask "what text is in this selection".
-// So capturing a register's contents always means briefly writing to the
-// real clipboard and reading it back. To keep a *plain* y/d/c from
-// permanently stepping on whatever the user had copied from somewhere else:
-//   - reading the clipboard's *current* contents (to know what to restore)
-//     has to happen before our own Copy/Cut call overwrites it, and that
-//     read is unavoidably async -- so register-qualified y/d/c/"reg commands
-//     carry one small clipboard-read's worth of latency before the actual
-//     edit happens. In practice this is a handful of ms, not the ~150-300ms
-//     read used for f/t/w/e/b (those wait out Docs' own async clipboard
-//     write; this is just reading whatever's already sitting there).
-//   - restoring the user's original clipboard afterward doesn't need to
-//     block anything, so it (and the register-write itself) happens in the
-//     background after the edit and mode switch are already done.
-//   - a *plain* y with no register keeps going straight to the OS clipboard
-//     exactly as before, with none of the above -- zero added latency.
-//   - a plain d/c with no register now defaults to the CUT_REGISTER ("-")
-//     instead of the OS clipboard, so frequent deletes stop overwriting
-//     whatever the user meant to paste elsewhere; "-p pastes it back, and
-//     ""p (the real OS clipboard) is untouched by cuts.
-//   - deletion itself always goes through Backspace on the active selection,
-//     never Docs' Cut menu item, specifically so a *plain* d/c never has to
-//     touch the clipboard system at all when going to the black-hole
-//     register, and so the register bookkeeping above is a clean side
-//     channel rather than being load-bearing for the deletion itself.
+// Copy is the bridge from Docs selections to registers. Plain y writes the
+// system clipboard; plain d/c captures into the cut register and restores
+// the clipboard. Named registers also preserve it; "_ skips capture.
 let clipboardGuardQueue = Promise.resolve() // serializes the background register-capture/restore tail so rapid repeats (mashing "add) can't race and clobber each other's saved clipboard snapshot
 
-function queueRegisterCapture(targetReg, append, previousClipboard) {
-    clipboardGuardQueue = clipboardGuardQueue.then(async () => {
-        const text = await pollClipboardForChange(previousClipboard)
-        if (text !== null) {
-            writeRegister(targetReg, text, append)
-        } else {
-            console.warn(`DocsKeys: couldn't capture text into register "${targetReg}"`)
-        }
-        if (previousClipboard !== null) {
-            try {
-                await navigator.clipboard.writeText(previousClipboard)
-            } catch (err) {
-                console.warn("DocsKeys: couldn't restore clipboard", err)
-            }
-        }
-    })
+// Clipboard commands share the input guard with document reads. Keep the
+// guard through capture AND restoration, so another command cannot observe
+// a temporary clipboard value or act on a selection awaiting capture.
+function runClipboardCommand(fn) {
+    const ownsGuard = !oracleBusy && beginOracle()
+    const pending = clipboardGuardQueue.then(fn, fn)
+    clipboardGuardQueue = pending.catch((err) => console.warn("DocsKeys: clipboard command failed", err))
+    if (ownsGuard) clipboardGuardQueue.then(releaseOracleQuiet)
+    return pending
 }
 
 async function deleteOrChangeSelection(reg, append, isChange, linewise) {
-    const toSystemClip = isSystemRegister(reg)
-    const targetReg = (reg === BLACKHOLE_REGISTER || toSystemClip) ? null : (reg || CUT_REGISTER)
-    let previousClipboard = null
-    if (toSystemClip) {
-        // Same Copy-before-delete as any other register (Docs' Cut menu item
-        // is deliberately never used for deletion -- see the block comment
-        // above), but with no save/restore: the whole point of "+ is that the
-        // cut text is LEFT on the real clipboard afterwards, unlike a plain
-        // d/c (CUT_REGISTER) or a named "reg, both of which restore the
-        // user's previous clipboard so they're untouched by a delete.
-        clickMenu(menuItems.copy)
-    } else if (targetReg) {
-        try {
-            previousClipboard = await readClipboardSettled()
-        } catch (err) {
-            // Can't save it, so there'll be nothing to restore -- proceed anyway.
-        }
+    await clipboardRestorePending
+    const target = isSystemRegister(reg) || reg === BLACKHOLE_REGISTER ? null : (reg || CUT_REGISTER)
+    if (target) {
+        const text = await withClipboardSaved((previous) => copySelectionForOracle(previous))
+        await clipboardRestorePending
+        if (text !== null) writeRegister(target, text, append)
+    } else if (isSystemRegister(reg)) {
         clickMenu(menuItems.copy)
     }
-    sendKeyEvent("backspace") // deletes the active selection; see the block comment above for why this is Backspace, not Docs' Cut
+    sendKeyEvent("backspace")
     if (linewise) sendKeyEvent("backspace")
-    if (isChange) {
-        switchModeToInsert()
-    } else {
+    if (isChange) switchModeToInsert()
+    else {
         mode = "normal"
         switchModeToNormal()
-    }
-    if (targetReg) {
-        queueRegisterCapture(targetReg, append, previousClipboard)
     }
 }
 
@@ -1288,26 +1297,23 @@ function collapseCharwiseVisualToStart() {
 }
 
 async function yankSelection(reg, append) {
+    await clipboardRestorePending
     if (!reg || isSystemRegister(reg)) {
-        await clipboardRestorePending // a pending restore must not overwrite the yank
-        clickMenu(menuItems.copy) // straight to the OS clipboard -- "+y is Vim's system-clipboard yank, identical to a bare y here since the unnamed register already IS the OS clipboard for yanks
-        collapseCharwiseVisualToStart()
-        switchModeToNormal()
-        return
+        clickMenu(menuItems.copy)
+    } else if (reg !== BLACKHOLE_REGISTER) {
+        const text = await withClipboardSaved((previous) => copySelectionForOracle(previous))
+        await clipboardRestorePending
+        if (text !== null) writeRegister(reg, text, append)
     }
-    let previousClipboard = null
-    try {
-        previousClipboard = await readClipboardSettled()
-    } catch (err) {
-    }
-    clickMenu(menuItems.copy)
     collapseCharwiseVisualToStart()
     switchModeToNormal()
-    queueRegisterCapture(reg, append, previousClipboard)
 }
 
+function pasteRegister(name) {
+    return runClipboardCommand(() => pasteRegisterInner(name))
+}
 
-async function pasteRegister(name) {
+async function pasteRegisterInner(name) {
     if (!name || isSystemRegister(name)) {
         // Wait for any in-flight clipboard restore (from a document read) so
         // it can't land AFTER the paste and be pasted, or overwrite a copy.
@@ -1339,19 +1345,9 @@ async function pasteRegister(name) {
 }
 
 
-// Wraps an action in a save-clipboard/restore-clipboard pair, the same
-// pattern pasteRegister() established. Used by every oracle read. `fn`
-// receives the saved previous clipboard value.
-//
-// The restore write is intentionally NOT awaited by the caller: the caller
-// only cares about `fn`'s result (the read text) and shouldn't have to wait
-// on a second clipboard round-trip just to get it back. It IS awaited by the
-// NEXT withClipboardSaved() call (clipboardRestorePending). Without that, two
-// reads in quick succession (`v` reads both sides of the caret back to back)
-// could read the clipboard's "previous" value before the first read's
-// restore had landed, see that read's temporary text instead of the user's
-// real clipboard, and later "restore" that -- permanently replacing what the
-// user had copied with a fragment of the line.
+// Save the clipboard around a text read. The next read and the input guard
+// both wait for restoration. Keep restoration separate from command capture
+// so nested operations can wait without depending on their own queue.
 let clipboardRestorePending = Promise.resolve()
 // Reads the clipboard only after any in-flight background restore has landed,
 // so a save-then-restore can never capture (and later "restore") an oracle's
@@ -1407,20 +1403,10 @@ async function pollClipboardForChange(previousText, maxWaitMs = 250, intervalMs 
     }
 }
 
-// Copies the current selection and returns its text -- or "" if the
-// selection was empty. Must be called inside withClipboardSaved().
-//
-// Why a sentinel: Docs' Copy does nothing at all when the selection is empty
-// (the menu item is disabled), so the clipboard never changes, and the old
-// "poll until it differs from the previous clipboard" fell through to
-// "whatever's there now" -- i.e. the user's OLD clipboard contents, which
-// callers then treated as the text of the line. At the end of a line (or on
-// an empty line) every f/t/w/e/b read therefore "found" unrelated text and
-// moved the cursor by garbage step counts. Writing a known sentinel first
-// makes "nothing was copied" unambiguous, and also stops a copy whose text
-// happens to equal the old clipboard from waiting out the full timeout.
-// Assumption (unverified against a live page): if Docs hasn't replaced the
-// sentinel within maxWaitMs, the selection was empty.
+// Copy the selection, returning "" for no text and null on failure.
+// A unique sentinel distinguishes an empty selection from stale clipboard
+// contents and handles copies identical to the previous clipboard value.
+// Call only inside withClipboardSaved; preserve the clipboard on failure.
 const ORACLE_SENTINEL = `\u200b\u200bdocskeys-oracle-${Math.random().toString(36).slice(2)}\u200b\u200b`
 // The wait for "Docs hasn't replaced the sentinel, so the selection was
 // empty" adapts to how long real copies have been taking (3x the smoothed
@@ -1430,10 +1416,9 @@ const ORACLE_SENTINEL = `\u200b\u200bdocskeys-oracle-${Math.random().toString(36
 let copyLatencyMs = null
 async function copySelectionForOracle(previousClipboard, maxWaitMs = 250) {
     if (previousClipboard === null) {
-        // Couldn't read the user's clipboard, so writing a sentinel would
-        // leave it stuck on the clipboard afterwards. Old behavior instead.
-        clickMenu(menuItems.copy)
-        return await pollClipboardForChange(null, maxWaitMs)
+        // Without a saved clipboard we cannot safely probe or distinguish
+        // an empty selection from stale clipboard text.
+        return null
     }
     try {
         await navigator.clipboard.writeText(ORACLE_SENTINEL)
@@ -1453,29 +1438,24 @@ async function copySelectionForOracle(previousClipboard, maxWaitMs = 250) {
     return text
 }
 
-// Reads the text from the cursor to the end of the current wrapped display
-// line (same "line" $/0/D/C already use), via a temporary selection + Copy +
-// clipboard read. Returns null on any failure. This is a live, on-demand
-// read every time -- never a cached snapshot -- so it stays correct even
-// while a collaborator is editing elsewhere in the doc.
-//
-// These cores must only run with NO selection active (normal mode, or `v`
-// right before it creates its selection): Shift+End/Shift+Home extend
-// relative to the selection's ANCHOR, so with a live selection the copied
-// text starts at the anchor rather than at the caret. Visual mode therefore
-// never calls them -- see "Visual mode model". Caller holds the oracle
-// guard (beginOracle) and the clipboard save (withClipboardSaved).
+// Temporarily select caret..EOL and read via Copy, then collapse to the
+// original caret. These cores require an empty selection, a clipboard save,
+// and the input guard. A live Visual selection has a different anchor and
+// must use its snapshot or copy the selection itself, never these cores.
 async function readAfterCore(previousClipboard) {
     const t0 = DEBUG_TIMING ? performance.now() : 0
+    const origin = cursorDocumentPoint()
     try {
         sendKeyEvent("end", { shift: true })
+        const moved = comparePoints(origin, cursorDocumentPoint())
         const t1 = DEBUG_TIMING ? performance.now() : 0
         const after = await copySelectionForOracle(previousClipboard)
         const t2 = DEBUG_TIMING ? performance.now() : 0
-        if (after === null) {
+        if (after === null || (after === "" && moved !== null && moved !== 0)) {
             // The temporary selection is still there and we don't know how
             // far it reaches; flag it so the next idle pass collapses it.
-            noteSelectionGlitch()
+            if (moved !== null && moved !== 0) sendKeyEvent("left")
+            else if (moved === null) noteSelectionGlitch()
             return null
         }
         // Collapse the temporary selection back onto the caret. With no
@@ -1501,13 +1481,16 @@ async function readAfterCore(previousClipboard) {
 // Right (collapse to the selection's end) restores the caret.
 async function readBeforeCore(previousClipboard) {
     const t0 = DEBUG_TIMING ? performance.now() : 0
+    const origin = cursorDocumentPoint()
     try {
         sendKeyEvent("home", { shift: true })
+        const moved = comparePoints(origin, cursorDocumentPoint())
         const t1 = DEBUG_TIMING ? performance.now() : 0
         const before = await copySelectionForOracle(previousClipboard)
         const t2 = DEBUG_TIMING ? performance.now() : 0
-        if (before === null) {
-            noteSelectionGlitch()
+        if (before === null || (before === "" && moved !== null && moved !== 0)) {
+            if (moved !== null && moved !== 0) sendKeyEvent("right")
+            else if (moved === null) noteSelectionGlitch()
             return null
         }
         if (before.length > 0) sendKeyEvent("right")
@@ -1517,26 +1500,6 @@ async function readBeforeCore(previousClipboard) {
         return before
     } catch (err) {
         console.warn("DocsKeys: couldn't read text before cursor (best-effort feature; falling back to no-op)", err)
-        noteSelectionGlitch()
-        return null
-    }
-}
-
-// Reads just the character under the caret (shift+Right, Copy, collapse).
-// Used by the box-cursor width refresh: selecting one character instead of
-// the rest of the line is what keeps that refresh quick. At the end of a
-// paragraph the "character" is the line break itself.
-async function readCharAfterCore(previousClipboard) {
-    try {
-        sendKeyEvent("right", { shift: true })
-        const text = await copySelectionForOracle(previousClipboard, 150)
-        if (text === null) {
-            noteSelectionGlitch()
-            return null
-        }
-        if (text.length > 0) sendKeyEvent("left")
-        return text
-    } catch (err) {
         noteSelectionGlitch()
         return null
     }
@@ -1709,7 +1672,7 @@ async function performFind(type, char, count, operator, returnMode, skipAdjacent
         // capture text relative to the ANCHOR, not the cursor, so decline
         // rather than act on a wrong read; f/F/t/T have no native Docs
         // equivalent to fall back to.
-        console.warn(`DocsKeys: ${type}${char} isn't available in this visual selection (visual line mode, or the selection has moved off the line) -- press v again to reset`)
+        console.warn(`DocsKeys: ${type}${char} isn't available in this visual selection (visual line mode, or the selection has moved off the line) -- leave and re-enter visual mode to reset`)
         finishFind(returnMode)
         return
     }
@@ -1743,17 +1706,8 @@ async function performFind(type, char, count, operator, returnMode, skipAdjacent
     applyFindResult(type, steps, operator, returnMode)
 }
 
-// Entry point from eventHandler. IMPORTANT: this must be called with the raw,
-// untranslated e.key, not the Dvorak-remapped `key` variable used for command
-// letters elsewhere in this file. DVORAK_MODE's translateKey() exists to turn
-// a physically-Dvorak-typed key back into its QWERTY *command* label (so 'd'
-// means delete regardless of layout) -- but f/F/t/T's argument isn't a
-// command, it's a literal character to search for in the document, and
-// e.key already reflects the correct on-screen character under the active
-// OS keyboard layout. Translating it would search for the wrong character.
-// (This mirrors how the existing 'r' replace-character command sidesteps the
-// same issue, by not consuming the translated `key` for its actual character
-// either -- see the `mode == 'replaceChar'` branch in eventHandler.)
+// Find/replace arguments are literal OS-layout characters. Apply the DVP
+// translation to command keys only, never to the character being searched.
 function handleFindCharInput(rawKey) {
     if (oracleBusy) return
     if (toGraphemes(rawKey).length !== 1) {
@@ -1816,7 +1770,7 @@ async function goToFirstNonBlank(operator, returnMode) {
     if (returnMode === "visual" || returnMode === "visualLine") {
         // Charwise visual mode with a line model handles ^/_ itself (see
         // handleKeyEventVisualLine); anything reaching here has no model.
-        console.warn("DocsKeys: ^/_ isn't available in this visual selection (visual line mode, or the selection has moved off the line) -- press v again to reset")
+        console.warn("DocsKeys: ^/_ isn't available in this visual selection (visual line mode, or the selection has moved off the line) -- leave and re-enter visual mode to reset")
         finishFind(returnMode)
         return
     }
@@ -1857,26 +1811,10 @@ function selectToEndOfLine() {
     sendKeyEvent("end", { shift: true })
 }
 
-// --- word / WORD motions (w, e, b, and true W, E, B) ---
-//
-// The previous implementation approximated `e` by nudging the cursor a fixed
-// 2 characters before a native Ctrl+Right word-jump, to dodge Ctrl+Right's
-// "always lands on the start of the next word" behavior when `e` needed to
-// land on a word's own end. That fixed nudge assumed the cursor was always
-// exactly at a previous end-of-word position (the repeated-press case,
-// `ee`/`2e`); on a *fresh* press from elsewhere in a word (e.g. from a
-// word's start), the same nudge overshot backward past the real end --
-// which is exactly what landing "between o and n" in "discussions" was.
-//
-// Now that DocsKeys can read line text (see f/F/t/T above), w/e/b/W/E/B are
-// computed exactly against Vim's actual word/WORD definitions instead of
-// guessed from Ctrl+Right/Ctrl+Left's behavior. This only knows about the
-// current wrapped display line, though (same scope as f/t) -- so if a
-// motion would need to continue onto the next line, these fall back to the
-// old native-keystroke behavior for that one press, which handles crossing
-// lines correctly (if not always with exact Vim word semantics right at the
-// boundary). See MISSING_VIM_FEATURES.md for exactly what that fallback
-// does and doesn't get right.
+// --- Word and WORD motions -------------------------------------------------
+// Precise motions classify a freshly read display line. Native mode bypasses
+// reads for normal w/b only. Operators, e and WORD motions keep the precise
+// path. Crossing a line falls back to Docs word boundaries.
 
 // Vim's default 'iskeyword' counts every letter/digit (including accented and
 // non-Latin letters) and "_" as word characters, and gives emoji a class of
@@ -1967,7 +1905,7 @@ function fallbackWordEnd(shift) {
     // The old repeat-nudge heuristic -- kept only as the cross-line fallback,
     // where its "assume we're at a previous end-of-word" premise is a much
     // smaller approximation than it was as the primary implementation.
-    sendKeyEvent(shift ? "right" : "right", { shift })
+    sendKeyEvent("right", { shift })
     sendKeyEvent("right", { shift })
     sendKeyEvent("right", wordMods(shift))
     sendKeyEvent("left", { shift })
@@ -1983,6 +1921,14 @@ let pendingLineCount = 1
 
 async function performWordMotion(kind, classify, count, operator, returnMode) {
     if (oracleBusy) return
+    // Operators and WORD/e motions keep Vim boundaries. Normal w/b may use
+    // Docs' synchronous word navigation, with no clipboard round trip.
+    if (!operator && returnMode === "normal" && settings.wordMotion === "native" &&
+        classify === classifyWordChar && (kind === "w" || kind === "b")) {
+        repeatMotion(() => fallbackWordMotion(kind === "w", false), count)
+        switchModeToNormal()
+        return
+    }
     if (returnMode === "visual" || returnMode === "visualLine") {
         // No oracle in visual modes -- see "Visual mode model". Charwise
         // visual with a line model never gets here (handleKeyEventVisualLine
@@ -1998,12 +1944,15 @@ async function performWordMotion(kind, classify, count, operator, returnMode) {
     }
 }
 
-function fallbackToNativeWordMotion(kind, forward, operator, returnMode) {
+function fallbackToNativeWordMotion(kind, forward, operator, returnMode, count = 1) {
     const shift = !!operator || returnMode === "visual" || returnMode === "visualLine"
-    if (kind === "e") {
-        fallbackWordEnd(shift)
+    if (!operator && returnMode === "visual") {
+        visualNativeWordMotion(kind)
     } else {
-        fallbackWordMotion(forward, shift)
+        repeatMotion(() => {
+            if (kind === "e") fallbackWordEnd(shift)
+            else fallbackWordMotion(forward, shift)
+        }, count)
     }
     if (operator) {
         runLongStringOp(operator, false)
@@ -2047,40 +1996,17 @@ async function performWordMotionInner(kind, classify, count, operator, returnMod
     if (steps === -1) {
         // Ran off the end of the current line -- fall back to the native
         // motion for this one press rather than silently doing nothing.
-        fallbackToNativeWordMotion(kind, forward, operator, returnMode)
+        fallbackToNativeWordMotion(kind, forward, operator, returnMode, count)
         return
     }
 
     applyMotionSteps(forward, inclusive, steps, operator, returnMode)
 }
 
-// --- Scrolling (Ctrl+d/u/f/b/e/y) ---------------------------------------
-//
-// Vim distinguishes moving the cursor by a page (Ctrl+f/b) or half a page
-// (Ctrl+d/u, also changing the scroll-lock position) from scrolling the
-// view WITHOUT moving the cursor at all (Ctrl+e/y, one line at a time). None
-// of these have a single native browser key that does the Vim-exact thing,
-// so each is approximated differently:
-//   Ctrl+f / Ctrl+b -- sent as native PageDown/PageUp. Google Docs already
-//     handles these as its own "next/previous page" editing shortcut (the
-//     same category of native key Home/End/Ctrl+Home/Ctrl+End already are in
-//     this file), so this reuses an existing, already-relied-on mechanism
-//     rather than a new one.
-//   Ctrl+d / Ctrl+u -- Vim moves the cursor (and the view) by exactly half
-//     the window's text lines. DocsKeys has no API for Docs' viewport line
-//     count, so it estimates one from window.innerHeight and the real
-//     caret's own on-screen height (already read for the box cursor), and
-//     moves the cursor that many lines with plain Up/Down -- Docs' own
-//     "keep the caret on screen" scrolling then does the rest. Approximate
-//     (assumes no wrapped/variable-height lines in the estimate), consistent
-//     with the rest of this file's "estimate from the caret's rect" approach.
-//   Ctrl+e / Ctrl+y -- scroll the view by one line WITHOUT moving the
-//     cursor. There's no synthetic key for this; it directly nudges the
-//     scrollTop of Docs' scrolling container. Google Docs' current class
-//     name for that container is not confirmed against a live page (same
-//     category of guess as kix-cursor-caret elsewhere in this file) --
-//     falls back to scrolling the page's main scrollable element, and
-//     no-ops with a console warning if neither is found.
+// --- Scrolling -------------------------------------------------------------
+// Ctrl+d/u move half a viewport; Ctrl+f/b use native page navigation.
+// Visual modes keep Shift held or use whole-line boundary steps.
+// Ctrl+e/y changes only the document container scrollTop.
 function estimateLinesPerScreen() {
     const ct = getCursorTop()
     if (!ct || typeof window === "undefined" || !window.innerHeight) return null
@@ -2093,11 +2019,20 @@ function estimateLinesPerScreen() {
 function halfScreenScroll(down) {
     const lines = estimateLinesPerScreen()
     const count = lines ? Math.max(1, Math.round(lines / 2)) : 10
-    repeatMotion(() => sendKeyEvent(down ? "down" : "up"), count)
+    if (mode === "visualLine") vlMoveVertical(down ? count : -count)
+    else if (mode === "visual") visualNativeMotion(down, () => {
+        repeatMotion(() => sendKeyEvent(down ? "down" : "up", { shift: true }), count)
+    })
+    else repeatMotion(() => sendKeyEvent(down ? "down" : "up"), count)
 }
 
 function fullScreenScroll(down) {
-    sendKeyEvent(down ? "pagedown" : "pageup")
+    if (mode === "visualLine") {
+        const count = Math.max(1, (estimateLinesPerScreen() || 20) - 2)
+        vlMoveVertical(down ? count : -count)
+    } else if (mode === "visual") {
+        visualNativeMotion(down, () => sendKeyEvent(down ? "pagedown" : "pageup", { shift: true }))
+    } else sendKeyEvent(down ? "pagedown" : "pageup")
 }
 
 let docsScrollContainer = null
@@ -2122,20 +2057,9 @@ function scrollOneLine(down) {
     el.scrollTop += down ? lineHeight : -lineHeight
 }
 
-// --- ~ (toggle case) ------------------------------------------------------
-// Previously listed as "not implemented, needs to read the character under
-// the cursor" -- true when this file was write-only, but the oracle built
-// for f/t/w/e/b already solves exactly that read, and the save/restore
-// write-to-clipboard-then-Paste technique that already backs named
-// registers is exactly the mechanism needed to put computed text (which
-// DocsKeys can never type itself) into the document. Scoped to `count`
-// characters starting at the cursor, not crossing the line -- same scope as
-// every other oracle-based motion here (f/t/w/e/b), and avoids the same
-// line-boundary ambiguity `x`'s known register gap flags. Case-less
-// characters (digits, punctuation, emoji, most non-cased scripts) are left
-// unchanged, via a plain String case-comparison rather than a script-aware
-// table, same approximation Vim itself makes for non-Latin-1 characters
-// without 'casemap'.
+// --- Toggle case -----------------------------------------------------------
+// Read the current run, transform graphemes, and paste the replacement with
+// clipboard save/restore. This does not change a register.
 function toggleGraphemeCase(ch) {
     const upper = ch.toUpperCase()
     const lower = ch.toLowerCase()
@@ -2245,11 +2169,11 @@ function runLongStringOp(operation = longStringOp, linewise = false) {
     pendingRegisterAppend = false
     switch (operation) {
         case "c":
-            return deleteOrChangeSelection(reg, append, true, linewise)
+            return runClipboardCommand(() => deleteOrChangeSelection(reg, append, true, linewise))
         case "d":
-            return deleteOrChangeSelection(reg, append, false, linewise)
+            return runClipboardCommand(() => deleteOrChangeSelection(reg, append, false, linewise))
         case "y":
-            return yankSelection(reg, append)
+            return runClipboardCommand(() => yankSelection(reg, append))
         case "p": {
             const pasted = pasteRegister(reg)
             switchModeToNormal()
@@ -2264,23 +2188,10 @@ function runLongStringOp(operation = longStringOp, linewise = false) {
 }
 
 
-// --- operator + text object: diw daw diW daW ciw yiw ... ---------------------
-//
-// The old implementation was "b, then dw", which is only right from the LAST
-// character of a word: from the first character `b` jumps to the PREVIOUS
-// word, so `diw` there deleted the previous word (and its spaces), and it
-// mishandled punctuation and white space; `aw` was identical to `iw`. It now
-// reads the line once and reuses textObjectRange() -- the same exact Vim
-// rules charwise Visual mode uses (:help iw, aw):
-//   iw  the run of same-class characters under the cursor (word chars,
-//       punctuation, or white space each count as one "word")
-//   aw  that plus trailing white space, or leading white space if there is
-//       no trailing white space; on white space, the white space plus the
-//       word after it
-// A count extends the object by the following objects, as repeating iw/aw in
-// Visual mode does. The caret is then walked to the start of the object with
-// plain arrows (no selection exists yet) and the object is selected with
-// shift+Right, so nothing depends on where a read leaves the selection.
+// --- Operator text objects --------------------------------------------------
+// iw selects a same-class run; aw includes trailing whitespace, or leading
+// whitespace when none follows. Counts extend across subsequent objects.
+// Read once with no live selection, then select the computed grapheme range.
 let operatorObjectPrefix = "i"   // 'i' | 'a', remembered from waitForFirstInput
 let operatorObjectCount = 1
 
@@ -2344,7 +2255,7 @@ function waitForSecondInput(key) {
 }
 
 function waitForFirstInput(key) {
-    if (/[1-9]/.test(key) || (operatorCount > 0 && key === "0")) {
+    if (/^[1-9]$/.test(key) || (operatorCount > 0 && key === "0")) {
         operatorCount = operatorCount * 10 + Number(key)
         return
     }
@@ -2458,18 +2369,15 @@ function waitForVisualInput(key) {
             if (returnMode === "visual" && visualModel) {
                 visualSelectTextObject(around, key === "W" ? classifyWORDChar : classifyWordChar)
             } else {
-                console.warn("DocsKeys: iw/aw aren't available in this visual selection (visual line mode, or the selection has moved off the line) -- press v again to reset")
+                console.warn("DocsKeys: iw/aw aren't available in this visual selection (visual line mode, or the selection has moved off the line) -- leave and re-enter visual mode to reset")
             }
             updateModeIndicator(mode)
             break
         case "p":
             visualModel = null
             goToStartOfPara()
-            goToEndOfPara(true)
-            mode = "visualLine"
-            visualLineOrient = "fwd"
-            visualLineRows = null
-            updateModeIndicator(mode)
+            switchModeToVisualLine()
+            vlParagraph(true)
             break
         default:
             mode = returnMode
@@ -2479,7 +2387,7 @@ function waitForVisualInput(key) {
 }
 
 function handleMultipleMotion(key) {
-    if (/[0-9]/.test(key)) {
+    if (/^[0-9]$/.test(key)) {
         multipleMotion.times = Number(String(multipleMotion.times)+key)
         return
     }
@@ -2588,6 +2496,11 @@ function leaveVisualSelectionForEscape() {
         } else {
             sendKeyEvent("left")
         }
+    } else if (mode === "visual") {
+        if (nativeVisualFocusAfter) {
+            sendKeyEvent("right")
+            sendKeyEvent("left")
+        } else sendKeyEvent("left")
     } else {
         sendKeyEvent("right")
     }
@@ -2628,9 +2541,20 @@ function handleModifiedKey(e) {
 }
 
 function eventHandler(e) {
+    if (e.isTrusted === false || e.isComposing || e.keyCode === 229) return
     if (
         ["Shift","Meta","Control","Alt",""].includes(e.key)
     ) return
+
+    hasHandledKey = true
+
+    if (e.ctrlKey && e.key === "[") {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        if (oracleBusy) queueKey({ key: "Escape" })
+        else handleKey({ key: "Escape", preventDefault() {} })
+        return
+    }
 
     const key = translateKey(e.key)
 
@@ -2684,6 +2608,7 @@ function eventHandler(e) {
     // mode is never queued -- typing goes straight to Docs.
     if (oracleBusy && mode != 'insert') {
         e.preventDefault()
+        e.stopImmediatePropagation()
         // A key that is being HELD down is not queued: key repeat is faster
         // than a read, so every repeat used to pile up in the queue and keep
         // executing (`w` held down kept jumping words after release). While a
@@ -2702,7 +2627,8 @@ function eventHandler(e) {
 // key has already been preventDefault()ed, so it can't fall through to Docs
 // as native typing.
 function handleKey(e) {
-    const key = translateKey(e.key)
+    const arrows = { ArrowLeft: "h", ArrowDown: "j", ArrowUp: "k", ArrowRight: "l", Home: "0", End: "$" }
+    const key = arrows[e.key] || translateKey(e.key)
 
     if (e.key == 'Escape') {
         e.preventDefault()
@@ -2721,6 +2647,15 @@ function handleKey(e) {
         if (mode == 'visualLine' || mode == 'visual') {
             leaveVisualSelectionForEscape()
         }
+        pendingRegister = null
+        pendingRegisterAppend = false
+        pendingFindType = null
+        pendingFindOperator = null
+        pendingFindCount = 1
+        pendingWordCount = 1
+        pendingLineCount = 1
+        operatorCount = 0
+        multipleMotion.times = 0
         switchModeToNormal()
         return;
     }
@@ -2785,7 +2720,7 @@ function handleKey(e) {
 }
 
 function handleKeyEventNormal(key) {
-    if (/[1-9]/.test(key)) {
+    if (/^[1-9]$/.test(key)) {
         mode = "multipleMotion"
         multipleMotion.mode = "normal"
         multipleMotion.times = Number(key)
@@ -2797,10 +2732,10 @@ function handleKeyEventNormal(key) {
             sendKeyEvent("left")
             break
         case "j":
-            sendKeyEvent("down")
+            nativeVerticalStep(true)
             break
         case "k":
-            sendKeyEvent("up")
+            nativeVerticalStep(false)
             break
         case "l":
             sendKeyEvent("right")
@@ -2851,7 +2786,7 @@ function handleKeyEventNormal(key) {
         case "Y":
             { const lcount = pendingLineCount || 1
               pendingLineCount = 1
-              selectLinesDown(lcount - 1)
+              selectToEndOfLineCounted(lcount)
               runLongStringOp("y") }
             break
         case "\"":
@@ -2960,17 +2895,12 @@ function handleKeyEventNormal(key) {
         default:
             return;
     }
-    if (tempnormal) {
-        if (mode != 'visual' && mode != 'visualLine' && mode != 'replaceChar' && mode != 'waitForFindChar') {
-            tempnormal = false
-            switchModeToInsert()
-        }
-    }
+    finishTemporaryNormal()
     refreshCursorOverlayForCurrentMode()
 }
 
 function handleKeyEventVisualLine(key) {
-    if (/[1-9]/.test(key)) {
+    if (/^[1-9]$/.test(key)) {
         multipleMotion.mode = mode // "visual" or "visualLine" -- was hard-coded to "visualLine"
         mode = "multipleMotion"
         multipleMotion.times = Number(key)
@@ -2988,21 +2918,29 @@ function handleKeyEventVisualLine(key) {
     const model = (mode === "visual") ? visualModel : null
 
     switch (key) {
+        case "v":
+            leaveVisualSelectionForEscape()
+            switchModeToNormal()
+            break
+        case "V":
+            sendKeyEvent("left")
+            switchModeToVisualLine()
+            break
         case "":
             break
         case "h":
             if (model) visualMoveCursor(model.c - 1)
-            else sendKeyEvent("left", { shift: true })
+            else visualNativeMotion(false, () => sendKeyEvent("left", { shift: true }))
             break
         case "l":
             if (model) visualMoveCursor(model.c + 1)
-            else sendKeyEvent("right", { shift: true })
+            else visualNativeMotion(true, () => sendKeyEvent("right", { shift: true }))
             break
         case "j":
-            visualNativeMotion(true, () => sendKeyEvent("down", { shift: true }))
+            visualNativeMotion(true, () => nativeVerticalStep(true, true))
             break
         case "k":
-            visualNativeMotion(false, () => sendKeyEvent("up", { shift: true }))
+            visualNativeMotion(false, () => nativeVerticalStep(false, true))
             break
         case "\"":
             switchModeToWaitForRegister()
@@ -3045,19 +2983,25 @@ function handleKeyEventVisualLine(key) {
             if (model) {
                 visualMoveCursor(firstNonBlankIndex(model.text))
             } else {
-                console.warn("DocsKeys: ^/_ isn't available in this visual selection (visual line mode, or the selection has moved off the line) -- press v again to reset")
+                console.warn("DocsKeys: ^/_ isn't available in this visual selection (visual line mode, or the selection has moved off the line) -- leave and re-enter visual mode to reset")
             }
             break
         case "0":
             if (model) visualMoveCursor(0)
-            else selectToStartOfLine()
+            else visualNativeMotion(false, () => selectToStartOfLine())
             break
         case "$":
             // Real Vim's `$` in Visual mode also selects the line break; this
             // stops at the last character (Docs' shift+End) -- documented
             // deviation, safer than accidentally joining lines.
             if (model) visualMoveCursor(model.text.length - 1)
-            else selectToEndOfLine()
+            else visualNativeMotion(true, () => {
+                sendKeyEvent("end", { shift: true })
+                const end = cursorDocumentPoint()
+                sendKeyEvent("left", { shift: true })
+                const last = cursorDocumentPoint()
+                if (end && last && Math.abs(end.y - last.y) > 1) sendKeyEvent("right", { shift: true })
+            })
             break
         case "G":
             visualNativeMotion(true, () => goToDocEnd(true))
@@ -3181,6 +3125,7 @@ function findMenuItem(menuItem) {
 }
 
 function simulateClick(el, x = 0, y = 0) {
+    if (!el) return
     const eventSequence = ["mouseover", "mousedown", "mouseup", "click"];
     for (const eventName of eventSequence) {
         const event = document.createEvent("MouseEvents");
@@ -3217,6 +3162,21 @@ function activateTopLevelMenu(menuCaption) {
 
 switchModeToNormal()
 
+try {
+    chrome.storage.local.get(DocsKeysSettings.key, (result) => {
+        if (chrome.runtime.lastError) return
+        applySettings(result[DocsKeysSettings.key])
+        if (!hasHandledKey && settings.startInInsert) switchModeToInsert()
+    })
+    chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === "local" && changes[DocsKeysSettings.key]) {
+            applySettings(changes[DocsKeysSettings.key].newValue)
+        }
+    })
+} catch (err) {
+    console.warn("DocsKeys: preferences unavailable; using defaults", err)
+}
+
 // switchModeToNormal() above runs immediately on page load, before Google
 // Docs has created its cursor element yet -- so the box-cursor sizing it
 // tries to do silently no-ops (getCursorTop() finds nothing). Previously
@@ -3238,13 +3198,18 @@ waitForElement(
 let mouseDownPos = null
 if (typeof document.addEventListener === "function") {
     document.addEventListener("mousedown", (e) => {
+        if (!e.isTrusted || !e.target.closest(".kix-appview-editor")) return
         mouseDownPos = { x: e.clientX, y: e.clientY }
         if (mode === "visual" || mode === "visualLine") {
             visualModel = null
             visualLineRows = null
+            visualAnchorPoint = null
+            mode = "visual" // a mouse range need not contain whole lines
+            updateModeIndicator(mode)
         }
     }, true)
     document.addEventListener("mouseup", (e) => {
+        if (!e.isTrusted || !e.target.closest(".kix-appview-editor")) return
         const moved = mouseDownPos && Math.hypot(e.clientX - mouseDownPos.x, e.clientY - mouseDownPos.y) > 3
         mouseDownPos = null
         if (mode === "insert") return

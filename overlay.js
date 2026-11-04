@@ -6,6 +6,8 @@ const eq = (n, g, x) => { const ok = JSON.stringify(g) === JSON.stringify(x); if
   const e = makeEnv("hello world", {})
   const d = e.ctx.document
   const caret = { style: {}, isConnected: true, rect: { left: 100, top: 200, width: 1, height: 16, bottom: 216 }, getBoundingClientRect() { return this.rect } }
+  caret.closest = () => ({ querySelector: () => null })
+  e.get("cursorTop = null")
   d.getElementsByClassName = (c) => (c === "kix-cursor-caret" ? [caret] : [])
   const el = { ownerDocument: { defaultView: { getComputedStyle: () => ({ fontSize: "16px", fontFamily: "Arial", fontWeight: "400" }) } } }
   d.querySelector = (s) => (s === ".docs-texteventtarget-iframe" ? { contentDocument: { activeElement: el, querySelector: () => el } } : null)
@@ -25,7 +27,6 @@ const eq = (n, g, x) => { const ok = JSON.stringify(g) === JSON.stringify(x); if
   e.get("hideCursorBoxOverlay()"); eq("insert mode hides box, restores native caret", [overlay().style.display, caret.style.opacity], ["none", ""])
   // moving the caret without DocsKeys schedules an exact-width refresh; our own read must not re-trigger it forever
   e.get("switchModeToNormal()"); caret.rect = { left: 10, top: 10, width: 1, height: 16, bottom: 26 }
-  let runs = 0; const orig = e.ctx.runAccurateWidthRefresh
   e.get("overlayFrame()"); await e.sleep(200); await e.settle()
   const k1 = e.sim.keyLog.length; e.get("overlayFrame()"); await e.sleep(300)
   eq("no self-triggering refresh loop", e.sim.keyLog.length, k1)
