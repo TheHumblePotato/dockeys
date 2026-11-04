@@ -179,7 +179,7 @@ function makeEnv(text, opts = {}) {
         },
     }
     // Older suites exercise the precise clipboard path; pass settings: {} to
-    // exercise shipped defaults (including fast native w/b).
+    // exercise shipped defaults (including cached Vim word motions).
     const store = { "docskeys-settings": opts.settings === undefined ? { wordMotion: "precise" } : opts.settings }
     const storageListeners = []
     const chrome = {
@@ -192,7 +192,7 @@ function makeEnv(text, opts = {}) {
     class CustomEvent { constructor(type, init) { this.type = type; this.detail = init && init.detail } }
     const ctx = vm.createContext({
         document, window, navigator, chrome, CustomEvent, console: { log() {}, warn: opts.warn || (() => {}), error() {} },
-        setTimeout, clearTimeout, performance, Promise, Date, Math, Number, String, Array, Object, RegExp, Error, Intl,
+        setTimeout, clearTimeout, performance, Promise, Date, Math, Number, String, Array, Object, RegExp, Error, Intl, AbortController,
     })
     vm.runInContext(fs.readFileSync(path.join(__dirname, "settings.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(path.join(__dirname, "vim.js"), "utf8"), ctx)
@@ -202,6 +202,7 @@ function makeEnv(text, opts = {}) {
     vm.runInContext(fs.readFileSync(path.join(__dirname, "search.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(path.join(__dirname, "g_prefix.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(path.join(__dirname, "viewport.js"), "utf8"), ctx)
+    vm.runInContext(fs.readFileSync(path.join(__dirname, "linewise.js"), "utf8"), ctx)
     vm.runInContext(fs.readFileSync(opts.file || path.join(__dirname, "content.js"), "utf8"), ctx)
     const get = (expr) => vm.runInContext(expr, ctx)
     async function settle() {
@@ -229,7 +230,15 @@ function makeEnv(text, opts = {}) {
         if (wait) { await sleep(1); await settle() }
     }
     async function pressAll(str) { for (const ch of str) await press(ch) }
-    return { sim, ctx, get, press, pressRaw, pressAll, settle, sleep, documentListeners,
+    function selectedText() {
+        const state = get("linewiseState")
+        if (get("mode") !== "visualLine" || !state) return sim.selText()
+        const anchor = state.text.slice(0, state.anchor).join("").length
+        const a = sim.lineInfo(anchor), c = sim.lineInfo(sim.focus)
+        const end = Math.max(a.end, c.end)
+        return sim.text.slice(Math.min(a.start, c.start), end < sim.text.length ? end + 1 : end)
+    }
+    return { sim, ctx, get, press, pressRaw, pressAll, settle, sleep, documentListeners, selectedText,
         changeSettings(value) {
             store["docskeys-settings"] = value
             for (const fn of storageListeners) fn({ "docskeys-settings": { newValue: value } }, "local")

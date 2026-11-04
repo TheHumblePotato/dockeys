@@ -131,12 +131,19 @@
         <legend>Settings</legend>
         <label><input type="checkbox" name="dvorak"> Programmer Dvorak (DVP) command keys</label>
         <label><input type="checkbox" name="boxCursor"> Box cursor in normal and visual modes</label>
+        <label>Box cursor color <input type="color" name="cursorColor"></label>
         <label><input type="checkbox" name="modeIndicator"> Show mode badge</label>
         <label><input type="checkbox" name="startInInsert"> Start new documents in insert mode</label>
         <label>Word motions
             <select name="wordMotion">
                 <option value="native">Fast: cached Vim motions</option>
                 <option value="precise">Precise: fresher Vim motions</option>
+            </select>
+        </label>
+        <label>Visual j/k
+            <select name="visualVertical">
+                <option value="display">Displayed rows: fast native movement</option>
+                <option value="logical">Paragraphs: Vim logical lines</option>
             </select>
         </label>
         <p>Both modes follow Vim word boundaries across paragraphs. Fast reuses reads for up to 2.5 seconds; Precise up to 0.5 seconds. Operators refresh before editing.</p>
@@ -260,7 +267,7 @@
         </div>
         <div class="tip">
              <div class="tip-title">Visual mode tip</div>
-             <div class="tip-content">Visual mode includes the anchor and cursor characters. <span class="key inline">w</span> lands on the next word’s first character; <span class="key inline">e</span> lands at a word end. Motions remain exact across paragraphs while the snapshot is valid. <span class="key inline">V</span> selects whole display lines. Use <span class="key inline">gg</span> for the first line; <span class="key inline">g</span> now waits for a second command key.</div>
+             <div class="tip-content">Visual mode includes the anchor and cursor characters. <span class="key inline">w</span> lands on the next word’s first character; <span class="key inline">e</span> lands at a word end. <span class="key inline">V</span> keeps a movable cursor and highlights whole paragraphs as motions cross lines. <span class="key inline">o/O</span> swaps endpoints. A plain click clears Visual mode. Escape also cancels an active document read.</div>
          </div>
     </div>
 
@@ -381,6 +388,7 @@
         <h2 class="section-title">Search and g motions</h2>
         <p><span class="key inline">/text</span> + Enter searches forward; <span class="key inline">?text</span> searches backward. Queries are literal, with \c / \C case flags and \n for a paragraph break.</p>
         <p><span class="key inline">n / N</span> repeat; <span class="key inline">* / #</span> search the word under the cursor. Searches wrap. <span class="key inline">d/hi</span> + Enter deletes up to the next “hi”, excluding the match; c/y and counts work too.</p>
+        <p>While typing a search, Up/Down browse this tab’s last 50 queries. Down past the newest restores your draft. A missing pattern keeps your cursor and selection in place.</p>
         <p><span class="key inline">ge / gE</span> move to the previous word/WORD end; <span class="key inline">g_</span> goes to the last nonblank. <span class="key inline">gj / gk</span> use native display lines. <span class="key inline">3gg / 3G</span> go to the third paragraph line.</p>
     </div>
 

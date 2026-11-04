@@ -4,6 +4,14 @@ let searchState = null
 let lastSearch = null
 let searchOverlay = null
 let pendingSearchCount = 1
+const searchHistory = []
+
+function rememberSearch(pattern) {
+    const previous = searchHistory.indexOf(pattern)
+    if (previous >= 0) searchHistory.splice(previous, 1)
+    searchHistory.push(pattern)
+    if (searchHistory.length > 50) searchHistory.shift()
+}
 
 function showSearchLine(text) {
     if (!searchOverlay) {
@@ -29,7 +37,7 @@ function hideSearchLine() {
 }
 
 function startSearch(forward, operator = null, count = 1, returnMode = mode) {
-    searchState = { forward, operator, count, returnMode, query: "" }
+    searchState = { forward, operator, count, returnMode, query: "", historyIndex: searchHistory.length, draft: "" }
     mode = "search"
     showSearchLine(forward ? "/" : "?")
     updateModeIndicator(mode)
@@ -57,8 +65,16 @@ function handleSearchInput(event) {
         hideSearchLine()
         if (!pattern) { pendingRegister = null; switchModeToNormal(); return }
         const wholeWord = !state.query && lastSearch ? lastSearch.wholeWord : false
+        rememberSearch(pattern)
         lastSearch = { pattern, forward: state.forward, wholeWord }
         performSearch(pattern, state.forward, state.count, state.operator, wholeWord, state.returnMode)
+        return
+    }
+    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+        if (state.historyIndex === searchHistory.length) state.draft = state.query
+        state.historyIndex = Math.max(0, Math.min(searchHistory.length, state.historyIndex + (event.key === "ArrowUp" ? -1 : 1)))
+        state.query = state.historyIndex === searchHistory.length ? state.draft : searchHistory[state.historyIndex]
+        showSearchLine((state.forward ? "/" : "?") + state.query)
         return
     }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "v") {
@@ -78,21 +94,55 @@ function handleSearchInput(event) {
     showSearchLine((state.forward ? "/" : "?") + state.query)
 }
 
+async function settleSearchLanding(snapshot, match) {
+    await waitForEditorPaint()
+    if (oracleAbort && oracleAbort.signal.aborted) return
+    const context = renderedContextAtCaret()
+    if (!context) { snapshot.point = cursorDocumentPoint(); return }
+    const wanted = snapshot.text.slice(match.target, match.target + match.length).join("")
+    if (context.text.slice(context.at, context.at + match.length).join("") !== wanted) {
+        const nearby = []
+        for (let delta = -2; delta <= 2; delta++) {
+            const at = context.at + delta
+            if (at >= 0 && context.text.slice(at, at + match.length).join("") === wanted) nearby.push(at)
+        }
+        if (nearby.length === 1) {
+            moveSnapshotCaret(context, nearby[0])
+            await waitForEditorPaint()
+        }
+    }
+    textSnapshot = renderedContextAtCaret()
+}
+
+function revealReadDestination() {
+    const token = viewportRead, caret = getCursorTop()
+    if (!token?.el || !caret) return
+    // Native caret reveal can race the restoration frame. Measure against
+    // the intended viewport, never a transient scroll to a probe endpoint.
+    restoreReadViewport(token)
+    const rect = caret.getBoundingClientRect(), box = token.el.getBoundingClientRect?.()
+    const top = box?.top || 0, bottom = box?.bottom || top + (token.el.clientHeight || window.innerHeight || 600)
+    if (rect.top < top) token.top += rect.top - top
+    else if (rect.bottom > bottom) token.top += rect.bottom - bottom
+    restoreReadViewport(token)
+}
+
 async function performSearch(pattern, forward, count = 1, operator = null, wholeWord = false, returnMode = "normal") {
     if (!beginOracle()) return
     const epoch = scrollIntentRevision
-    try {
+    try { await withViewportPreserved(async () => {
         let snapshot
         if (returnMode === "visual") {
             const model = await completeVisualSnapshot()
             if (!model) return
             snapshot = { text: model.text, at: model.c }
         } else snapshot = await getTextSnapshot(!!operator)
+        if (oracleAbort && oracleAbort.signal.aborted) return
         if (!snapshot) {
             showSearchLine("Search unavailable: could not read document text")
             return
         }
-        let at = DocsKeysVim.cursor(snapshot.text, snapshot.at)
+        let at = returnMode === "visualLine" ? snapshot.at : DocsKeysVim.cursor(snapshot.text, snapshot.at)
         if (pattern === null) {
             const line = DocsKeysVim.line(snapshot.text, at)
             let i = at
@@ -128,11 +178,15 @@ async function performSearch(pattern, forward, count = 1, operator = null, whole
             updateModeIndicator(mode)
           } else {
             moveSnapshotCaret(snapshot, match.target)
-            switchModeToNormal()
+            await settleSearchLanding(snapshot, match)
+            finishFind(returnMode)
           }
         })
         if (match.wrapped) showSearchLine(forward ? "Search wrapped to top" : "Search wrapped to bottom")
         else hideSearchLine()
+        await waitForEditorPaint()
+        if (epoch === scrollIntentRevision) revealReadDestination()
+    }, 500)
     } finally {
         if (operator && mode !== "insert" && mode !== "visual") switchModeToNormal()
         releaseOracle()

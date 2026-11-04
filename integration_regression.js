@@ -8,8 +8,8 @@ function load(file, context) {
 }
 
 // Exercise popup loading, saving, validation, and updates from another popup.
-const inputs = Object.fromEntries(["dvorak", "boxCursor", "modeIndicator", "startInInsert", "wordMotion", "readStrategy"]
-    .map((name) => [name, { type: ["wordMotion", "readStrategy"].includes(name) ? "select-one" : "checkbox" }]))
+const inputs = Object.fromEntries(["dvorak", "boxCursor", "modeIndicator", "startInInsert", "wordMotion", "readStrategy", "cursorColor", "visualVertical"]
+    .map((name) => [name, { type: name === "cursorColor" ? "color" : ["wordMotion", "readStrategy", "visualVertical"].includes(name) ? "select-one" : "checkbox" }]))
 let onChange, onStorage, saved
 const fieldset = { disabled: true, elements: { namedItem: (name) => inputs[name] },
     addEventListener(type, fn) { onChange = fn } }
@@ -28,11 +28,14 @@ assert.equal(fieldset.disabled, false)
 assert.equal(inputs.dvorak.checked, false)
 assert.equal(inputs.boxCursor.checked, true)
 assert.equal(inputs.wordMotion.value, "native")
+assert.equal(inputs.cursorColor.value, "#1a73e8")
+inputs.cursorColor.value = "#ff3300"
 inputs.wordMotion.value = "precise"
 inputs.startInInsert.checked = true
 onChange()
 assert.equal(saved["docskeys-settings"].wordMotion, "precise")
 assert.equal(saved["docskeys-settings"].startInInsert, true)
+assert.equal(saved["docskeys-settings"].cursorColor, "#ff3300")
 assert.match(status.textContent, /Saved/)
 onStorage({ "docskeys-settings": { newValue: { modeIndicator: false } } }, "local")
 assert.equal(inputs.modeIndicator.checked, false)

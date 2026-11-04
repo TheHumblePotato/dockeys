@@ -11,16 +11,14 @@ function handleGPrefix(key) {
     const state = gPrefixState
     gPrefixState = null
     mode = state.returnMode
-    if (mode === "visualLine" && key !== "g") { updateModeIndicator(mode); return }
+    if (mode === "visualLine" && !linewiseState && key !== "g") { updateModeIndicator(mode); return }
     if (key === "e" || key === "E") {
         if (mode === "visual") visualSnapshotWord("ge", key === "E", state.count)
         else snapshotWordMotion("ge", key === "E", state.count, state.operator)
     } else if (key === "g") gotoTextLine(state.count, state.operator, state.returnMode)
     else if (key === "_") lastNonblankMotion(state.count, state.operator, state.returnMode)
     else if (key === "j" || key === "k") {
-        if (mode === "visual") visualNativeMotion(key === "j", () => {
-            repeatMotion(() => nativeVerticalStep(key === "j", true), state.count)
-        })
+        if (mode === "visual") visualNativeVertical(key === "j", state.count)
         else if (!state.operator) repeatMotion(() => nativeVerticalStep(key === "j"), state.count)
     } else {
         pendingRegister = null
@@ -31,7 +29,7 @@ function handleGPrefix(key) {
 }
 
 async function gotoTextLine(count, operator = null, returnMode = mode) {
-    if (returnMode === "visualLine") {
+    if (returnMode === "visualLine" && !linewiseState) {
         if (count === 1) vlGoto(false)
         else if (count === null) vlGoto(true)
         return
@@ -58,7 +56,7 @@ async function gotoTextLine(count, operator = null, returnMode = mode) {
             if (operator !== "y") recordChange(() => gotoTextLine(count, operator))
             await applySnapshotRange(snapshot, { start, end }, operator)
         } else if (returnMode === "visual") visualMoveCursor(target)
-        else { moveSnapshotCaret(snapshot, target); switchModeToNormal() }
+        else { moveSnapshotCaret(snapshot, target); finishFind(returnMode) }
     } finally { releaseOracle() }
 }
 
@@ -78,6 +76,6 @@ async function lastNonblankMotion(count, operator, returnMode) {
             if (operator !== "y") recordChange(() => lastNonblankMotion(count, operator, "normal"))
             await applySnapshotRange(snapshot, { start: Math.min(at, target), end: Math.min(snapshot.text.length, Math.max(at, target) + 1) }, operator)
         } else if (returnMode === "visual") visualMoveCursor(target)
-        else { moveSnapshotCaret(snapshot, target); switchModeToNormal() }
+        else { moveSnapshotCaret(snapshot, target); finishFind(returnMode) }
     } finally { releaseOracle() }
 }

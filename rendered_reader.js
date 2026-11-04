@@ -48,7 +48,7 @@ function renderedRunAtCaret() {
             }
             const error = Math.abs(box.left + widths[at] - rect.left)
             if (error > Math.max(1.5, rect.height * 0.12)) continue
-            const value = { text, at, partial: true, rendered: true,
+            const value = { text, at, partial: true, rendered: true, node,
                 char: text[at], glyphWidth: at < text.length ? widths[at + 1] - widths[at] : null,
                 previousChar: text[at - 1], previousWidth: at > 0 ? widths[at] - widths[at - 1] : null,
                 font, point: cursorDocumentPoint(), revision: textRevision, created: Date.now() }
@@ -60,13 +60,53 @@ function renderedRunAtCaret() {
     return value
 }
 
+// Paragraph roles supply actual logical boundaries. Adjacent annotated runs
+// are concatenated verbatim; only explicit paragraph siblings add a newline.
+// A tile/run boundary by itself never implies a space or a line break.
+function renderedContextAtCaret() {
+    const run = renderedRunAtCaret()
+    if (!run || !run.node || !run.node.closest) return run
+    const paragraph = run.node.closest('[role="paragraph"]')
+    if (!paragraph || !paragraph.parentElement) return run
+    const siblings = Array.from(paragraph.parentElement.children)
+    const center = siblings.indexOf(paragraph)
+    if (center < 0) return run
+    const isParagraph = (node) => node.getAttribute && node.getAttribute("role") === "paragraph"
+    let first = center, last = center
+    while (first > 0 && center - first < 32 && isParagraph(siblings[first - 1])) first--
+    while (last + 1 < siblings.length && last - center < 32 && isParagraph(siblings[last + 1])) last++
+    let at = null
+    const text = []
+    for (let i = first; i <= last; i++) {
+        const nodes = Array.from(siblings[i].querySelectorAll('rect[aria-label]'))
+        if (!nodes.length) return run
+        if (i > first) text.push("\n")
+        let previous = null
+        for (const node of nodes) {
+            const label = node.getAttribute("aria-label")
+            if (label === null || !node.getAttribute("data-font-css") || /[\r\n\u000b\u2028\u2029\p{Script=Arabic}\p{Script=Hebrew}]/u.test(label)) return run
+            if (node.closest('[role="listmarker"], [role="listitem"]') && /^[\s\d.)•◦▪‣⁃●○■□*-]+$/u.test(label)) return run
+            const box = node.getBoundingClientRect()
+            if (previous) {
+                const sameRow = Math.abs(previous.box.top - box.top) < Math.min(previous.box.height, box.height) / 2
+                // A geometric gap can be an omitted space or generated list
+                // marker. Neither is a native arrow step we may invent.
+                if (sameRow && Math.abs(box.left - previous.box.right) > 1.5) return run
+                if (!sameRow && !/\s$/u.test(previous.label) && !/^\s/u.test(label)) return run
+            }
+            if (node === run.node) at = text.length + run.at
+            text.push(...toGraphemes(label))
+            previous = { box, label }
+        }
+    }
+    return at === null ? run : { ...run, text, at, paragraphStart: true }
+}
+
 function renderedWordSnapshot(kind, WORD, count) {
     if (settings.readStrategy === "clipboard") return null
-    const snapshot = renderedRunAtCaret()
+    const snapshot = renderedContextAtCaret()
     if (!snapshot || snapshot.at >= snapshot.text.length) return null
-    const result = DocsKeysVim.word(snapshot.text, snapshot.at, kind, count, WORD)
-    if ((kind === "b" || kind === "ge") ? result.target === 0 : result.boundary >= snapshot.text.length) return null
-    return snapshot
+    return wordSnapshotCovers(snapshot, kind, WORD, count) ? snapshot : null
 }
 
 function rememberCursorText(snapshot) {
@@ -93,6 +133,10 @@ function normalNavigation(key) {
     const context = snapshot || (cursorTextHint && cursorTextHint.revision === textRevision ? cursorTextHint.context : null)
     const before = cursorDocumentPoint()
     if (snapshot && (key === "h" || key === "l")) {
+        const line = DocsKeysVim.line(snapshot.text, snapshot.at)
+        if (key === "h" && snapshot.at === line.start && (line.start > 0 || snapshot.completeStart || snapshot.paragraphStart || !snapshot.partial)) return
+        const last = Math.max(line.start, line.end - (mode === "visualLine" ? 0 : 1))
+        if (key === "l" && snapshot.at >= last && (line.end < snapshot.text.length || snapshot.completeEnd || !snapshot.partial)) return
         const target = snapshot.at + (key === "h" ? -1 : 1)
         if (target >= 0 && target < snapshot.text.length && snapshot.text[target] !== "\n") {
             moveSnapshotCaret(snapshot, target)

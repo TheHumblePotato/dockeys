@@ -30,6 +30,30 @@ DocsKeys drives keyboard events and menu commands. It has no supported Google Do
 
 Live Google Docs testing is still required for paragraph/text extraction, formatting, tables, lists, page boundaries, proportional fonts, zoom, permissions, IME, and collaborating users. Clipboard text and arrow movement may disagree around non-text content. Undo history and trusted-key handling are controlled by Docs.
 
+## Implemented in 1.9
+
+- Word/WORD context can cross explicitly annotated sibling paragraphs without Copy, including Visual mode and Rendered only. Unknown boundaries still require Auto/Clipboard fallback.
+- Fallback windows cross displayed rows using native Up/Down and Home/End. Text probes wait for caret painting and measure after Copy; a failed Copy cannot masquerade as a successful empty snapshot at a document boundary.
+- Entering Visual mode uses bounded context. Full promotions protect the entire collapse/read/reconstruction, including late layout frames; failed promotions restore the original selection.
+- Default Visual `j/k` uses displayed rows with bounded key volume instead of selecting through a paragraph character by character. The Paragraphs setting retains modeled Vim logical-line behavior. Anchor crossing can still require a repair read.
+- Configurable translucent box cursor color, blue by default, applied immediately to open tabs.
+- In-tab search history with Up/Down, draft restoration, duplicate removal, and a 50-query limit; no reads while browsing.
+- Regression coverage for wrapped Visual rows, promotion scroll jumps, fresh no-match searches, delayed caret painting/failed Copy, failed Visual promotion, color repainting, and rendered cross-paragraph words.
+
+## Implemented in 1.10
+
+- Reject ambiguous gaps/generated list-marker runs in combined rendered contexts. Rebind normal word snapshots after the native caret paints; the Chromium fixture reproduces the next-line/bullet `w` one-character error.
+- Linewise highlighting is independent of Docs' selection endpoints. The native caret retains its column, supports horizontal/word/find/search/document motions and counts, and swaps endpoints with `o/O`. Operators realize whole-paragraph ranges on demand; character/linewise conversion preserves the span.
+- Plain mouse clicks leave Visual without a clipboard check; drags keep native charwise ranges. Mouse replacement cancels pending reads without replaying cleanup onto the clicked caret.
+- Search protects the entire read/move/reveal operation and measures against the intended viewport. Missing patterns retain the view; uniquely verified nearby rendered matches can correct native landing discrepancies.
+- Editor ancestors, window scrolling, and late page timers/animation callbacks scheduled by a read participate in scroll/focus guards.
+- Bounded clipboard I/O, abortable reads, prioritized Escape/Ctrl+[, bounded restoration, overflow recovery, and a command watchdog prevent a stalled clipboard promise from permanently capturing input.
+- Expanded Neovim adapter comparisons include linewise cursor positions, selection ranges, word/find/document motions, EOL behavior, endpoint swaps, and operators.
+
+## Complete remaining backlog
+
+The sections below are the current list of unfinished features, known approximations, and integration work. Live verification is part of the backlog, not evidence that a behavior is already correct in Docs.
+
 ## Search follow-ups
 
 | Feature | Current gap / next step |
@@ -37,25 +61,26 @@ Live Google Docs testing is still required for paragraph/text extraction, format
 | Vim regex syntax | Queries are literal. Add a documented parser for magic/nomagic, character classes, groups, alternation, lookarounds, and backreferences; do not silently treat JavaScript regex as Vim regex. |
 | Search options | Add configurable `wrapscan`, `ignorecase`, `smartcase`, and result-limit behavior. `\c/\C` already work per query. |
 | Incremental search / `hlsearch` | Show matching results without changing the document selection or running clipboard reads per keystroke. |
-| Search history and register | Add command history, query navigation, and the `"/` register. Preserve direction and flags when reusing patterns. |
+| Persistent search history and register | In-tab history is implemented. Add persistence, prefix filtering, richer command-line navigation, and the `"/` register; retain direction/flags correctly. |
 | `gn/gN` | Select the current/next match as a text object, including operator counts and no-match behavior. |
 | Search offsets | Implement `/pattern/e`, line/character offsets, and the resulting inclusive/exclusive motion rules. |
 | Large-document navigation | Reduce synthetic arrow-event volume without guessing Docs' word boundaries or losing exact ranges. |
 
 ## Motion and selection follow-ups
 
-- Make logical paragraph lines versus rendered display lines explicit and consistent. Normal `j/k`, linewise `V`, and Home/End remain display based; modeled Visual motions and counted document jumps use paragraph breaks.
+- Unify line semantics across operators, text objects, `gg/G`, `V`, and the configurable Visual vertical modes. Displayed rows and logical paragraph lines are explicit options, but not every command shares the same abstraction.
 - Support all column-preservation cases, tabs, variable-width graphemes, and virtual-column behavior. `gg/G` currently choose a grapheme column, not a tab-expanded screen column.
 - Audit remaining aliases and boundaries: `_` counts, counted `$`, `g^/g0/g$`, `gI`, and native `h/l` at paragraph boundaries. `I` currently uses Home rather than first nonblank.
 - Implement `H/M/L`, counted viewport commands, sentence motions, and reliable blank-line paragraph motions instead of Docs' paragraph shortcuts.
 - Add `%` with bracket nesting and quote/escape handling.
 - Add marks, the jump list, and normal-mode `Ctrl+o/Ctrl+i` with document positions that survive collaborator edits.
-- Preserve the entire span when converting a multiline charwise selection to `V`.
-- Make horizontal/word motions in `V` keep whole lines while moving the logical cursor, instead of ignoring them.
 - Add `gv`, previous-selection restoration, and Visual block mode with rectangle-aware editing.
 - Fully audit repeated `iw/aw/iW/aW` across blank paragraphs and indentation. Same-line cases are covered; cross-paragraph whitespace/object counts still need broader differential tests.
 - Add quoted, paired-delimiter, sentence, and nested block text objects with counted selection.
 - Distinguish mouse selection anchor/focus reliably, including reverse dragging and native selection replacement.
+- Eliminate the remaining clipboard repair on native Visual anchor crossings and the snapshot rebuild when resuming modeled words after native vertical movement.
+- Verify preferred-column retention and EOL/blank-row clamping through short wrapped rows when annotated text is absent or caret painting is delayed.
+- Improve linewise highlighting without annotation geometry, preserve logical paragraph highlighting across virtualized/wrapped pages, and integrate native formatting menus/accessibility selection ranges with the custom highlight.
 
 ## Editing and register follow-ups
 
@@ -75,7 +100,9 @@ Live Google Docs testing is still required for paragraph/text extraction, format
 - Add an opt-in live-browser test fixture against real Docs, with a collaborator session and a disposable test document.
 - Handle Docs SPA navigation and replacement of the input iframe element, not just reloading its document.
 - Improve text revision signals for canvas-only remote edits. Mutation/cursor observation plus a bounded cache age is best effort, not a synchronized buffer.
+- Bind cached positions robustly after asynchronous caret painting, so stale geometry cannot cause unnecessary cache misses or reuse at the wrong native position.
 - Extend rendered-text mapping across adjacent styled runs, ligatures, bidirectional text, tables, and offscreen pages. Preserve exact whitespace and logical line boundaries; never concatenate runs speculatively.
+- Extend context across tile/page boundaries without explicit adjacent paragraph siblings; handle empty annotated paragraphs and detect duplicate or incomplete annotations conservatively.
 - Investigate a supported read path or stable revision/selection signal. The annotation flag and SVG/selectors are private implementation details, and a saved-file API does not expose the live caret.
 - Reduce full-snapshot reads for global search/operators and very large counts; retain clipboard safety and exact Vim boundaries. Do not infer successful extraction solely from a transient caret rectangle.
 - Improve cursor sizing without annotations, especially native wrapped-line vertical movement, ligatures, and bidirectional text; keep cosmetics free of document probes.

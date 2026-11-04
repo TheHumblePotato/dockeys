@@ -6,6 +6,14 @@ let selectionBatchGeneration = 0
 let selectionFreezeLayer = null
 let readPresentationStyle = null
 let selectionFreezeScroll = null
+let readPresentationGeneration = 0
+let readScrollSettling = false
+
+function cancelReadScrollSettlement() {
+    if (!readScrollSettling) return
+    readScrollSettling = false
+    window.dispatchEvent(new CustomEvent("doc-keys-read-phase", { detail: { active: false } }))
+}
 
 function setReadAttribute(name, active) {
     const root = document.documentElement
@@ -84,9 +92,11 @@ function afterSelectionPaint(fn) {
     requestAnimationFrame(() => requestAnimationFrame(finish))
 }
 
-async function withReadPresentation(fn) {
+async function withReadPresentation(fn, settleMs = 80) {
     const outer = readPresentationDepth++ === 0
+    const generation = outer ? ++readPresentationGeneration : readPresentationGeneration
     if (outer) {
+        readScrollSettling = false
         ensureReadStyle()
         freezeVisualSelection()
         setReadAttribute("data-docskeys-reading", true)
@@ -96,9 +106,14 @@ async function withReadPresentation(fn) {
     finally {
         readPresentationDepth--
         if (outer) {
-            window.dispatchEvent(new CustomEvent("doc-keys-read-phase", { detail: { active: false } }))
+            readScrollSettling = true
+            if (typeof requestAnimationFrame === "function") {
+                setTimeout(() => {
+                    if (!readPresentationDepth && generation === readPresentationGeneration) cancelReadScrollSettlement()
+                }, settleMs)
+            } else cancelReadScrollSettlement()
             afterSelectionPaint(() => {
-                if (readPresentationDepth) return
+                if (readPresentationDepth || generation !== readPresentationGeneration) return
                 setReadAttribute("data-docskeys-reading", false)
                 if (!document.documentElement.hasAttribute || !document.documentElement.hasAttribute("data-docskeys-selection-batch")) removeSelectionFreeze()
             })
@@ -111,12 +126,17 @@ function withStableSelection(fn) {
     freezeVisualSelection()
     setReadAttribute("data-docskeys-selection-batch", true)
     const generation = ++selectionBatchGeneration
-    try { return fn() }
-    finally {
+    const finish = () => {
         afterSelectionPaint(() => {
             if (generation !== selectionBatchGeneration) return
             setReadAttribute("data-docskeys-selection-batch", false)
             if (!readPresentationDepth) removeSelectionFreeze()
         })
     }
+    try {
+        const result = fn()
+        if (result && typeof result.then === "function") return result.finally(finish)
+        finish()
+        return result
+    } catch (err) { finish(); throw err }
 }

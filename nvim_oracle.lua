@@ -22,7 +22,13 @@ for _, case in ipairs(cases) do
   local offset = position[2]
   for i = 1, position[1] - 1 do offset = offset + #lines[i] + 1 end
   local selection = vim.NIL
-  if vim.fn.mode():sub(1, 1) == "v" then
+  if vim.fn.mode() == "V" then
+    local anchor_row = vim.fn.getpos("v")[2]
+    local first = math.min(anchor_row, position[1])
+    local last = math.max(anchor_row, position[1])
+    selection = table.concat(vim.api.nvim_buf_get_lines(0, first - 1, last, false), "\n")
+    if last < #lines then selection = selection .. "\n" end
+  elseif vim.fn.mode():sub(1, 1) == "v" then
     vim.cmd.normal({ args = { '"zy' }, bang = true })
     selection = vim.fn.getreg("z")
   end

@@ -37,6 +37,22 @@ Auto combines these paths. Rendered only disables automatic clipboard document p
 
 ## Verification and remaining uncertainty
 
-`npm test` covers the simulated adapter, bounded probes, cleanup on failure, rendered-only behavior, viewport commands, and Neovim differential cases when installed. `npm run test:browser` runs real Chromium DOM/CSS/canvas checks in a disposable local fixture, including masked Copy and proportional cursor widths after movement/find/search.
+### Changes in 1.10
+
+The rendered context builder rejects unexplained geometric gaps, generated list markers, and uncertain wrapped joins. A generated bullet before the next paragraph's text reproduces the one-character second-`w` bug in the Chromium fixture. Normal word movement now waits for caret paint and rebinds its context to the actual rendered caret.
+
+Linewise mode uses a normal native caret and a separate highlight; it does not repeatedly place Docs' focus at the selected line's outer boundary. Supported operators materialize an exact snapshot range. Native formatting/accessibility selection integration and unannotated wrapped highlighting remain limitations.
+
+Search keeps one viewport transaction through its final move and explicit reveal, measuring only after restoring the intended scroll position. The page bridge also guards ancestor/window scrolling and scroll/focus work in timers/animation callbacks scheduled during the read. These callbacks still execute; only their probe-associated viewport effects are suppressed.
+
+Clipboard promises are bounded and active reads are abortable. Escape bypasses queued input. Cancellation keeps selection cleanup/restoration bounded and prevents stale cleanup from moving a newly clicked caret; overflow and a watchdog recover stalled commands.
+
+### Changes in 1.9
+
+The local reader now accepts contiguous explicit paragraph siblings, concatenating their labeled runs verbatim and inserting only semantic paragraph breaks. A run/tile boundary alone still supplies no inferred whitespace. Fallback windows use vertical native movement to cross displayed rows. Probes wait for caret painting before capturing the origin and measure movement after Copy completes; unavailable Copy data is rejected and its temporary selection is collapsed back. A recovery path handles Copy/menu integrations that collapse a selection themselves, returning by the known grapheme count when needed.
+
+Visual mode starts with bounded context. Promotion protects its whole collapse/read/reconstruction, and a failed promotion rebuilds the original selection. Page scroll guards and viewport restoration cover delayed layout frames; newer wheel/touch input, `Ctrl+e/y`, and viewport commands take priority. Default Visual vertical movement uses native displayed rows without a full-document promotion on every `j/k`, waiting for the painted row before resolving selection direction. Logical paragraph movement remains an option.
+
+`npm test` covers the simulated adapter, bounded probes, cleanup on failure, rendered-only behavior, wrapped Visual rows/key volume, promotion viewport safety, delayed caret/Copy failure, viewport commands, and Neovim differential cases when installed. `npm run test:browser` runs real Chromium DOM/CSS/canvas checks in a disposable local fixture, including rendered cross-paragraph words/Visual selections, masked Copy, and proportional cursor widths after movement/find/search.
 
 The fixture does not authenticate with Google Docs. Live Docs validation remains necessary for annotation availability, actual highlight markup, styled/wrapped text, asynchronous native scroll behavior, collaborative edits, and clipboard timing. Annotated runs may cover only rendered pages; full-document context still needs a fallback. Cached text is not a synchronized Docs buffer, and remote canvas-only changes may remain unseen until cache expiry.

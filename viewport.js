@@ -16,6 +16,7 @@ function alignCursorViewport(where) {
     const height = el.clientHeight || (box && box.height) || window.innerHeight || 600
     const target = where === "t" ? top : where === "b" ? top + height - rect.height : top + (height - rect.height) / 2
     viewportEpoch++
+    cancelReadScrollSettlement()
     el.scrollTop += rect.top - target
 }
 

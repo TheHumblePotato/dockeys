@@ -43,6 +43,9 @@ for (const [text, at, keys] of [
     ["a\n", 2, "vd"],
     ["a\n", 2, "vc"],
 ]) adapterCases.push({ text, at, keys, kind: "adapter" })
+for (const keys of ["Vh", "Vl", "Vj", "Vjk", "Vw", "Vww", "V3w", "V0", "V$", "V0h", "V$l", "V$h", "Vfb", "VG", "Vjo", "VwO", "Vjd", "Vc", "Vjy"]) {
+    adapterCases.push({ text: "alpha beta\ngamma delta\nepsilon zeta", at: 2, keys, kind: "adapter" })
+}
 cases.push(...adapterCases)
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "docskeys-oracle-"))
 const input = path.join(temp, "cases.json"), output = path.join(temp, "results.json")
@@ -93,10 +96,16 @@ console.log(`${cases.length - adapterCases.length} word motions/operator ranges 
             for (const char of test.keys) await e.pressRaw(char === "\r" ? "Enter" : char)
             await e.settle()
             const visual = e.get("mode") === "visual"
-            const got = { text: e.sim.text, selection: visual ? e.sim.selText() : null }
+            const linewise = e.get("mode") === "visualLine"
+            const got = { text: e.sim.text, selection: visual || linewise ? e.selectedText() : null }
             // Cursor positions after deletes/changes depend on Docs' insertion
             // caret. Compare logical motion cursors and all resulting ranges.
-            if (!/[dcy]/.test(test.keys)) got.at = visual && e.get("visualModel") ? e.get("visualModel.c") : e.sim.focus
+            // A bounded model uses local indices, so compare the actual
+            // native selection endpoint, accounting for Vim's inclusive end.
+            if (!/[dcy]/.test(test.keys)) {
+                const virtualEOF = visual && e.get("visualModel && visualModel.c === visualModel.text.length")
+                got.at = visual && !virtualEOF && e.get("nativeVisualFocusAfter") ? e.sim.prevB(e.sim.focus) : e.sim.focus
+            }
             const want = { text: oracle.text, selection: oracle.selection }
             if (got.at !== undefined) want.at = oracle.at
             try { assert.deepEqual(got, want) }

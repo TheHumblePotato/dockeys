@@ -88,27 +88,27 @@ async function main() {
     // Cross-line native word motions start on the character, not after it.
     e = makeEnv("x\na b c")
     await e.pressAll("vw")
-    assert.equal(e.sim.selText(), "x\na")
+    assert.equal(e.selectedText(), "x\na")
     await e.press("w")
-    assert.equal(e.sim.selText(), "x\na b")
+    assert.equal(e.selectedText(), "x\na b")
     await e.press("b")
-    assert.equal(e.sim.selText(), "x\na")
+    assert.equal(e.selectedText(), "x\na")
     e = makeEnv("a b\nx")
     e.sim.setCaret(4)
     await e.pressAll("vb")
-    assert.equal(e.sim.selText(), "b\nx")
+    assert.equal(e.selectedText(), "b\nx")
     e = makeEnv("one two\nthree four\nfive six")
     e.sim.setCaret(8)
     await e.pressAll("vbww")
-    assert.equal(e.sim.selText(), "three f")
+    assert.equal(e.selectedText(), "three f")
     await e.pressAll("bb")
-    assert.equal(e.sim.selText(), "two\nt")
+    assert.equal(e.selectedText(), "two\nt")
     await e.press("Escape")
     assert.equal(e.sim.focus, 4)
     e = makeEnv("abcdefgh\nabcdefgh\nabcdefgh")
     e.sim.setCaret(12)
     await e.pressAll("vjjk")
-    assert.equal(e.sim.selText(), "d")
+    assert.equal(e.selectedText(), "d")
 
     // Check linewise movement against an independent line-index reference.
     for (const lines of [["a", "longer line", "z"], ["", "abc", "", "x", ""], ["😀xyz", "q", "longer"]]) {
@@ -124,7 +124,7 @@ async function main() {
                 await e.press(motion)
                 const lo = Math.min(anchor, cursor), hi = Math.max(anchor, cursor)
                 const end = hi + 1 < lines.length ? starts[hi + 1] : text.length
-                assert.equal(e.sim.selText(), text.slice(starts[lo], end), `${JSON.stringify(lines)} anchor=${anchor} cursor=${cursor} motion=${motion}`)
+                assert.equal(e.selectedText(), text.slice(starts[lo], end), `${JSON.stringify(lines)} anchor=${anchor} cursor=${cursor} motion=${motion}`)
             }
         }
     }
@@ -135,14 +135,14 @@ async function main() {
         await e.pressAll("V" + (jump === "g" ? "gg" : jump))
         if (jump === "G") {
             await e.pressAll("kk")
-            assert.equal(e.sim.selText(), "longer line\n")
+            assert.equal(e.selectedText(), "longer line\n")
             await e.press("k")
-            assert.equal(e.sim.selText(), "a\nlonger line\n")
+            assert.equal(e.selectedText(), "a\nlonger line\n")
         } else {
             await e.press("j")
-            assert.equal(e.sim.selText(), "longer line\n")
+            assert.equal(e.selectedText(), "longer line\n")
             await e.press("j")
-            assert.equal(e.sim.selText(), "longer line\nz\n")
+            assert.equal(e.selectedText(), "longer line\nz\n")
         }
     }
 
@@ -150,7 +150,7 @@ async function main() {
     e = makeEnv("aa\nbbb\nc\ndddd\ne")
     await e.press("V")
     await e.press("d", true, { ctrlKey: true })
-    assert.equal(e.sim.selText(), e.sim.text)
+    assert.equal(e.selectedText(), e.sim.text)
     assert.equal(e.get("mode"), "visualLine")
     await e.press("V")
     assert.equal(e.get("mode"), "normal")

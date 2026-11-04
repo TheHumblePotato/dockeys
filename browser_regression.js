@@ -47,7 +47,8 @@ const svg = document.querySelector('svg');
 for (const [row,text] of sim.text.split('\n').entries()) {
  const rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
  for (const [key,value] of Object.entries({x:40,y:40+32*row,width:measure.measureText(text).width,height:24,'aria-label':text,'data-font-css':'20px Arial',fill:'transparent'})) rect.setAttribute(key,value);
- svg.appendChild(rect);
+ const paragraph=document.createElementNS('http://www.w3.org/2000/svg','g');paragraph.setAttribute('role','paragraph');
+ paragraph.appendChild(rect);svg.appendChild(paragraph);
 }
 function updateFixture() {
  const line=sim.lineInfo(sim.focus), row=sim.text.slice(0,sim.focus).split('\n').length-1;
@@ -62,7 +63,10 @@ input.body.style.font='20px Arial'; input.body.contentEditable='true';
 input.body.addEventListener('keydown',event=>{
  sim.key({keyCode:event.keyCode,mods:{control:event.ctrlKey,alt:event.altKey,shift:event.shiftKey,meta:event.metaKey}});
  updateFixture();
- if(window.fixtureScrollAttack) { editor.scrollTop=900; editor.scrollTo(0,950); editor.scroll({top:999}); caret.scrollIntoView(); }
+ if(window.fixtureScrollAttack) {
+  editor.scrollTop=900; editor.scrollTo(0,950); editor.scroll({top:999}); caret.scrollIntoView();
+  setTimeout(()=>{editor.scrollTop=900;editor.scrollTo(0,950);caret.scrollIntoView();window.scrollTo(0,950)},180);
+ }
 });
 for(const item of document.querySelectorAll('.goog-menuitem')) item.addEventListener('click',()=>sim.menu(item.textContent));
 Object.defineProperty(navigator,'clipboard',{configurable:true,value:{readText:async()=>sim.clipboard,writeText:async text=>{sim.clipboard=text}}});
@@ -91,10 +95,37 @@ ${source}
   assert(sim.copyCalls===0,'local navigation/find should not copy');
   settings.readStrategy='rendered';reset();handleKeyEventNormal('w');await settle();
   const boundary=sim.focus;handleKeyEventNormal('w');await settle();
-  assert(boundary===3&&sim.focus===3&&sim.copyCalls===0,'rendered-only mode probed beyond available text');
+  assert(boundary===3&&sim.focus===6&&sim.copyCalls===0,'rendered-only words did not cross an explicit paragraph boundary');
+  handleKeyEventNormal('b');await settle();assert(sim.focus===3&&sim.copyCalls===0,'rendered-only b did not cross back');
+  handleKeyEventNormal('w');await settle();handleKeyEventNormal('w');await settle();handleKeyEventNormal('w');await settle();
+  assert(sim.focus===11&&sim.copyCalls===0,'rendered-only mode probed beyond known paragraphs');
+  reset();handleKeyEventNormal('v');await settle();handleKeyEventVisualLine('w');await settle();handleKeyEventVisualLine('w');await settle();
+  assert(sim.selText()==='Wi mi\ni'&&sim.copyCalls===0,'rendered Visual words failed across paragraphs');
+  handleKeyEventVisualLine('b');await settle();assert(sim.selText()==='Wi m','rendered Visual b failed across paragraphs');
+  handleKey({key:'Escape',preventDefault(){},stopImmediatePropagation(){}});
+  reset();handleKeyEventNormal('v');await settle();const verticalCopies=sim.copyCalls;
+  handleKeyEventVisualLine('j');await settle();renderOverlay();
+  assert(sim.selText()==='Wi mi\ni'&&width()<wide/2,'Visual j did not move to the next displayed row/glyph');
+  handleKeyEventVisualLine('k');await settle();renderOverlay();
+  assert(sim.selText()==='W'&&sim.copyCalls===verticalCopies,'Visual j/k read or rebuilt the selection');
+  const oldColor=cursorBoxOverlay.style.backgroundColor;settings.cursorColor='#e91e63';renderOverlay();
+  assert(cursorBoxOverlay.style.backgroundColor!==oldColor,'stationary cursor color did not update');
+  handleKey({key:'Escape',preventDefault(){},stopImmediatePropagation(){}});
   settings.readStrategy='auto';
   reset();await performSearch('WWW',true);await settle();renderOverlay();
   assert(sim.focus===11&&width()>narrow*2,'search target glyph width');
+  const marker=document.createElementNS('http://www.w3.org/2000/svg','rect');
+  for(const [key,value] of Object.entries({x:20,y:72,width:10,height:24,'aria-label':'•','data-font-css':'20px Arial',fill:'transparent'})) marker.setAttribute(key,value);
+  svg.children[1].insertBefore(marker,svg.children[1].firstChild);
+  reset();handleKeyEventNormal('w');await settle();handleKeyEventNormal('w');await settle();
+  assert(sim.focus===6,'w did not land at the first text character after the bullet');
+  handleKeyEventNormal('w');await settle();assert(sim.focus===11,'w after crossing a bulleted paragraph moved one character');
+  marker.remove();invalidateRenderedReader();
+  reset();handleKeyEventNormal('V');await settle();renderOverlay();
+  assert(sim.focus===0&&!sim.hasSel()&&document.querySelector('.docskeys-linewise-highlight').style.display==='block','V captured the native caret');
+  handleKeyEventVisualLine('j');renderOverlay();assert(sim.focus===6&&!sim.hasSel(),'Vj did not move the real caret one row');
+  handleKeyEventVisualLine('w');await settle();assert(sim.focus===11&&mode==='visualLine','Vw failed to move the linewise cursor');
+  handleKey({key:'Escape',preventDefault(){},stopImmediatePropagation(){}});
   reset();nativeScrollTop.call(editor,500);window.fixtureScrollAttack=true;
   await withViewportPreserved(async()=>{
    goToDocEnd(true);
@@ -108,8 +139,9 @@ ${source}
    assert(sim.clipboard===sim.text,'masked selection cannot be copied');
    sendKeyEvent('left');
   });
-  window.fixtureScrollAttack=false;await delay(80);
+  window.fixtureScrollAttack=false;await delay(250);
   assert(!document.documentElement.hasAttribute('data-docskeys-reading'),'read mask leaked');
+  assert(editor.scrollTop===500,'late probe layout scrolled after read completion');
   nativeScrollTop.call(editor,0);reset();handleKeyEventNormal('v');await settle();await delay(80);
   assert(visualModel&&visualModel.partial,'v did not use a read-only rendered snapshot');
   withStableSelection(()=>{sendKeyEvent('right');sendKeyEvent('right',{shift:true})});
@@ -123,6 +155,16 @@ ${source}
   document.querySelector('#paper').appendChild(tile);highlight.appendChild(document.createElement('span'));
   await delay(20);tile.remove();await delay(20);
   assert(visualModel===modelBeforeRedraw&&sim.copyCalls===copiesBeforeRedraw,'tile/selection redraw invalidated Visual state');
+  handleKey({key:'Escape',preventDefault(){},stopImmediatePropagation(){}});
+  settings.readStrategy='clipboard';reset();
+  const readClipboard=navigator.clipboard.readText;
+  navigator.clipboard.readText=()=>new Promise(()=>{});
+  handleKeyEventNormal('w');await delay(20);assert(oracleBusy,'fixture did not stall the clipboard request');
+  eventHandler({key:'Escape',isTrusted:true,preventDefault(){},stopImmediatePropagation(){}});
+  await settle();
+  assert(mode==='normal'&&!oracleBusy&&!document.documentElement.hasAttribute('data-docskeys-reading'),'Escape did not restore browser input/masks');
+  navigator.clipboard.readText=readClipboard;
+  handleKeyEventNormal('j');assert(sim.focus===6,'native input remained locked after cancellation');
   document.querySelector('#docskeys-test-result').textContent='PASS real browser: rendered glyph sizing, no-copy local navigation/find, masked Copy, scroll lock, stable visual selection';
  }catch(error){document.querySelector('#docskeys-test-result').textContent='FAIL '+error.stack}
 })();

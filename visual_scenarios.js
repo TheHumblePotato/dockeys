@@ -6,18 +6,18 @@ async function fresh(text, off) { const e = makeEnv(text); e.sim.setCaret(off); 
 ;(async () => {
   let e
   e = await fresh(T, 9 + 3); await e.press("v"); await e.press("k")
-  eq("v k", e.sim.selText(), T.slice(3, 13)); eq("v k mode/model", [e.get("mode"), e.get("!!visualModel")], ["visual", true])
+  eq("v k", e.selectedText(), T.slice(3, 13)); eq("v k stays visual", e.get("mode"), "visual")
   await e.press("d"); await e.sleep(20); eq("v k d", e.sim.text, T.slice(0, 3) + T.slice(13))
   e = await fresh(T, 9 + 3); await e.press("v"); await e.press("j")
-  eq("v j", e.sim.selText(), T.slice(12, 18 + 3 + 1))
+  eq("v j", e.selectedText(), T.slice(12, 18 + 3 + 1))
   e = await fresh(T, 9 + 3); await e.pressAll("vllk")
-  eq("v l l k", e.sim.selText(), T.slice(5, 13))
+  eq("v l l k", e.selectedText(), T.slice(5, 13))
   e = await fresh(T, 9 + 3); await e.pressAll("vhj")
-  eq("v h j", e.sim.selText(), T.slice(9 + 3, 18 + 2 + 1))
+  eq("v h j", e.selectedText(), T.slice(9 + 3, 18 + 2 + 1))
   e = await fresh(T, 9 + 3); await e.pressAll("vhk")
-  eq("v h k", e.sim.selText(), T.slice(2, 13))
+  eq("v h k", e.selectedText(), T.slice(2, 13))
   e = await fresh(T, 9 + 3); await e.pressAll("vjjk"); await e.sleep(200)
-  console.log("     (v j j k, native after crossing) sel =", JSON.stringify(e.sim.selText()), "mode", e.get("mode"))
+  console.log("     (v j j k, native after crossing) sel =", JSON.stringify(e.selectedText()), "mode", e.get("mode"))
 
   // Esc caret placement
   e = await fresh(T, 9 + 3); await e.pressAll("vll"); await e.press("Escape")
@@ -32,12 +32,12 @@ async function fresh(text, off) { const e = makeEnv(text); e.sim.setCaret(off); 
   eq("v l l y", [e.sim.clipboard, e.sim.focus, e.sim.hasSel(), e.get("mode")], ["def", 12, false, "normal"])
 
   // counts
-  e = await fresh(T, 9 + 1); await e.pressAll("v3l"); eq("v 3l", [e.sim.selText(), e.get("mode")], [T.slice(10, 14), "visual"])
-  e = await fresh("aa bb cc dd ee ff", 0); await e.pressAll("v2w"); eq("v 2w", [e.sim.selText(), e.get("mode")], ["aa bb c", "visual"])
-  e = await fresh("a-b-c-d-e", 0); await e.press("v"); await e.press("3"); await e.press("f"); await e.pressRaw("-"); eq("v 3f-", e.sim.selText(), "a-b-c-")
+  e = await fresh(T, 9 + 1); await e.pressAll("v3l"); eq("v 3l", [e.selectedText(), e.get("mode")], [T.slice(10, 14), "visual"])
+  e = await fresh("aa bb cc dd ee ff", 0); await e.pressAll("v2w"); eq("v 2w", [e.selectedText(), e.get("mode")], ["aa bb c", "visual"])
+  e = await fresh("a-b-c-d-e", 0); await e.press("v"); await e.press("3"); await e.press("f"); await e.pressRaw("-"); eq("v 3f-", e.selectedText(), "a-b-c-")
 
   // Esc cancelling pending f keeps visual
-  e = await fresh(T, 9 + 3); await e.pressAll("vf"); await e.press("Escape"); eq("v f Esc stays visual", [e.get("mode"), e.sim.selText()], ["visual", "d"])
+  e = await fresh(T, 9 + 3); await e.pressAll("vf"); await e.press("Escape"); eq("v f Esc stays visual", [e.get("mode"), e.selectedText()], ["visual", "d"])
   // invalid text object key keeps charwise visual
   e = await fresh(T, 9 + 3); await e.pressAll("vix"); eq("v i x -> visual", e.get("mode"), "visual")
 
@@ -53,11 +53,11 @@ async function fresh(text, off) { const e = makeEnv(text); e.sim.setCaret(off); 
   eq("f at EOL no garbage move", e.sim.focus, 11)
 
   // v at EOL / line start / empty line / word-end fallback
-  e = await fresh("hello\nworld", 5); await e.press("v"); eq("v at EOL selects last char", [e.sim.selText(), e.get("visualModel").a], ["o", 4])
-  e = await fresh("hello\nworld", 0); e.sim.clipboard = "JUNK"; await e.press("v"); await e.sleep(30); eq("v at line start", [e.sim.selText(), e.sim.clipboard], ["h", "JUNK"])
-  e = await fresh("a\n\nb", 2); await e.press("v"); await e.sleep(50); eq("v on empty line keeps the full model", [e.get("mode"), e.get("!!visualModel"), e.sim.selText()], ["visual", true, "\n"])
+  e = await fresh("hello\nworld", 5); await e.press("v"); eq("v at EOL selects last char", [e.selectedText(), e.get("visualModel").a], ["o", 4])
+  e = await fresh("hello\nworld", 0); e.sim.clipboard = "JUNK"; await e.press("v"); await e.sleep(30); eq("v at line start", [e.selectedText(), e.sim.clipboard], ["h", "JUNK"])
+  e = await fresh("a\n\nb", 2); await e.press("v"); await e.sleep(50); eq("v on empty line keeps the full model", [e.get("mode"), e.get("!!visualModel"), e.selectedText()], ["visual", true, "\n"])
   e = await fresh("one two\nthree four", 4); await e.press("v"); await e.press("w"); await e.sleep(10)
-  console.log("     v w on last word (native fallback): sel", JSON.stringify(e.sim.selText()), "model", e.get("visualModel"))
+  console.log("     v w on last word (native fallback): sel", JSON.stringify(e.selectedText()), "model", e.get("visualModel"))
   await e.press("h"); eq("h after fallback still visual", e.get("mode"), "visual")
 
   // V mode: no reads

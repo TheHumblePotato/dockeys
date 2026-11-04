@@ -59,12 +59,29 @@ window.addEventListener("doc-keys-simulate-keypress", (event) => {
 ;(() => {
     if (typeof Element !== "function" || typeof HTMLElement !== "function") return
     let blockedUntil = 0
+    let readCallbackDepth = 0
     window.addEventListener("doc-keys-read-phase", (event) => {
         blockedUntil = event.detail && event.detail.active ? Date.now() + 4000 : 0
     })
-    const active = () => Date.now() < blockedUntil
+    const active = () => Date.now() < blockedUntil || readCallbackDepth > 0
+    // A Docs callback scheduled by a probe may reveal its old selection long
+    // after the read finished. Keep that callback's scroll/focus suppressed;
+    // unrelated later input uses the original viewport methods normally.
+    for (const name of ["setTimeout", "requestAnimationFrame"]) {
+        const original = window[name]
+        if (typeof original !== "function") continue
+        window[name] = function(callback, ...args) {
+            if (typeof callback !== "function" || Date.now() >= blockedUntil) return original.call(this, callback, ...args)
+            return original.call(this, function(...values) {
+                readCallbackDepth++
+                try { return callback.apply(this, values) }
+                finally { readCallbackDepth-- }
+            }, ...args)
+        }
+    }
     const editorNode = (node) => node === document.scrollingElement ||
-        !!(node && node.closest && node.closest(".kix-appview-editor, .kix-appview-editor-container, .docs-texteventtarget-iframe"))
+        !!(node && node.closest && node.closest(".kix-appview-editor, .kix-appview-editor-container, .docs-texteventtarget-iframe")) ||
+        !!(node && node.contains && document.querySelector(".kix-appview-editor") && node.contains(document.querySelector(".kix-appview-editor")))
     for (const name of ["scrollTop", "scrollLeft"]) {
         const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, name)
         if (!descriptor || !descriptor.configurable || !descriptor.set) continue
@@ -78,6 +95,11 @@ window.addEventListener("doc-keys-simulate-keypress", (event) => {
         Element.prototype[name] = function(...args) {
             if (!active() || !editorNode(this)) return original.apply(this, args)
         }
+    }
+    for (const name of ["scroll", "scrollTo", "scrollBy"]) {
+        const original = window[name]
+        if (typeof original !== "function") continue
+        window[name] = function(...args) { if (!active()) return original.apply(this, args) }
     }
     const guardedFocus = new WeakSet()
     function protectFocus(prototype) {

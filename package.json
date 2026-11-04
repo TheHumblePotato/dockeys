@@ -1,6 +1,6 @@
 {
   "name": "docskeys",
-  "version": "1.8.0",
+  "version": "1.10.0",
   "private": true,
   "description": "Vim-style keyboard shortcuts for Google Docs",
   "scripts": {

@@ -101,7 +101,6 @@ function getCursorBoxOverlay() {
     return cursorBoxOverlay
 }
 
-const CURSOR_BOX_COLOR = "rgba(0, 0, 0, 0.25)"
 const CURSOR_UNDERLINE_HEIGHT_PX = 3
 
 // Font info comes from the docs-texteventtarget-iframe's contenteditable
@@ -192,6 +191,7 @@ function restoreNativeCursor() {
 // While the native caret is in the "off" phase of its blink (display:none ->
 // zero-height rect) the last geometry is simply kept instead of hiding.
 function renderOverlay() {
+    renderLinewiseSelection()
     updateSelectionFreezePosition()
     if (readPresentationDepth) return null // do not follow a probe's temporary caret
     const shape = overlayShapeWanted
@@ -227,8 +227,9 @@ function renderOverlay() {
     const model = mode === "visual" ? visualModel : null
     const glyph = cursorGlyphInfo()
     if (glyph && glyph.font) fontInfo = { ...fontInfo, fontCSS: glyph.font }
-    const char = model ? model.text[model.c] : glyph && glyph.char
-    const exactWidth = glyph && (model && model.dF > model.c && glyph.previousChar === char ? glyph.previousWidth : glyph.char === char ? glyph.width : null)
+    const afterNativeChar = mode === "visual" && !model && nativeVisualFocusAfter
+    const char = model ? model.text[model.c] : glyph && (afterNativeChar ? glyph.previousChar : glyph.char)
+    const exactWidth = glyph && ((model && model.dF > model.c || afterNativeChar) && glyph.previousChar === char ? glyph.previousWidth : glyph.char === char ? glyph.width : null)
     const width = exactWidth || measureCharWidth(fontInfo, char || "0") * zoom
     if (!width) return null
     let left = rect.left, top = rect.top, bottom = rect.bottom
@@ -241,11 +242,11 @@ function renderOverlay() {
             top = cursorPoint.y - ((scroller && scroller.scrollTop) || 0)
             bottom = top + rect.height
         } else left -= width
-    }
+    } else if (afterNativeChar) left -= width
     const overlay = getCursorBoxOverlay()
-    const key = `${shape}|${left}|${top}|${rect.height}|${bottom}|${width}`
+    const key = `${shape}|${left}|${top}|${rect.height}|${bottom}|${width}|${settings.cursorColor}`
     if (key !== lastOverlayKey) {
-        overlay.style.backgroundColor = CURSOR_BOX_COLOR
+        overlay.style.backgroundColor = settings.cursorColor + "80"
         overlay.style.left = `${left}px`
         overlay.style.width = `${width}px`
         if (shape === "underline") {
@@ -431,7 +432,10 @@ function paragraphMods(shift = false) {
 }
 
 function sendKeyEvent(key, mods = {}) {
-    if (!viewportRead) viewportEpoch++
+    if (!viewportRead) {
+        viewportEpoch++
+        cancelReadScrollSettlement()
+    }
     if (["delete", "backspace", "enter", "space"].includes(key) ||
         (!viewportRead && !managedTextMotion && mode !== "visual")) invalidateTextSnapshot()
     const keyCode = keyCodes[key]
@@ -576,7 +580,7 @@ function visualRealizeDocs(tA, tF) {
 
 function visualSetSelection(a, c) {
     const m = visualModel
-    const last = m.fullDocument ? m.text.length : m.text.length - 1
+    const last = m.fullDocument || m.completeEnd ? m.text.length : m.text.length - 1
     a = Math.max(0, Math.min(last, a))
     c = Math.max(0, Math.min(last, c))
     const { tA, tF } = visualDocsFor(a, c)
@@ -619,32 +623,33 @@ let visualAnchorPoint = null
 function prepareNativeVisualMotion(forward) {
     const m = visualModel
     if (m) {
-        visualRealizeDocs(m.a, m.a)
-        visualAnchorPoint = cursorDocumentPoint()
-        visualRealizeDocs(forward ? m.a : m.a + 1, m.c)
-        nativeVisualAnchorAfter = !forward
+        // Keep the existing anchor. Walking back to it and rebuilding a long
+        // selection for each j/k used hundreds of synthetic character events.
+        visualAnchorPoint = m.boundaries && m.boundaries.get(m.a) || visualAnchorPoint
+        nativeVisualAnchorAfter = m.c < m.a
+        nativeVisualFocusAfter = m.c >= m.a
+        if (m.dF > m.c) sendKeyEvent("left", { shift: true })
         visualModel = null
     } else if (nativeVisualFocusAfter) {
         sendKeyEvent("left", { shift: true })
     }
 }
 
-function finishNativeVisualMotion(direction) {
+function finishNativeVisualMotion(direction, ownGuard = true) {
     const relation = comparePoints(cursorDocumentPoint(), visualAnchorPoint)
     const forward = relation === null ? direction : relation === 0 ? !nativeVisualAnchorAfter : relation > 0
     if (nativeVisualAnchorAfter === forward) {
         // The cursor crossed its anchor. Rebuild from the selected grapheme
         // count to move Docs' anchor by one character. This read happens only
         // on a crossing, never for ordinary word jumps or cosmetic rendering.
-        repairNativeVisualAnchor(forward)
-        return
+        return repairNativeVisualAnchor(forward, ownGuard)
     }
     if (forward) sendKeyEvent("right", { shift: true })
     nativeVisualFocusAfter = forward
 }
 
-async function repairNativeVisualAnchor(forward) {
-    if (!beginOracle()) return
+async function repairNativeVisualAnchor(forward, ownGuard = true) {
+    if (ownGuard && !beginOracle()) return
     try {
         const selected = await withClipboardSaved((previous) => copySelectionForOracle(previous))
         if (selected === null) return
@@ -660,28 +665,60 @@ async function repairNativeVisualAnchor(forward) {
         nativeVisualAnchorAfter = !forward
         nativeVisualFocusAfter = forward
     } finally {
-        releaseOracle()
+        if (ownGuard) releaseOracle()
     }
 }
 
 function visualNativeMotion(forward, nativeFn) {
-    prepareNativeVisualMotion(forward)
-    nativeFn()
-    finishNativeVisualMotion(forward)
+    withStableSelection(() => {
+        prepareNativeVisualMotion(forward)
+        nativeFn()
+        finishNativeVisualMotion(forward)
+    })
 }
 
-function nativeVerticalStep(down, shift = false) {
+let nativeVisualGoalX = null
+async function visualNativeVertical(down, count = 1) {
+    if (!beginOracle()) return
+    try {
+        await withStableSelection(async () => {
+            prepareNativeVisualMotion(down)
+            await waitForEditorPaint()
+            if (oracleAbort && oracleAbort.signal.aborted) return
+            const point = cursorDocumentPoint()
+            if (nativeVisualGoalX === null && point) nativeVisualGoalX = point.x
+            repeatMotion(() => nativeVerticalStep(down, true, nativeVisualGoalX), count)
+            await waitForEditorPaint()
+            if (oracleAbort && oracleAbort.signal.aborted) return
+            const run = renderedRunAtCaret()
+            if (run && run.text.length && run.at === run.text.length) {
+                sendKeyEvent("left", { shift: true })
+                await waitForEditorPaint()
+            }
+            await finishNativeVisualMotion(down, false)
+        })
+    } finally { releaseOracle(); refreshCursorOverlayForCurrentMode() }
+}
+
+function nativeVerticalStep(down, shift = false, goalX = null) {
     const before = cursorDocumentPoint()
     sendKeyEvent(down ? "down" : "up", { shift })
     let after = cursorDocumentPoint()
     // Docs moves to EOL/column zero when Up/Down hits a document boundary.
     // Vim keeps the cursor in its column on that line instead.
-    if (!before || !after || Math.abs(before.y - after.y) > 1) return
-    for (let i = 0; i < 2000 && Math.abs(before.x - after.x) > 1; i++) {
-        const key = before.x < after.x ? "left" : "right"
+    if (!before || !after) return
+    const sameRow = Math.abs(before.y - after.y) <= 1
+    if (!sameRow && goalX === null) return
+    const targetX = sameRow ? before.x : goalX
+    for (let i = 0; i < 512 && Math.abs(targetX - after.x) > 1; i++) {
+        const key = targetX < after.x ? "left" : "right"
         sendKeyEvent(key, { shift })
         const next = cursorDocumentPoint()
         if (!next || comparePoints(next, after) === 0) break
+        if (Math.abs(next.y - after.y) > 1 || Math.abs(next.x - targetX) >= Math.abs(after.x - targetX)) {
+            sendKeyEvent(key === "left" ? "right" : "left", { shift })
+            break
+        }
         after = next
     }
 }
@@ -779,249 +816,38 @@ function switchModeToVisual() {
     startVisualSelection()
 }
 
-// Reads the line once -- BEFORE any selection exists, so the read is exact --
-// then creates the one-character selection and initialises the model. Runs
-// under the oracle guard, so keys typed while it's in flight are queued and
-// replayed in order afterwards. If the read fails (or the line is empty, or
-// its text isn't a single plain line) it degrades to the old native
-// behavior: a one-character shift+Right selection and no model.
+// Prefer annotated context, otherwise start with a bounded window. Keep both
+// the probe and the final selection inside the same viewport transaction.
 async function startVisualSelection() {
     if (!beginOracle()) return
     try {
-        const rendered = settings.readStrategy !== "clipboard" ? renderedRunAtCaret() : null
-        const snapshot = rendered && rendered.char ? rendered : await getTextSnapshot()
-        if (mode !== "visual") return
-        if (!snapshot) {
-            sendKeyEvent("right", { shift: true })
-            return
-        }
-        const at = DocsKeysVim.cursor(snapshot.text, snapshot.at)
-        moveSnapshotCaret(snapshot, at)
-        visualModel = { text: snapshot.text, a: at, c: at, dA: at, dF: at,
-            fullDocument: !snapshot.partial, partial: !!snapshot.partial }
-        visualSetSelection(at, at)
+        await withViewportPreserved(async () => {
+            nativeVisualGoalX = null
+            const rendered = settings.readStrategy !== "clipboard" ? renderedContextAtCaret() : null
+            const snapshot = rendered && rendered.char ? rendered : await getWordSnapshot("b")
+            if (mode !== "visual") return
+            if (!snapshot) {
+                sendKeyEvent("right", { shift: true })
+                return
+            }
+            const at = DocsKeysVim.cursor(snapshot.text, snapshot.at)
+            moveSnapshotCaret(snapshot, at)
+            visualModel = { text: snapshot.text, a: at, c: at, dA: at, dF: at,
+                fullDocument: !snapshot.partial, partial: !!snapshot.partial, paragraphStart: !!snapshot.paragraphStart,
+                completeStart: !!snapshot.completeStart, completeEnd: !!snapshot.completeEnd }
+            visualSetSelection(at, at)
+        })
     } finally {
         releaseOracle()
         refreshCursorOverlayForCurrentMode()
     }
 }
 
-// --- Visual line mode -------------------------------------------------------
-// Forward: anchor at the anchor-line start, focus after the cursor line.
-// Backward: anchor after the anchor line, focus at the cursor-line start.
-// Boundary steps keep entire display lines selected without sticky columns.
-// Rows are unknown after absolute/paragraph jumps; saved anchor coordinates
-// detect when shrinking reaches the anchor again. A final empty line needs
-// separate state because including it adds no selection characters.
-let visualLineOrient = "fwd"   // "fwd" | "bwd"
-let visualLineRows = 1
-let visualLineEmptyEndIncluded = false
-let visualLineAnchorEmpty = false
-let visualLineAnchorStart = null
-let visualLineAnchorEnd = null
-
-function switchModeToVisualLine() {
-    mode = 'visualLine'
-    visualModel = null
-    visualLineOrient = "fwd"
-    visualLineRows = 1
-    visualLineEmptyEndIncluded = false
-    visualLineAnchorEmpty = false
-    updateModeIndicator(mode)
-    sendKeyEvent('home')
-    visualLineAnchorStart = cursorDocumentPoint()
-    vlStepBoundary(true)
-    visualLineAnchorEnd = cursorDocumentPoint()
-    visualLineAnchorEmpty = visualLineEmptyEndIncluded
-}
-
-// End+Right selects through a line break, but also works on the final line.
-// Left+Home moves to the previous boundary without a sticky goal column.
-// Up/Down alone clip to short lines and can leave a partial line selected.
-function vlStepBoundary(forward, shift = true) {
-    if (!forward && shift && visualLineOrient === "fwd" && visualLineEmptyEndIncluded) {
-        visualLineEmptyEndIncluded = false
-        return true // the final empty line occupies no selection characters
-    }
-    const before = cursorPositionKey(getCursorTop())
-    if (forward) {
-        sendKeyEvent("end", { shift })
-        sendKeyEvent("right", { shift })
-    } else {
-        sendKeyEvent("left", { shift })
-        sendKeyEvent("home", { shift })
-    }
-    const after = cursorPositionKey(getCursorTop())
-    if (before === null || after === null || before !== after) return true
-    if (forward && shift && !visualLineEmptyEndIncluded) {
-        sendKeyEvent("home", { shift: true })
-        const atStart = cursorPositionKey(getCursorTop())
-        sendKeyEvent("end", { shift: true })
-        if (atStart === after) {
-            visualLineEmptyEndIncluded = true
-            return true
-        }
-    }
-    return false
-}
-
-// Forward selection -> backward one anchored after the anchor line. Ends with
-// an empty selection whose caret is at that anchor boundary. (Left collapses
-// to the selection's start = start of the anchor line; Down = start of the
-// next line, or the document end for the last line.)
-function vlPrepBwd() {
-    if (!(visualLineAnchorEmpty && visualLineRows === 1)) sendKeyEvent("left")
-    sendKeyEvent("end")
-    sendKeyEvent("right")
-    visualLineEmptyEndIncluded = false
-}
-
-// Backward selection -> forward one anchored at the start of the anchor line.
-// Right collapses to the selection's end (the boundary after the anchor line);
-// Left steps back into the anchor line; Home goes to its start. Ends with an
-// empty selection whose caret is at the start of the anchor line.
-function vlPrepFwd() {
-    sendKeyEvent("right")
-    if (!visualLineAnchorEmpty) {
-        sendKeyEvent("left")
-        sendKeyEvent("home")
-    }
-    visualLineEmptyEndIncluded = false
-}
-
-function vlMoveVertical(delta) {
-    const down = delta > 0
-    const steps = Math.abs(delta)
-    const extending = (visualLineOrient === "fwd") === down
-    if (extending) {
-        for (let i = 0; i < steps; i++) {
-            if (!vlStepBoundary(down)) break
-            if (visualLineRows !== null) visualLineRows++
-        }
-        return
-    }
-    if (visualLineRows === null) {
-        const anchor = visualLineOrient === "fwd" ? visualLineAnchorEnd : visualLineAnchorStart
-        if (!anchor || !cursorDocumentPoint()) return
-        for (let i = 0; i < steps; i++) {
-            if (comparePoints(cursorDocumentPoint(), anchor) === 0) {
-                visualLineRows = 1
-                vlMoveVertical(down ? steps - i : i - steps)
-                return
-            }
-            if (!vlStepBoundary(down)) return
-        }
-        return
-    }
-    const rows = visualLineRows === null ? Infinity : visualLineRows
-    if (steps < rows) {
-        // Shrinking towards the anchor line; the anchor line stays selected.
-        repeatMotion(() => vlStepBoundary(down), steps)
-        if (visualLineRows !== null) visualLineRows -= steps
-        return
-    }
-    // Moving past the anchor line: flip sides. The anchor line plus
-    // (steps - rows + 1) lines on the far side end up selected.
-    const newRows = steps - rows + 2
-    if (visualLineOrient === "fwd") {
-        vlPrepBwd()
-        visualLineOrient = "bwd"
-    } else {
-        vlPrepFwd()
-        visualLineOrient = "fwd"
-    }
-    let movedRows = visualLineOrient === "bwd" && visualLineAnchorEmpty ? 1 : 0
-    for (let i = movedRows; i < newRows; i++) {
-        if (!vlStepBoundary(down)) break
-        movedRows++
-    }
-    visualLineRows = Math.max(1, movedRows)
-}
-
-function vlGoto(toEnd) {
-    if (toEnd) {
-        if (visualLineOrient === "bwd") { vlPrepFwd(); visualLineOrient = "fwd" }
-        goToDocEnd(true)
-        // G includes an empty final line even though it adds no characters.
-        sendKeyEvent("home", { shift: true })
-        const endStart = cursorDocumentPoint()
-        sendKeyEvent("end", { shift: true })
-        visualLineEmptyEndIncluded = comparePoints(endStart, cursorDocumentPoint()) === 0
-    } else {
-        if (visualLineOrient === "fwd") { vlPrepBwd(); visualLineOrient = "bwd" }
-        goToDocStart(true)
-    }
-    visualLineRows = null
-}
-
-// Paragraph jumps only in the orientation they can't cross the anchor in.
-function vlParagraph(forward) {
-    if (forward && visualLineOrient === "fwd") {
-        goToEndOfPara(true)
-        sendKeyEvent("end", { shift: true })
-        sendKeyEvent("right", { shift: true })
-        visualLineRows = null
-    } else if (!forward && visualLineOrient === "bwd") {
-        goToStartOfPara(true)
-        sendKeyEvent("home", { shift: true })
-        visualLineRows = null
-    }
-}
-
-function handleKeyEventVisualLineMode(key) {
-    switch (key) {
-        case "v":
-            mode = "visual"
-            nativeVisualFocusAfter = visualLineOrient === "fwd"
-            nativeVisualAnchorAfter = !nativeVisualFocusAfter
-            visualAnchorPoint = visualLineAnchorStart
-            updateModeIndicator(mode)
-            break
-        case "V":
-            sendKeyEvent("left")
-            mode = "normal"
-            switchModeToNormal()
-            break
-        case "j": vlMoveVertical(1); break
-        case "k": vlMoveVertical(-1); break
-        case "G": vlGoto(true); break
-        case "g": startGPrefix(1, null, "visualLine"); break
-        case "}": vlParagraph(true); break
-        case "{": vlParagraph(false); break
-        case "\"":
-            switchModeToWaitForRegister()
-            break
-        case "p": {
-            const reg = pendingRegister
-            pendingRegister = null
-            mode = "normal" // see the charwise `p` below
-            pasteRegister(reg)
-            switchModeToNormal()
-            break
-        }
-        case "c":
-        case "d":
-        case "y":
-            visualOperator(key)
-            break
-        case "x":
-            visualOperator("d")
-            break
-        case "s":
-            visualOperator("c")
-            break
-        case "i":
-        case "a":
-            visualObjectPrefix = key
-            visualObjectReturnMode = mode
-            mode = "waitForVisualInput"
-            break
-        default:
-            // h l w b e W B E f F t T ; , 0 ^ $ o O ...: intentionally
-            // nothing -- V selects whole lines only.
-            break
-    }
-}
+// Whole-line highlighting is independent of the editor caret (linewise.js).
+function switchModeToVisualLine() { startLinewiseSelection() }
+function handleKeyEventVisualLineMode(key) { handleLinewiseKey(key) }
+function vlMoveVertical(delta) { repeatMotion(() => nativeVerticalStep(delta > 0), Math.abs(delta)) }
+function vlGoto(end) { gotoTextLine(end ? null : 1, null, "visualLine") }
 
 // d/c/y/x/s in a visual mode whose selection isn't exactly modelled (V, or
 // charwise after the selection left its line) first checks with a Copy that
@@ -1070,7 +896,7 @@ function visualOperator(op) {
 }
 
 function switchModeToNormal() {
-    if (mode == "visualLine") sendKeyEvent("left")
+    clearLinewiseSelection()
     mode = 'normal'
     visualModel = null
     updateModeIndicator(mode)
@@ -1134,11 +960,88 @@ let oracleGeneration = 0
 const keyQueue = []
 const MAX_QUEUED_KEYS = 64
 let drainingKeyQueue = false
+let oracleAbort = null
+let oracleDeadline = null
+let activeProbeRestore = null
+let oracleCleanupPending = Promise.resolve()
+let probeCleanupRevision = 0
+
+function abortDocumentRead(restoreProbe = true) {
+    probeCleanupRevision++
+    if (activeProbeRestore) {
+        const restore = activeProbeRestore
+        activeProbeRestore = null
+        if (restoreProbe) oracleCleanupPending = Promise.resolve(restore()).catch((err) => console.warn("DocsKeys: probe cleanup failed", err))
+    } else if (restoreProbe && mode === "visual" && visualModel && visualModel.dA !== visualModel.dF) {
+        leaveVisualSelectionForEscape()
+    }
+    if (oracleAbort) oracleAbort.abort()
+    clearTimeout(oracleDeadline)
+    keyQueue.length = 0
+    pendingSelectionCheck = null
+    pendingFindOperator = null
+    pendingFindType = null
+    pendingFindCount = 1
+    pendingWordCount = 1
+    pendingLineCount = 1
+    pendingSearchCount = 1
+    pendingRegister = null
+    pendingRegisterAppend = false
+    operatorCount = 0
+    invalidateTextSnapshot()
+    searchState = null
+    hideSearchLine()
+    multipleMotion.times = 0
+    viewportEpoch++
+    cancelReadScrollSettlement()
+    if (viewportRead) restoreReadViewport(viewportRead)
+    viewportRead = null
+    readPresentationGeneration++
+    setReadAttribute("data-docskeys-reading", false)
+    setReadAttribute("data-docskeys-selection-batch", false)
+    removeSelectionFreeze()
+    window.dispatchEvent(new CustomEvent("doc-keys-read-phase", { detail: { active: false } }))
+    visualModel = null
+    clearLinewiseSelection()
+    mode = "normal"
+    updateModeIndicator(mode)
+}
+
+function clipboardRequest(fn, timeoutMs = 1200, cancelable = true) {
+    const signal = cancelable && oracleAbort && oracleAbort.signal
+    if (signal && signal.aborted) return Promise.reject(new Error("DocsKeys: read cancelled"))
+    return new Promise((resolve, reject) => {
+        let done = false
+        const finish = (error, value) => {
+            if (done) return
+            done = true
+            clearTimeout(timer)
+            if (signal) signal.removeEventListener("abort", cancel)
+            error ? reject(error) : resolve(value)
+        }
+        const cancel = () => finish(new Error("DocsKeys: read cancelled"))
+        const timer = setTimeout(() => finish(new Error("DocsKeys: clipboard request timed out")), timeoutMs)
+        if (signal) signal.addEventListener("abort", cancel, { once: true })
+        Promise.resolve().then(() => {
+            if (signal && signal.aborted) throw new Error("DocsKeys: read cancelled")
+            return fn()
+        }).then((value) => finish(null, value), (error) => finish(error))
+    })
+}
 
 function beginOracle() {
     if (oracleBusy) return false
     oracleBusy = true
     oracleGeneration++
+    oracleCleanupPending = Promise.resolve()
+    oracleAbort = new AbortController()
+    const generation = oracleGeneration
+    oracleDeadline = setTimeout(() => {
+        if (oracleBusy && oracleGeneration === generation) {
+            console.warn("DocsKeys: stalled command cancelled; input restored")
+            abortDocumentRead()
+        }
+    }, 8000)
     return true
 }
 
@@ -1149,8 +1052,10 @@ function releaseOracleQuiet() {
     // replayed from the queue (a held Ctrl+V, `p`, `y`) and any command that
     // follows can never see or write the oracle's temporary clipboard text.
     const generation = oracleGeneration
-    Promise.all([clipboardRestorePending, clipboardGuardQueue]).then(() => {
+    Promise.allSettled([clipboardRestorePending, clipboardGuardQueue, oracleCleanupPending]).then(() => {
         if (generation !== oracleGeneration) return
+        clearTimeout(oracleDeadline)
+        oracleAbort = null
         oracleBusy = false
         finishTemporaryNormal()
         drainKeyQueue()
@@ -1165,7 +1070,8 @@ function releaseOracle() {
 
 function queueKey(item) {
     if (keyQueue.length >= MAX_QUEUED_KEYS) {
-        console.warn("DocsKeys: key queue full while waiting on a document read; dropping key")
+        console.warn("DocsKeys: pending command cancelled because its input queue filled")
+        abortDocumentRead()
         return
     }
     keyQueue.push(item)
@@ -1296,6 +1202,7 @@ async function deleteOrChangeSelection(reg, append, isChange, linewise) {
     } else if (isSystemRegister(reg)) {
         clickMenu(menuItems.copy)
     }
+    if (oracleAbort && oracleAbort.signal.aborted) return
     sendKeyEvent("backspace")
     if (linewise) sendKeyEvent("backspace")
     if (isChange) switchModeToInsert()
@@ -1327,6 +1234,7 @@ async function yankSelection(reg, append) {
         await clipboardRestorePending
         if (text !== null) writeRegister(reg, text, append)
     }
+    if (oracleAbort && oracleAbort.signal.aborted) return
     collapseCharwiseVisualToStart()
     switchModeToNormal()
 }
@@ -1340,6 +1248,7 @@ async function pasteRegisterInner(name) {
         // Wait for any in-flight clipboard restore (from a document read) so
         // it can't land AFTER the paste and be pasted, or overwrite a copy.
         await clipboardRestorePending
+        if (oracleAbort && oracleAbort.signal.aborted) return
         clickMenu(menuItems.paste)
         return
     }
@@ -1354,13 +1263,14 @@ async function pasteRegisterInner(name) {
     } catch (err) {
     }
     try {
-        await navigator.clipboard.writeText(text)
+        await clipboardRequest(() => navigator.clipboard.writeText(text))
         clickMenu(menuItems.paste)
         if (previousClipboard !== null) {
             await new Promise((resolve) => setTimeout(resolve, PASTE_SETTLE_DELAY_MS))
-            await navigator.clipboard.writeText(previousClipboard)
+            await clipboardRequest(() => navigator.clipboard.writeText(previousClipboard), 500, false)
         }
     } catch (err) {
+        if (oracleAbort && oracleAbort.signal.aborted) return
         console.warn(`DocsKeys: couldn't paste from register "${name}", falling back to a normal paste`, err)
         clickMenu(menuItems.paste)
     }
@@ -1376,7 +1286,7 @@ let clipboardRestorePending = Promise.resolve()
 // temporary text or sentinel.
 async function readClipboardSettled() {
     await clipboardRestorePending
-    return navigator.clipboard.readText()
+    return clipboardRequest(() => navigator.clipboard.readText())
 }
 async function withClipboardSaved(fn) {
     await clipboardRestorePending
@@ -1388,10 +1298,14 @@ async function withClipboardSaved(fn) {
         // restore it later, but we can still run the action itself.
     }
     try {
+        if (oracleAbort && oracleAbort.signal.aborted) return null
         return await fn(previousClipboard)
+    } catch (err) {
+        if (oracleAbort && oracleAbort.signal.aborted) return null
+        throw err
     } finally {
         if (previousClipboard !== null) {
-            clipboardRestorePending = navigator.clipboard.writeText(previousClipboard).catch((err) => {
+            clipboardRestorePending = clipboardRequest(() => navigator.clipboard.writeText(previousClipboard), 500, false).catch((err) => {
                 console.warn("DocsKeys: couldn't restore clipboard", err)
             })
         }
@@ -1411,7 +1325,8 @@ async function pollClipboardForChange(previousText, maxWaitMs = 250, intervalMs 
     const start = Date.now()
     while (Date.now() - start < maxWaitMs) {
         try {
-            const text = await navigator.clipboard.readText()
+            if (oracleAbort && oracleAbort.signal.aborted) return null
+            const text = await clipboardRequest(() => navigator.clipboard.readText(), 300)
             if (text !== previousText) return text
         } catch (err) {
             // keep polling; a transient read failure isn't necessarily final
@@ -1419,7 +1334,7 @@ async function pollClipboardForChange(previousText, maxWaitMs = 250, intervalMs 
         await new Promise((resolve) => setTimeout(resolve, intervalMs))
     }
     try {
-        return await navigator.clipboard.readText()
+        return await clipboardRequest(() => navigator.clipboard.readText(), 300)
     } catch (err) {
         return null
     }
@@ -1443,7 +1358,7 @@ async function copySelectionForOracle(previousClipboard, maxWaitMs = 250) {
         return null
     }
     try {
-        await navigator.clipboard.writeText(ORACLE_SENTINEL)
+        await clipboardRequest(() => navigator.clipboard.writeText(ORACLE_SENTINEL))
     } catch (err) {
         return null
     }
@@ -1586,6 +1501,7 @@ function findBackward(text, char, count, skipAdjacent = false) {
 }
 
 function finishFind(returnMode) {
+    if (oracleAbort && oracleAbort.signal.aborted) { switchModeToNormal(); return }
     if (returnMode === "visual" || returnMode === "visualLine") {
         mode = returnMode
         updateModeIndicator(mode)
@@ -1622,7 +1538,7 @@ function applyMotionSteps(forward, inclusive, steps, operator, returnMode) {
         return
     }
 
-    if (returnMode === "visual" || returnMode === "visualLine") {
+    if (returnMode === "visual" || (returnMode === "visualLine" && !linewiseState)) {
         // Unreachable in practice: visual motions are handled by the visual
         // model (or decline) before getting here. Kept as a safe native
         // fallback.
@@ -1633,7 +1549,7 @@ function applyMotionSteps(forward, inclusive, steps, operator, returnMode) {
     }
 
     repeatMotion(() => sendKeyEvent(dirKey), steps)
-    switchModeToNormal()
+    finishFind(returnMode)
 }
 
 function applyFindResult(type, steps, operator, returnMode) {
@@ -1695,7 +1611,7 @@ async function performFind(type, char, count, operator, returnMode, skipAdjacent
         performVisualFind(type, char, count, skipAdjacent)
         return
     }
-    if (returnMode === "visual" || returnMode === "visualLine") {
+    if (returnMode === "visual" || (returnMode === "visualLine" && !linewiseState)) {
         // The line model isn't available (visual LINE mode, or the selection
         // has left the line `v` was pressed on). Reading text now would
         // capture text relative to the ANCHOR, not the cursor, so decline
@@ -1824,7 +1740,7 @@ function goToLastCharacter() {
 // the extra read is an acceptable trade for correctness here.
 async function goToFirstNonBlank(operator, returnMode) {
     if (oracleBusy) return
-    if (returnMode === "visual" || returnMode === "visualLine") {
+    if (returnMode === "visual" || (returnMode === "visualLine" && !linewiseState)) {
         // Charwise visual mode with a line model handles ^/_ itself (see
         // handleKeyEventVisualLine); anything reaching here has no model.
         console.warn("DocsKeys: ^/_ isn't available in this visual selection (visual line mode, or the selection has moved off the line) -- leave and re-enter visual mode to reset")
@@ -1944,6 +1860,9 @@ function getDocsScrollContainer() {
 }
 
 function scrollOneLine(down) {
+    viewportEpoch++
+    scrollIntentRevision++
+    cancelReadScrollSettlement()
     const el = getDocsScrollContainer()
     const ct = getCursorTop()
     let lineHeight = 20
@@ -1979,7 +1898,7 @@ async function performTildeOp(count) {
             const toggled = chars.slice(0, n).map(toggleGraphemeCase).join("")
             repeatMotion(() => sendKeyEvent("right", { shift: true }), n)
             try {
-                await navigator.clipboard.writeText(toggled)
+                await clipboardRequest(() => navigator.clipboard.writeText(toggled))
                 clickMenu(menuItems.paste) // lands the cursor right after the pasted text, matching Vim's ~ moving the cursor forward by `count`
             } catch (err) {
                 console.warn("DocsKeys: ~ couldn't write the toggled text (best-effort feature)", err)
@@ -2281,10 +2200,8 @@ function waitForVisualInput(key) {
             updateModeIndicator(mode)
             break
         case "p":
-            visualModel = null
-            goToStartOfPara()
-            switchModeToVisualLine()
-            vlParagraph(true)
+            mode = returnMode
+            startLinewiseSelection()
             break
         default:
             mode = returnMode
@@ -2331,8 +2248,14 @@ function handleMultipleMotion(key) {
         // to always restore "visualLine", even for charwise `v`.
         mode = targetMode
         multipleMotion.times = 0
-        if (targetMode === "visual" && ["w", "W", "b", "B", "e", "E"].includes(key)) {
-            visualSnapshotWord(key.toLowerCase(), key === key.toUpperCase(), times)
+        if ((targetMode === "visual" || targetMode === "visualLine") && ["w", "W", "b", "B", "e", "E"].includes(key)) {
+            if (targetMode === "visualLine") snapshotWordMotion(key.toLowerCase(), key === key.toUpperCase(), times, null, "visualLine")
+            else visualSnapshotWord(key.toLowerCase(), key === key.toUpperCase(), times)
+            return
+        }
+        if (targetMode === "visual" && (key === "j" || key === "k")) {
+            if (settings.visualVertical === "display") visualNativeVertical(key === "j", times)
+            else visualLogicalVertical(key === "j", times)
             return
         }
         if (key === "f" || key === "F" || key === "t" || key === "T") {
@@ -2426,6 +2349,7 @@ function visualModeToResumeOnEscape() {
 // selection the cursor is the selection's start (Left collapses there).
 // Without a model the old behavior is kept (collapse to the end).
 function leaveVisualSelectionForEscape() {
+    if (mode === "visualLine" && linewiseState) { clearLinewiseSelection(); return }
     if (mode === "visual" && visualModel) {
         if (visualModel.c >= visualModel.a) {
             sendKeyEvent("right")
@@ -2458,7 +2382,10 @@ function handleModifiedKey(e) {
         if (HELD_NAMED_KEYS.includes(k) || ["x", "v", "z", "y"].includes(k.toLowerCase())) invalidateExternalText()
         // Native selection commands (Ctrl+A, Ctrl+Shift+arrows, ...) can
         // create a selection while in normal mode; make sure it is noticed.
-        if (e.shiftKey || k.toLowerCase() === "a") markSelectionCheck("user")
+        if (e.shiftKey || k.toLowerCase() === "a") {
+            if (linewiseState) { clearLinewiseSelection(); mode = "normal" }
+            markSelectionCheck("user")
+        }
         return
     }
     if (!(k.length === 1 || HELD_NAMED_KEYS.includes(k))) return
@@ -2480,6 +2407,12 @@ function handleModifiedKey(e) {
 
 function eventHandler(e) {
     if (e.isTrusted === false || e.isComposing || e.keyCode === 229) return
+    if (oracleBusy && (e.key === "Escape" || (e.ctrlKey && e.key === "["))) {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        abortDocumentRead()
+        return
+    }
     if (mode === "search") {
         e.preventDefault()
         e.stopImmediatePropagation()
@@ -2508,6 +2441,12 @@ function eventHandler(e) {
     }
 
     const key = translateKey(e.key)
+
+    if (mode === "visualLine" && linewiseState && e.ctrlKey && ["c", "x", "v"].includes(e.key.toLowerCase())) {
+        e.preventDefault(); e.stopImmediatePropagation()
+        linewiseOperator(e.key.toLowerCase() === "c" ? "y" : e.key.toLowerCase() === "x" ? "d" : "p")
+        return
+    }
 
     if (e.ctrlKey && mode=='insert' && key=='o' ){
         e.preventDefault()
@@ -2896,7 +2835,9 @@ function handleKeyEventVisualLine(key) {
     // The line model exists only in charwise visual mode, and only until the
     // selection leaves the line `v` was pressed on.
     const model = (mode === "visual") ? visualModel : null
-    if (model && model.partial && (["j", "k", "0", "^", "_", "$", "i", "a"].includes(key) ||
+    if (key !== "j" && key !== "k") nativeVisualGoalX = null
+    if (model && model.partial && (["0", "^", "_", "$", "i", "a"].includes(key) ||
+        (settings.visualVertical === "logical" && (key === "j" || key === "k")) ||
         (key === "h" && model.c === 0) || (key === "l" && model.c >= model.text.length - 1))) {
         completeVisualThen(key)
         return
@@ -2908,7 +2849,6 @@ function handleKeyEventVisualLine(key) {
             switchModeToNormal()
             break
         case "V":
-            sendKeyEvent("left")
             switchModeToVisualLine()
             break
         case "/":
@@ -2940,12 +2880,12 @@ function handleKeyEventVisualLine(key) {
             else visualNativeMotion(true, () => sendKeyEvent("right", { shift: true }))
             break
         case "j":
-            if (model) visualSnapshotVertical(true)
-            else visualNativeMotion(true, () => nativeVerticalStep(true, true))
+            if (model && settings.visualVertical === "logical") visualSnapshotVertical(true)
+            else visualNativeVertical(true)
             break
         case "k":
-            if (model) visualSnapshotVertical(false)
-            else visualNativeMotion(false, () => nativeVerticalStep(false, true))
+            if (model && settings.visualVertical === "logical") visualSnapshotVertical(false)
+            else visualNativeVertical(false)
             break
         case "\"":
             switchModeToWaitForRegister()
@@ -3202,13 +3142,14 @@ let mouseDownPos = null
 if (typeof document.addEventListener === "function") {
     document.addEventListener("mousedown", (e) => {
         if (!e.isTrusted || !e.target.closest(".kix-appview-editor")) return
+        if (oracleBusy) abortDocumentRead(false)
         invalidateTextSnapshot()
         mouseDownPos = { x: e.clientX, y: e.clientY }
         if (mode === "visual" || mode === "visualLine") {
             visualModel = null
-            visualLineRows = null
+            clearLinewiseSelection()
             visualAnchorPoint = null
-            mode = "visual" // a mouse range need not contain whole lines
+            mode = "normal"
             updateModeIndicator(mode)
         }
     }, true)
@@ -3218,6 +3159,18 @@ if (typeof document.addEventListener === "function") {
         mouseDownPos = null
         if (mode === "insert") return
         if (moved || e.shiftKey || e.detail >= 2) markSelectionCheck("user")
+        else {
+            pendingSelectionCheck = null
+            pendingFindType = null
+            pendingFindOperator = null
+            multipleMotion.times = 0
+            searchState = null
+            hideSearchLine()
+            visualModel = null
+            clearLinewiseSelection()
+            mode = "normal"
+            updateModeIndicator(mode)
+        }
     }, true)
 }
 
