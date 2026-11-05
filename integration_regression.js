@@ -43,6 +43,9 @@ assert.equal(inputs.wordMotion.value, "native")
 popup.chrome.runtime.lastError = { message: "unavailable" }
 onChange()
 assert.match(status.textContent, /Could not save/)
+popup.chrome.storage = undefined
+onChange()
+assert.match(status.textContent, /Could not save/)
 
 // Check the injected bridge against a real event-shaped constructor, including
 // startup without an iframe, replaced editors, modifiers, and legacy codes.
@@ -50,7 +53,7 @@ let listener, iframe = null
 const events = []
 const bridge = vm.createContext({
     document: { querySelector: () => iframe },
-    window: { addEventListener(type, fn) { listener = fn } },
+    window: { addEventListener(type, fn) { if (type === "doc-keys-simulate-keypress") listener = fn } },
     KeyboardEvent: class {
         constructor(type, init) { this.type = type; Object.assign(this, init) }
     },

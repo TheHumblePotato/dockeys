@@ -21,7 +21,7 @@ const simulatedKeys = {
 }
 
 function simulateKeyEvent(type, el, args) {
-    const [key, code] = simulatedKeys[args.keyCode]
+    const [key, code] = args.shortcut ? [args.key, args.code] : simulatedKeys[args.keyCode]
     const mods = args.mods || {}
     const event = new KeyboardEvent(type, {
         key, code, bubbles: true, cancelable: true,
@@ -50,6 +50,17 @@ window.addEventListener("doc-keys-simulate-keypress", (event) => {
     if (!editor) return // Docs may still be creating/replacing its input iframe.
     simulateKeyEvent("keydown", editor, args)
     simulateKeyEvent("keyup", editor, args)
+})
+
+window.addEventListener("doc-keys-native-shortcut", (event) => {
+    const args = event.detail
+    if (!args || typeof args.key !== "string" || args.key.length !== 1 ||
+        !(args.mods?.control || args.mods?.meta) || !Number.isInteger(args.keyCode)) return
+    const editor = getEditorEl()
+    if (!editor) return
+    const shortcut = { ...args, shortcut: true }
+    simulateKeyEvent("keydown", editor, shortcut)
+    simulateKeyEvent("keyup", editor, shortcut)
 })
 
 // Docs schedules focus/scroll work independently of its selection updates.

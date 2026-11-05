@@ -56,14 +56,14 @@ async function main() {
         const event = { isTrusted: true, target: { closest: () => ({}) }, clientX: 100, clientY: 100, detail: 1 }
         e.documentListeners.mousedown(event)
         e.sim.setCaret(7)
-        e.documentListeners.mouseup(event)
+        await e.documentListeners.mouseup(event)
         assert.equal(e.get("mode"), "normal")
         assert.equal(e.sim.focus, 7)
         assert.equal(e.sim.hasSel(), false)
         assert.equal(e.sim.copyCalls, copies)
         e.documentListeners.mousedown(event)
         e.sim.anchor = 7; e.sim.focus = 10
-        e.documentListeners.mouseup({ ...event, clientX: 130 })
+        await e.documentListeners.mouseup({ ...event, clientX: 130 })
         assert.equal(e.get("mode"), "visual")
         assert.equal(e.sim.selText(), "c d")
     }
@@ -148,7 +148,7 @@ async function main() {
     const click = { isTrusted: true, target: { closest: () => ({}) }, clientX: 100, clientY: 100, detail: 1 }
     e.documentListeners.mousedown(click)
     e.sim.setCaret(7)
-    e.documentListeners.mouseup(click)
+    await e.documentListeners.mouseup(click)
     await e.settle()
     assert.equal(e.sim.focus, 7, "old cleanup moved the clicked caret")
     assert.equal(e.get("mode"), "normal")

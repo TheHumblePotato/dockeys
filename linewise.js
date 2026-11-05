@@ -1,5 +1,5 @@
 // Linewise selection has an ordinary native caret. Its highlight is separate
-// from Docs' anchor/focus range, which is materialized only for an operator.
+// from Docs' anchor/focus range, materialized for editing/formatting actions.
 let linewiseState = null
 let linewiseHighlight = null
 
@@ -37,7 +37,7 @@ async function seekLinewiseRow(target, shift = false) {
         if (previousDirection && direction !== previousDirection) return false
         previousDirection = direction
         sendKeyEvent(direction > 0 ? "down" : "up", { shift })
-        await waitForEditorPaint()
+        await waitForCaretPaint(before.point, true)
         if (sameDisplayRow(before, linewiseCursorRow())) return false
     }
     return false
@@ -53,7 +53,7 @@ async function seekLinewisePoint(target, shift = false) {
         if (Math.abs(point.x - target.point.x) <= 1) return true
         const right = point.x < target.point.x
         sendKeyEvent(right ? "right" : "left", { shift })
-        await waitForEditorPaint()
+        await waitForCaretPaint(point)
         const next = linewiseCursorRow()
         if (!sameDisplayRow(row, next)) {
             sendKeyEvent(right ? "left" : "right", { shift })
@@ -238,7 +238,20 @@ async function realizeDisplayLinewiseRange(state, op) {
 async function linewiseMoveVertical(down, count = 1) {
     if (!linewiseState) return
     if (linewiseUnit() === "display") {
-        repeatMotion(() => normalNavigation(down ? "j" : "k"), count)
+        if (!beginOracle()) return
+        try {
+            const state = linewiseState
+            if (state.goal === null || state.goal === undefined) state.goal = cursorDocumentPoint()?.x
+            await withViewportPreserved(async () => {
+                for (let n = 0; n < count && !oracleAbort?.signal.aborted; n++) {
+                    const before = cursorDocumentPoint()
+                    sendKeyEvent(down ? "down" : "up")
+                    await waitForCaretPaint(before, true)
+                    if (state.goal !== undefined) await alignVisualColumn(state.goal, false)
+                }
+                revealReadDestination()
+            }, 500)
+        } finally { releaseOracle() }
         return
     }
     if (!beginOracle()) return
@@ -253,7 +266,7 @@ async function linewiseMoveVertical(down, count = 1) {
                 const row = DocsKeysVim.line(snapshot.text, at)
                 if ((down && row.end === snapshot.text.length) || (!down && row.start === 0)) break
                 const next = DocsKeysVim.line(snapshot.text, down ? row.end + 1 : row.start - 1)
-                at = Math.min(next.start + state.goal, Math.max(next.start, next.end - 1))
+                at = Math.min(next.start + state.goal, next.end)
             }
             moveSnapshotCaret(snapshot, at)
             await waitForEditorPaint()
@@ -266,11 +279,13 @@ async function linewiseMoveVertical(down, count = 1) {
 
 // Formatting, comments, and toolbar actions need a real Docs range. Keep
 // offsets inside that range so font reflow cannot lose Vim's logical cursor.
-async function prepareLinewiseExternalSelection() {
+async function prepareLinewiseExternalSelection(onReady = null) {
     const state = linewiseState
-    if (!state || state.externalRange) return !!state
+    if (!state) return false
+    if (state.externalRange) { onReady?.(); return true }
     if (!beginOracle()) return false
     const cursor = linewiseCursorRow(), anchor = { point: state.point, height: state.height }
+    if (cursor) cursor.glyph = cursorGlyphInfo()
     let ready = false
     try {
         await withViewportPreserved(async () => {
@@ -308,13 +323,20 @@ async function prepareLinewiseExternalSelection() {
             state.externalRange = { text, cursorOffset, anchorOffset, cursor }
             ready = true
         }, 500)
+        if (ready) {
+            await clipboardRestorePending
+            if (!oracleAbort?.signal.aborted && state === linewiseState) onReady?.()
+        }
     } catch (err) {
         if (!oracleAbort?.signal.aborted) showSearchLine("Could not prepare the line selection; try again")
     } finally {
+        const restore = activeProbeRestore
         activeProbeRestore = null
         if (!ready && linewiseState === state && !oracleAbort?.signal.aborted) {
-            sendKeyEvent("left")
-            if (cursor) await seekLinewisePoint(cursor)
+            await withViewportPreserved(async () => {
+                if (restore) await restore()
+                if (cursor) await seekLinewisePoint(cursor)
+            }, 500)
         }
         releaseOracle()
     }
@@ -332,6 +354,7 @@ async function restoreLinewiseExternalSelection() {
             if (text !== saved.text) {
                 // A native edit or click replaced the range. Never reconstruct
                 // an old selection over new text.
+                if (text) sendKeyEvent("left")
                 clearLinewiseSelection(); mode = "normal"; updateModeIndicator(mode)
                 return
             }
@@ -355,6 +378,8 @@ async function restoreLinewiseExternalSelection() {
 
 async function linewiseOperator(op) {
     if (!linewiseState || !beginOracle()) return
+    const original = linewiseCursorRow()
+    let realized = false
     try {
         const state = linewiseState
         let empty, range, snapshot
@@ -376,6 +401,7 @@ async function linewiseOperator(op) {
             }
         }, 500)
         if (empty === undefined || !linewiseStillValid(state)) return
+        realized = true
         clearLinewiseSelection()
         mode = "visual"
         visualModel = range ? { text: snapshot.text, a: range.start, c: Math.max(range.start, range.end - 1), dA: range.start, dF: range.end, fullDocument: true } : null
@@ -386,7 +412,17 @@ async function linewiseOperator(op) {
             if (op === "c") switchModeToInsert()
             else switchModeToNormal()
         } else await runLongStringOp(op)
-    } finally { activeProbeRestore = null; releaseOracle() }
+    } finally {
+        const restore = activeProbeRestore
+        activeProbeRestore = null
+        if (!realized && !oracleAbort?.signal.aborted) {
+            await withViewportPreserved(async () => {
+                if (restore) await restore()
+                if (original) await seekLinewisePoint(original)
+            }, 500)
+        }
+        releaseOracle()
+    }
 }
 
 async function linewiseToCharwise() {

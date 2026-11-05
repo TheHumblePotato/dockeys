@@ -159,8 +159,12 @@ function makeEnv(text, opts = {}) {
         },
     }
     const documentListeners = {}
+    const documentHandlers = {}
     const document = {
-        addEventListener(type, fn) { documentListeners[type] = fn },
+        addEventListener(type, fn) {
+            (documentHandlers[type] || (documentHandlers[type] = [])).push(fn)
+            documentListeners[type] = (event) => Promise.all(documentHandlers[type].map((handler) => handler(event)))
+        },
         getElementsByTagName: () => [{ contentDocument: iframeDoc }],
         getElementsByClassName: (c) => c === "kix-cursor-caret" ? [caret] : [],
         querySelector: (s) => s === ".docs-texteventtarget-iframe" ? { contentDocument: iframeDoc, addEventListener() {} } : null,
@@ -192,6 +196,7 @@ function makeEnv(text, opts = {}) {
             onChanged: { addListener(fn) { storageListeners.push(fn) } },
         },
     }
+    if (opts.withoutStorage) delete chrome.storage
     class CustomEvent { constructor(type, init) { this.type = type; this.detail = init && init.detail } }
     const ctx = vm.createContext({
         document, window, navigator, chrome, CustomEvent, console: { log() {}, warn: opts.warn || (() => {}), error() {} },

@@ -50,6 +50,35 @@ async function main() {
     await e.pressAll("vjw")
     assert.equal(e.sim.selText(), e.sim.text.slice(12), "a word after native j read from an unpainted caret")
 
+    for (const linewise of [false, true]) {
+        e = makeEnv("abcdefgh\nabcdefgh\nabcdefgh", { settings: { dvorak: false } })
+        e.sim.setCaret(3)
+        await e.pressRaw(linewise ? "V" : "v")
+        const caret = e.get("getCursorTop()"), live = caret.getBoundingClientRect.bind(caret)
+        let previous = live(), due = 0
+        const dispatch = e.sim.key.bind(e.sim)
+        e.sim.key = (detail) => { previous = live(); dispatch(detail); due = Date.now() + 80 }
+        caret.getBoundingClientRect = () => Date.now() < due ? previous : live()
+        e.ctx.requestAnimationFrame = (fn) => setTimeout(fn, 16)
+        await e.pressAll("jjkk")
+        assert.equal(e.sim.focus, linewise ? 3 : 4, "80ms caret paint made j/k move by characters")
+        if (!linewise) assert.equal(e.sim.selText(), "d")
+        assert.equal(e.get("mode"), linewise ? "visualLine" : "visual")
+    }
+
+    for (const middle of ["x", ""]) {
+        e = makeEnv("abcdefgh\n" + middle + "\nabcdefgh", { settings: { dvorak: false } })
+        e.ctx.measureCharWidth = () => 8
+        e.sim.setCaret(3)
+        await e.pressAll("vj")
+        assert.equal(e.sim.selText(), "defgh\n" + middle + "\n", "short row did not include Vim's valid EOL cursor")
+        e.get("renderOverlay()")
+        assert.equal(e.get("cursorBoxOverlay.style.left"), `${50 + middle.length * 8}px`, "the newline cursor box followed the native range into the next row")
+        assert.equal(e.get("cursorBoxOverlay.style.top"), "80px")
+        await e.pressAll("jkk")
+        assert.equal(e.sim.selText(), "d", "short/empty row lost the preferred column")
+    }
+
     // Promotion must protect the collapse, full read, and reconstruction,
     // rather than capturing the viewport after the first disruptive step.
     e = makeEnv("one two\nthree four\nfive six", { settings: { dvorak: false } })

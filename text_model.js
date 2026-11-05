@@ -382,7 +382,9 @@ function visualSnapshotVertical(down) {
     if ((down && bounds.end === m.text.length) || (!down && bounds.start === 0)) return
     const target = DocsKeysVim.line(m.text, down ? bounds.end + 1 : bounds.start - 1)
     const goal = m.goal
-    visualMoveCursor(Math.min(target.start + goal, Math.max(target.start, target.end - 1)))
+    // Visual permits the paragraph-break position on a short line. Normal
+    // mode's last-character clamp would omit that valid inclusive endpoint.
+    visualMoveCursor(Math.min(target.start + goal, target.end))
     m.goal = goal
 }
 

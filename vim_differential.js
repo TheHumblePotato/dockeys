@@ -46,6 +46,9 @@ for (const [text, at, keys] of [
 for (const keys of ["Vh", "Vl", "Vj", "Vjk", "Vw", "Vww", "V3w", "V0", "V$", "V0h", "V$l", "V$h", "Vfb", "VG", "Vjo", "VwO", "Vjd", "Vc", "Vjy"]) {
     adapterCases.push({ text: "alpha beta\ngamma delta\nepsilon zeta", at: 2, keys, kind: "adapter" })
 }
+for (const text of ["abcdefgh\nx\nabcdefgh", "abcdefgh\n\nabcdefgh"]) {
+    for (const keys of ["vj", "vjjkk", "Vj", "Vjjkk"]) adapterCases.push({ text, at: 3, keys, kind: "adapter", shortRow: true })
+}
 cases.push(...adapterCases)
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "docskeys-oracle-"))
 const input = path.join(temp, "cases.json"), output = path.join(temp, "results.json")
@@ -88,10 +91,13 @@ assert.equal(failures, 0, `${failures}/${cases.length} cases differ from Neovim`
 console.log(`${cases.length - adapterCases.length} word motions/operator ranges match Neovim`)
 
 ;(async () => {
+    let checked = 0
     for (let i = cases.length - adapterCases.length; i < cases.length; i++) {
         const test = cases[i], oracle = expected[i]
-        for (const wordMotion of ["native", "precise"]) {
-            const e = makeEnv(test.text, { settings: { dvorak: false, wordMotion } })
+        const units = test.keys.startsWith("V") || test.shortRow ? ["display", "logical"] : ["display"]
+        const variants = ["native", "precise"].flatMap((wordMotion) => units.map((visualVertical) => ({ wordMotion, visualVertical })))
+        for (const { wordMotion, visualVertical } of variants) {
+            const e = makeEnv(test.text, { settings: { dvorak: false, wordMotion, visualVertical } })
             e.sim.setCaret(test.at)
             for (const char of test.keys) await e.pressRaw(char === "\r" ? "Enter" : char)
             await e.settle()
@@ -112,8 +118,9 @@ console.log(`${cases.length - adapterCases.length} word motions/operator ranges 
             catch (err) {
                 if (failures++ < 10) console.error("ADAPTER", wordMotion, test, "got", got, "nvim", want)
             }
+            checked++
         }
     }
     assert.equal(failures, 0, "Extension command results differ from Neovim")
-    console.log(`${adapterCases.length * 2} extension command sequences match Neovim in both speed modes`)
+    console.log(`${checked} extension command sequences match Neovim across both speed modes and linewise settings`)
 })().then(() => process.exit(0)).catch((err) => { console.error(err); process.exit(1) })

@@ -37,6 +37,16 @@ Auto combines these paths. Rendered only disables automatic clipboard document p
 
 ## Verification and remaining uncertainty
 
+### Changes in 1.11
+
+Entering linewise mode now stores geometry without selecting or copying the document. Displayed rows and logical paragraphs use the same configured unit for highlighting, vertical movement, and operators. Paragraph anchors are resolved only when text-indexed operations need them. Horizontal highlighting uses rendered text/paragraph bounds.
+
+Explicit formatting and context-menu gestures prepare a real native range inside viewport/selection masking. Saved offsets within that range restore the logical cursor after formatting reflow; the range text is checked before restoration. This is tested against DOM event handlers in the Chromium fixture, not an authenticated Docs document. In particular, replaying a synthetic `contextmenu` can reach an application's custom menu handler but cannot open the browser's native menu.
+
+Visual vertical corrections use painted positions and measured glyph advances, with asynchronous fallback steps. The simulator delays caret rectangles by 80ms while native selection updates synchronously. Shifted formatting no longer schedules a selection check that can only run in Normal mode, eliminating a reproducible queue deadlock. Unavailable extension storage no longer prevents initialization or register use.
+
+Forward search reads the suffix first and adds the prefix only when required. Source/compiled-match caching, binary match lookup, and verified document-edge movement reduce repeated scans and arrow events. These caches remain bounded by the existing revision/position/age checks; they do not establish synchronized remote revision tracking.
+
 ### Changes in 1.10
 
 The rendered context builder rejects unexplained geometric gaps, generated list markers, and uncertain wrapped joins. A generated bullet before the next paragraph's text reproduces the one-character second-`w` bug in the Chromium fixture. Normal word movement now waits for caret paint and rebinds its context to the actual rendered caret.

@@ -11,15 +11,21 @@ function render(value) {
     }
 }
 
-chrome.storage.local.get(key, (result) => {
-    if (chrome.runtime.lastError) {
-        status.textContent = "Could not load settings. Reopen this popup to try again."
-        return
-    }
-    render(result[key])
-    form.disabled = false
-    status.textContent = "Changes save automatically."
-})
+try {
+    const storage = DocsKeysSettings.storage()
+    if (!storage) throw new Error("Storage unavailable")
+    storage.get(key, (result) => {
+        if (DocsKeysSettings.storageError()) {
+            status.textContent = "Could not load settings. Reopen this popup to try again."
+            return
+        }
+        render(result?.[key])
+        form.disabled = false
+        status.textContent = "Changes save automatically."
+    })
+} catch {
+    status.textContent = "Settings unavailable. Reload the extension and reopen this popup."
+}
 
 form.addEventListener("change", () => {
     const value = {}
@@ -27,11 +33,15 @@ form.addEventListener("change", () => {
         const input = form.elements.namedItem(name)
         value[name] = input.type === "checkbox" ? input.checked : input.value
     }
-    chrome.storage.local.set({ [key]: normalize(value) }, () => {
-        status.textContent = chrome.runtime.lastError ? "Could not save settings. Try again." : "Saved. Open documents update automatically."
-    })
+    try {
+        const storage = DocsKeysSettings.storage()
+        if (!storage) throw new Error("Storage unavailable")
+        storage.set({ [key]: normalize(value) }, () => {
+            status.textContent = DocsKeysSettings.storageError() ? "Could not save settings. Try again." : "Saved. Open documents update automatically."
+        })
+    } catch { status.textContent = "Could not save settings. Reopen this popup to try again." }
 })
 
-chrome.storage.onChanged.addListener((changes, area) => {
+try { chrome.storage?.onChanged?.addListener((changes, area) => {
     if (area === "local" && changes[key]) render(changes[key].newValue)
-})
+}) } catch { /* The popup may outlive an extension reload. */ }

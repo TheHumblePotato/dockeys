@@ -32,6 +32,7 @@ const fixture = String.raw`<!doctype html><meta charset="utf-8">
 </div></div>
 <iframe class="docs-texteventtarget-iframe"></iframe>
 <button class="menu-button">Edit</button>
+<button id="fixture-format">Format selection</button>
 ${["Copy", "Cut", "Paste", "Redo", "Undo", "Find"].map((x) => `<div class="goog-menuitem">${x}</div>`).join("")}
 <pre id="docskeys-test-result">RUNNING</pre>
 <script>
@@ -57,10 +58,12 @@ function updateFixture() {
  highlight.style.display=sim.hasSel()?'block':'none';
 }
 const input=document.querySelector('iframe').contentDocument;
+const fixtureNativeRanges=[], fixtureToolbarRanges=[], fixtureContextRanges=[];
 const focusCalls=[], originalFocus=input.defaultView.HTMLElement.prototype.focus;
 input.defaultView.HTMLElement.prototype.focus=function(options){focusCalls.push(options);return originalFocus.call(this,options)};
 input.body.style.font='20px Arial'; input.body.contentEditable='true';
 input.body.addEventListener('keydown',event=>{
+ if((event.ctrlKey||event.metaKey)&&event.key.length===1){fixtureNativeRanges.push([event.key,sim.selText()]);event.preventDefault();return}
  sim.key({keyCode:event.keyCode,mods:{control:event.ctrlKey,alt:event.altKey,shift:event.shiftKey,meta:event.metaKey}});
  updateFixture();
  if(window.fixtureScrollAttack) {
@@ -69,6 +72,8 @@ input.body.addEventListener('keydown',event=>{
  }
 });
 for(const item of document.querySelectorAll('.goog-menuitem')) item.addEventListener('click',()=>sim.menu(item.textContent));
+document.querySelector('#fixture-format').addEventListener('click',()=>fixtureToolbarRanges.push(sim.selText()));
+editor.addEventListener('contextmenu',event=>{event.preventDefault();fixtureContextRanges.push(sim.selText())});
 Object.defineProperty(navigator,'clipboard',{configurable:true,value:{readText:async()=>sim.clipboard,writeText:async text=>{sim.clipboard=text}}});
 window.chrome={runtime:{getURL:()=> 'data:text/javascript,void%200',lastError:null},storage:{local:{get(key,cb){cb({[key]:{dvorak:false,readStrategy:'auto'}})},set(value,cb){if(cb)cb()}},onChanged:{addListener(){}}}};
 updateFixture();
@@ -123,9 +128,34 @@ ${source}
   marker.remove();invalidateRenderedReader();
   reset();handleKeyEventNormal('V');await settle();renderOverlay();
   assert(sim.focus===0&&!sim.hasSel()&&document.querySelector('.docskeys-linewise-highlight').style.display==='block','V captured the native caret');
-  handleKeyEventVisualLine('j');renderOverlay();assert(sim.focus===6&&!sim.hasSel(),'Vj did not move the real caret one row');
+  handleKeyEventVisualLine('j');await settle();renderOverlay();assert(sim.focus===6&&!sim.hasSel(),'Vj did not move the real caret one row');
   handleKeyEventVisualLine('w');await settle();assert(sim.focus===11&&mode==='visualLine','Vw failed to move the linewise cursor');
   handleKey({key:'Escape',preventDefault(){},stopImmediatePropagation(){}});
+  reset();nativeScrollTop.call(editor,500);const beforeV=sim.copyCalls;
+  handleKeyEventNormal('V');await settle();await delay(80);
+  assert(editor.scrollTop===500&&sim.copyCalls===beforeV,'V entry probed or changed the viewport');
+  nativeScrollTop.call(editor,0);handleKeyEventVisualLine('j');await settle();renderOverlay();
+  const lineHighlight=document.querySelector('.docskeys-linewise-highlight').getBoundingClientRect();
+  assert(lineHighlight.left>=svg.getBoundingClientRect().left+39&&lineHighlight.width<300,'linewise overlay extends outside the text');
+  eventHandler({key:'m',code:'KeyM',keyCode:77,ctrlKey:true,altKey:true,isTrusted:true,preventDefault(){},stopImmediatePropagation(){}});
+  await settle();
+  assert(fixtureNativeRanges.at(-1)[1]===sim.text&&mode==='visualLine','comment shortcut saw only the cursor character');
+  eventHandler({key:'Escape',isTrusted:true,preventDefault(){},stopImmediatePropagation(){}});await settle();
+  assert(sim.focus===6&&!sim.hasSel()&&mode==='normal','formatting did not restore the logical cursor');
+  reset();handleKeyEventNormal('V');await settle();handleKeyEventVisualLine('j');await settle();
+  const format=document.querySelector('#fixture-format');
+  const mouse=(target,button=0)=>({target,button,isTrusted:true,detail:1,clientX:50,clientY:40,preventDefault(){},stopImmediatePropagation(){}});
+  linewiseToolbarMouseDown(mouse(format));
+  linewiseToolbarGesture.clicked=true;replayLinewiseToolbarGesture();await settle();
+  assert(fixtureToolbarRanges.at(-1)===sim.text&&mode==='visualLine','toolbar formatting lost the linewise range');
+  eventHandler({key:'Escape',isTrusted:true,preventDefault(){},stopImmediatePropagation(){}});await settle();
+  reset();handleKeyEventNormal('V');await settle();handleKeyEventVisualLine('j');await settle();
+  editorMouseDown(mouse(editor,2));linewiseContextMenu(mouse(editor,2));await settle();
+  assert(fixtureContextRanges.at(-1)===sim.text&&mode==='visualLine','right-click collapsed or omitted the linewise selection');
+  eventHandler({key:'Escape',isTrusted:true,preventDefault(){},stopImmediatePropagation(){}});await settle();
+  const localStorageAPI=chrome.storage;chrome.storage=undefined;
+  writeRegister('a','saved in memory',false);assert(registers.a==='saved in memory','missing storage broke the register');
+  chrome.storage=localStorageAPI;
   reset();nativeScrollTop.call(editor,500);window.fixtureScrollAttack=true;
   await withViewportPreserved(async()=>{
    goToDocEnd(true);
@@ -165,7 +195,7 @@ ${source}
   assert(mode==='normal'&&!oracleBusy&&!document.documentElement.hasAttribute('data-docskeys-reading'),'Escape did not restore browser input/masks');
   navigator.clipboard.readText=readClipboard;
   handleKeyEventNormal('j');assert(sim.focus===6,'native input remained locked after cancellation');
-  document.querySelector('#docskeys-test-result').textContent='PASS real browser: rendered glyph sizing, no-copy local navigation/find, masked Copy, scroll lock, stable visual selection';
+  document.querySelector('#docskeys-test-result').textContent='PASS real browser: glyph sizing, masked Copy/scroll guards, stable Visual, linewise formatting/toolbar/context ranges, storage fallback';
  }catch(error){document.querySelector('#docskeys-test-result').textContent='FAIL '+error.stack}
 })();
 </script>`
@@ -173,7 +203,7 @@ const html = path.join(temp, "fixture.html")
 fs.writeFileSync(html, fixture)
 const result = spawnSync(executable, ["--headless", "--disable-gpu", "--in-process-gpu", "--no-first-run", "--no-default-browser-check",
     "--disable-background-networking", `--user-data-dir=${path.join(temp, "profile")}`, "--dump-dom",
-    "--run-all-compositor-stages-before-draw", "--virtual-time-budget=5000", pathToFileURL(html).href],
+    "--run-all-compositor-stages-before-draw", "--virtual-time-budget=12000", pathToFileURL(html).href],
 { encoding: "utf8", timeout: 30000, maxBuffer: 4 * 1024 * 1024 })
 const match = result.stdout && result.stdout.match(/<pre id="docskeys-test-result">([^<]*)<\/pre>/)
 if (result.error || !match || !match[1].startsWith("PASS")) {

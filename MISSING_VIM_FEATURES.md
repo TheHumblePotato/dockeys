@@ -50,6 +50,17 @@ Live Google Docs testing is still required for paragraph/text extraction, format
 - Bounded clipboard I/O, abortable reads, prioritized Escape/Ctrl+[, bounded restoration, overflow recovery, and a command watchdog prevent a stalled clipboard promise from permanently capturing input.
 - Expanded Neovim adapter comparisons include linewise cursor positions, selection ranges, word/find/document motions, EOL behavior, endpoint swaps, and operators.
 
+## Implemented in 1.11
+
+- The existing Displayed rows/Paragraphs preference now controls `V` movement, highlight units, and operators together. Entering `V` and swapping endpoints are read-free; paragraph anchors are resolved lazily. Range preparation remains inside viewport protection.
+- Linewise highlights use annotated text/paragraph horizontal bounds instead of editor width. Formatting shortcuts, toolbar clicks, and right-clicks materialize a native range. Relative offsets restore the logical cursor/anchor after font reflow; changed range text invalidates the old state.
+- Right-clicks, box clicks, and clicks outside the editor preserve Visual mode. Moving primary clicks leave it; native drags enter charwise Visual. Native editing/navigation shortcuts and explicitly hidden selection overlays clear stale Visual state.
+- Fixed a queue deadlock caused by shifted formatting shortcuts scheduling a Normal-only selection check while Visual was active. Escape clears pending recovery. Registers and initialization tolerate unavailable extension storage and retain in-memory values.
+- Visual vertical correction waits for painted geometry instead of synchronously walking a stale caret. Tests include 80ms caret delays, wrapped rows, short/blank rows, anchor crossings, and preferred columns.
+- Forward literal search initially reads only the suffix, expanding missing context on demand. Repeats cache source text and compiled matches; binary search handles large counts. Document-edge anchors reduce long-distance arrow volume.
+- Added search wrapping, ignore case, smart case, and match-counter preferences. `\c/\C` override case options; `*/#` follow Vim's smart-case exception. Partial counts are labeled explicitly.
+- Added simulator/Chromium coverage for formatting/context/toolbar ranges, storage failure, font reflow, and Visual recovery. Neovim comparisons exercise both linewise settings on unwrapped rows; wrapped semantics are covered separately in the simulator.
+
 ## Complete remaining backlog
 
 The sections below are the current list of unfinished features, known approximations, and integration work. Live verification is part of the backlog, not evidence that a behavior is already correct in Docs.
@@ -59,12 +70,12 @@ The sections below are the current list of unfinished features, known approximat
 | Feature | Current gap / next step |
 | --- | --- |
 | Vim regex syntax | Queries are literal. Add a documented parser for magic/nomagic, character classes, groups, alternation, lookarounds, and backreferences; do not silently treat JavaScript regex as Vim regex. |
-| Search options | Add configurable `wrapscan`, `ignorecase`, `smartcase`, and result-limit behavior. `\c/\C` already work per query. |
+| Search options | Wrapping/case/count preferences are implemented. Add a result cap and richer count/status behavior for documents too large to index cheaply. |
 | Incremental search / `hlsearch` | Show matching results without changing the document selection or running clipboard reads per keystroke. |
 | Persistent search history and register | In-tab history is implemented. Add persistence, prefix filtering, richer command-line navigation, and the `"/` register; retain direction/flags correctly. |
 | `gn/gN` | Select the current/next match as a text object, including operator counts and no-match behavior. |
 | Search offsets | Implement `/pattern/e`, line/character offsets, and the resulting inclusive/exclusive motion rules. |
-| Large-document navigation | Reduce synthetic arrow-event volume without guessing Docs' word boundaries or losing exact ranges. |
+| Large-document navigation | Verified document-edge anchors reduce event volume. Extend exact mapping to intermediate rendered pages, without guessing native word boundaries. |
 
 ## Motion and selection follow-ups
 
@@ -79,8 +90,10 @@ The sections below are the current list of unfinished features, known approximat
 - Add quoted, paired-delimiter, sentence, and nested block text objects with counted selection.
 - Distinguish mouse selection anchor/focus reliably, including reverse dragging and native selection replacement.
 - Eliminate the remaining clipboard repair on native Visual anchor crossings and the snapshot rebuild when resuming modeled words after native vertical movement.
-- Verify preferred-column retention and EOL/blank-row clamping through short wrapped rows when annotated text is absent or caret painting is delayed.
-- Improve linewise highlighting without annotation geometry, preserve logical paragraph highlighting across virtualized/wrapped pages, and integrate native formatting menus/accessibility selection ranges with the custom highlight.
+- Extend live verification of preferred-column retention and EOL/blank-row clamping to styled wraps, tables, tabs, and bidirectional text. Simulator tests include missing annotations and delayed caret paint.
+- Improve linewise highlighting without annotation geometry and preserve paragraph bands across virtualized/page-split paragraphs. Verify disjoint text columns rather than merging unrelated runs at the same Y position.
+- Verify native formatting, comments, and context menus in live Docs. Shortcuts/custom menus are replayed after range preparation; synthetic events cannot open the browser/OS default context menu, and Docs may change its trusted-event requirements.
+- Expose custom linewise ranges to accessibility tools while an ordinary caret is active; the native selection currently exists during explicit formatting/clipboard/edit actions.
 
 ## Editing and register follow-ups
 
@@ -108,6 +121,8 @@ The sections below are the current list of unfinished features, known approximat
 - Improve cursor sizing without annotations, especially native wrapped-line vertical movement, ligatures, and bidirectional text; keep cosmetics free of document probes.
 - Validate selection masks and page-world scroll guards against real Docs versions, browser scroll anchoring, trackpads, and asynchronous menu completion.
 - Audit Mac modifiers, international keyboard layouts, IME composition, tables, lists, footnotes, headers, suggestions, and multi-tab Docs documents.
+- Cover toolbar gestures interrupted by scrolling, document replacement, remote edits, or a second click while range preparation is still running.
+- Recover an already-open tab completely after extension reload. Storage currently falls back safely in memory; reinjection/bridge version negotiation and full feature reattachment remain unfinished.
 - Add accessibility labels and navigation for a richer search command line without stealing the editor's selection or typing focus.
 
 References: [Neovim motion rules](https://neovim.io/doc/user/motion/), [Visual mode](https://neovim.io/doc/user/visual/), [search commands](https://neovim.io/doc/user/pattern/), and [default mappings](https://neovim.io/doc/user/quickref/).

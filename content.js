@@ -57,7 +57,7 @@ waitForElement(
     (iframe) => {
         const attach = () => {
             iframe.contentDocument.addEventListener('keydown', eventHandler, true)
-            iframe.contentDocument.addEventListener('beforeinput', invalidateExternalText, true)
+            iframe.contentDocument.addEventListener('beforeinput', handleNativeInput, true)
         }
         attach()
         iframe.addEventListener('load', attach)
@@ -225,15 +225,24 @@ function renderOverlay() {
     }
     const zoom = zoomFactorFor(fontInfo, rect.height)
     const model = mode === "visual" ? visualModel : null
-    const glyph = cursorGlyphInfo()
+    const nativeGeometry = mode === "visual" && !model && nativeVisualCursorGeometry &&
+        comparePoints(nativeVisualCursorGeometry.focus, cursorDocumentPoint()) === 0 ? nativeVisualCursorGeometry : null
+    const glyph = nativeGeometry?.glyph || linewiseState?.externalRange?.cursor.glyph || cursorGlyphInfo()
     if (glyph && glyph.font) fontInfo = { ...fontInfo, fontCSS: glyph.font }
-    const afterNativeChar = mode === "visual" && !model && nativeVisualFocusAfter
+    const afterNativeChar = mode === "visual" && !model && nativeVisualFocusAfter && !nativeGeometry
     const char = model ? model.text[model.c] : glyph && (afterNativeChar ? glyph.previousChar : glyph.char)
     const exactWidth = glyph && ((model && model.dF > model.c || afterNativeChar) && glyph.previousChar === char ? glyph.previousWidth : glyph.char === char ? glyph.width : null)
     const width = exactWidth || measureCharWidth(fontInfo, char || "0") * zoom
     if (!width) return null
     let left = rect.left, top = rect.top, bottom = rect.bottom
-    if (model && model.dF > model.c) {
+    const suspended = nativeGeometry || linewiseState?.externalRange?.cursor
+    if (suspended) {
+        const scroller = getDocsScrollContainer()
+        left = suspended.point.x - (scroller?.scrollLeft || 0)
+        top = suspended.point.y - (scroller?.scrollTop || 0)
+        bottom = top + suspended.height
+        rect = { left: rect.left, top: rect.top, height: suspended.height, bottom: rect.bottom }
+    } else if (model && model.dF > model.c) {
         const cursorPoint = model.boundaries && model.boundaries.get(model.c)
         const focusPoint = model.boundaries && model.boundaries.get(model.dF)
         if (cursorPoint && comparePoints(focusPoint, cursorDocumentPoint()) === 0) {
@@ -623,8 +632,10 @@ function comparePoints(a, b) {
 
 let nativeVisualAnchorAfter = false
 let visualAnchorPoint = null
+let nativeVisualCursorGeometry = null
 
 function prepareNativeVisualMotion(forward) {
+    nativeVisualCursorGeometry = null
     const m = visualModel
     if (m) {
         // Keep the existing anchor. Walking back to it and rebuilding a long
@@ -655,6 +666,7 @@ function finishNativeVisualMotion(direction, ownGuard = true) {
 async function repairNativeVisualAnchor(forward, ownGuard = true) {
     if (ownGuard && !beginOracle()) return
     try {
+        const destination = cursorDocumentPoint()
         const selected = await withClipboardSaved((previous) => copySelectionForOracle(previous))
         if (selected === null) return
         const n = toGraphemes(selected).length
@@ -668,6 +680,7 @@ async function repairNativeVisualAnchor(forward, ownGuard = true) {
         }
         nativeVisualAnchorAfter = !forward
         nativeVisualFocusAfter = forward
+        await waitForCaretPaint(cursorDocumentPoint(), false, forward ? null : destination)
     } finally {
         if (ownGuard) releaseOracle()
     }
@@ -682,44 +695,45 @@ function visualNativeMotion(forward, nativeFn) {
 }
 
 let nativeVisualGoalX = null
-async function waitForCaretPaint(before, vertical = false) {
+async function waitForCaretPaint(before, vertical = false, expected = null) {
     for (let n = 0; n < 12; n++) {
         if (oracleAbort?.signal.aborted) return
         const after = cursorDocumentPoint()
-        if (after && before && (vertical ? Math.abs(after.y - before.y) > 1 : comparePoints(after, before) !== 0)) return
+        if (expected ? comparePoints(after, expected) === 0 : after && before &&
+            (vertical ? Math.abs(after.y - before.y) > 1 : comparePoints(after, before) !== 0)) return
         if (typeof requestAnimationFrame !== "function") return
         await waitForEditorPaint()
     }
 }
 
-async function alignVisualColumn(goalX) {
+async function alignVisualColumn(goalX, shift = true) {
     const scroller = getDocsScrollContainer()
     const run = renderedRunAtCaret()
     if (run?.advances) {
         const x = goalX - (scroller?.scrollLeft || 0) - run.left
         let target = 0
-        for (let i = 1; i < run.text.length; i++) {
+        for (let i = 1; i <= run.text.length; i++) {
             if (Math.abs(run.advances[i] - x) < Math.abs(run.advances[target] - x)) target = i
         }
         const delta = target - run.at, before = cursorDocumentPoint()
-        repeatMotion(() => sendKeyEvent(delta > 0 ? "right" : "left", { shift: true }), Math.abs(delta))
+        repeatMotion(() => sendKeyEvent(delta > 0 ? "right" : "left", { shift }), Math.abs(delta))
         if (delta) await waitForCaretPaint(before)
-        return
+        return false
     }
     // Without annotations, inspect only painted positions. A synchronous
     // correction loop races Docs' caret paint and can undo a real row move.
     for (let n = 0; n < 128; n++) {
         const before = cursorDocumentPoint()
-        if (!before || Math.abs(before.x - goalX) <= 1) return
+        if (!before || Math.abs(before.x - goalX) <= 1) return false
         const right = before.x < goalX
-        sendKeyEvent(right ? "right" : "left", { shift: true })
+        sendKeyEvent(right ? "right" : "left", { shift })
         await waitForCaretPaint(before)
         const after = cursorDocumentPoint()
-        if (!after || comparePoints(before, after) === 0) return
+        if (!after || comparePoints(before, after) === 0) return false
         if (Math.abs(after.y - before.y) > 1 || Math.abs(after.x - goalX) >= Math.abs(before.x - goalX)) {
-            sendKeyEvent(right ? "left" : "right", { shift: true })
+            sendKeyEvent(right ? "left" : "right", { shift })
             await waitForCaretPaint(after)
-            return
+            return right && Math.abs(after.y - before.y) > 1
         }
     }
 }
@@ -728,9 +742,10 @@ async function visualNativeVertical(down, count = 1) {
     if (!beginOracle()) return
     try {
         await withStableSelection(async () => {
-            const beforePrepare = cursorDocumentPoint()
+            const model = visualModel, retract = model ? model.dF > model.c : nativeVisualFocusAfter
+            const expected = model?.boundaries?.get(model.c) || nativeVisualCursorGeometry?.point
             prepareNativeVisualMotion(down)
-            await waitForCaretPaint(beforePrepare)
+            if (retract) await waitForCaretPaint(cursorDocumentPoint(), false, expected)
             if (oracleAbort && oracleAbort.signal.aborted) return
             const point = cursorDocumentPoint()
             if (nativeVisualGoalX === null && point) nativeVisualGoalX = point.x
@@ -741,12 +756,13 @@ async function visualNativeVertical(down, count = 1) {
                 await alignVisualColumn(nativeVisualGoalX)
             }
             if (oracleAbort && oracleAbort.signal.aborted) return
-            const run = renderedRunAtCaret()
-            if (run && run.text.length && run.at === run.text.length) {
-                sendKeyEvent("left", { shift: true })
-                await waitForEditorPaint()
-            }
+            const beforeFinish = cursorDocumentPoint()
+            const glyph = cursorGlyphInfo(), height = getCursorTop()?.getBoundingClientRect().height || 20
             await finishNativeVisualMotion(down, false)
+            if (nativeVisualFocusAfter) await waitForCaretPaint(beforeFinish)
+            if (!oracleAbort?.signal.aborted && beforeFinish) nativeVisualCursorGeometry = {
+                point: beforeFinish, focus: cursorDocumentPoint(), glyph, height,
+            }
         })
     } finally { releaseOracle(); refreshCursorOverlayForCurrentMode() }
 }
@@ -860,6 +876,7 @@ let visualObjectReturnMode = "visual"
 function switchModeToVisual() {
     mode = 'visual'
     visualModel = null
+    nativeVisualCursorGeometry = null
     nativeVisualFocusAfter = true
     nativeVisualAnchorAfter = false
     visualAnchorPoint = cursorDocumentPoint()
@@ -948,8 +965,10 @@ function visualOperator(op) {
 
 function switchModeToNormal() {
     clearLinewiseSelection()
+    pendingSelectionCheck = null
     mode = 'normal'
     visualModel = null
+    nativeVisualCursorGeometry = null
     updateModeIndicator(mode)
     finishTemporaryNormal()
 }
@@ -1139,6 +1158,10 @@ function drainKeyQueue() {
                     clickMenu(menuItems.redo)
                 } else if (item.menu) {
                     clickMenu(menuItems[item.menu])
+                } else if (item.shortcut) {
+                    runLinewiseNativeShortcut(item.shortcut)
+                } else if (item.event) {
+                    eventHandler({ ...item.event, isTrusted: true, preventDefault() {}, stopImmediatePropagation() {} })
                 } else {
                     handleKey({
                         key: item.key,
@@ -2434,6 +2457,18 @@ function leaveVisualSelectionForEscape() {
 // the same Edit-menu clicks DocsKeys uses everywhere else; the rest are
 // dropped (the window is a fraction of a second).
 const HELD_NAMED_KEYS = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "Backspace", "Delete", "Enter"]
+function nativeShortcutArgs(e) {
+    return { key: e.key, code: e.code || "", keyCode: e.keyCode || (e.key.length === 1 ? e.key.toUpperCase().charCodeAt(0) : 0),
+        mods: { control: !!e.ctrlKey, alt: !!e.altKey, shift: !!e.shiftKey, meta: !!e.metaKey } }
+}
+
+async function runLinewiseNativeShortcut(args) {
+    if (oracleBusy) { queueKey({ shortcut: args }); return }
+    await prepareLinewiseExternalSelection(() => {
+        window.dispatchEvent(new CustomEvent("doc-keys-native-shortcut", { detail: args }))
+    })
+}
+
 function handleModifiedKey(e) {
     if (mode === "insert") return
     const k = e.key || ""
@@ -2441,7 +2476,8 @@ function handleModifiedKey(e) {
         const primary = isMac ? e.metaKey : e.ctrlKey
         const edit = primary && !e.altKey && ["x", "v", "z", "y"].includes(k.toLowerCase())
         if (HELD_NAMED_KEYS.includes(k) || edit) invalidateExternalText()
-        if (edit && mode !== "normal") {
+        const collapsedNavigation = HELD_NAMED_KEYS.includes(k) && !e.shiftKey
+        if ((edit || collapsedNavigation) && mode !== "normal") {
             // Leave the native range intact for Cut/Paste. Its collapse after
             // the edit must not leave a stale Visual badge/model behind.
             visualModel = null
@@ -2475,8 +2511,33 @@ function handleModifiedKey(e) {
     }
 }
 
+function reconcileVisualSelection() {
+    if (mode !== "visual" || oracleBusy || readPresentationDepth ||
+        document.documentElement.hasAttribute?.("data-docskeys-selection-batch") ||
+        document.documentElement.hasAttribute?.("data-docskeys-reading")) return
+    // A virtual EOF/empty modeled range is valid Vim state. Missing markup
+    // also proves nothing; recover only when Docs explicitly hides every
+    // existing native selection overlay.
+    if (visualModel && visualModel.dA === visualModel.dF) return
+    const overlays = Array.from(document.querySelectorAll(".kix-selection-overlay"))
+    if (!overlays.length || !overlays.every((node) => node.hidden ||
+        node.style.display === "none" || window.getComputedStyle?.(node).display === "none")) return
+    switchModeToNormal()
+}
+
+function handleNativeInput(event) {
+    invalidateExternalText()
+    if (/^(insert|delete|history)/.test(event.inputType || "") && (mode === "visual" || mode === "visualLine")) {
+        // Context-menu edits and IME can bypass our key handler. Let Docs
+        // consume its existing range, but retire the old Visual state now.
+        visualModel = null
+        switchModeToNormal()
+    }
+}
+
 function eventHandler(e) {
     if (e.isTrusted === false || e.isComposing || e.keyCode === 229) return
+    reconcileVisualSelection()
     if (oracleBusy && (e.key === "Escape" || (e.ctrlKey && e.key === "["))) {
         e.preventDefault()
         e.stopImmediatePropagation()
@@ -2512,9 +2573,40 @@ function eventHandler(e) {
 
     const key = translateKey(e.key)
 
-    if (mode === "visualLine" && linewiseState && e.ctrlKey && ["c", "x", "v"].includes(e.key.toLowerCase())) {
+    const primary = isMac ? e.metaKey : e.ctrlKey
+    // Formatting shortcuts use Docs' OS-layout key, never the DVP mapping.
+    // Copy/Cut/Paste retain the explicit linewise operator paths below.
+    if (mode === "visualLine" && linewiseState && primary && e.key.length === 1 &&
+        !["c", "x", "v", "z", "y"].includes(e.key.toLowerCase()) &&
+        !(e.ctrlKey && !e.altKey && !e.shiftKey && ["d", "u", "f", "b", "e"].includes(key))) {
         e.preventDefault(); e.stopImmediatePropagation()
-        linewiseOperator(e.key.toLowerCase() === "c" ? "y" : e.key.toLowerCase() === "x" ? "d" : "p")
+        runLinewiseNativeShortcut(nativeShortcutArgs(e))
+        return
+    }
+
+    if (!oracleBusy && linewiseState?.externalRange && !(e.ctrlKey || e.altKey || e.metaKey)) {
+        e.preventDefault(); e.stopImmediatePropagation()
+        restoreLinewiseExternalSelection()
+        queueKey({ key: e.key })
+        return
+    }
+
+    if (!oracleBusy && linewiseState?.externalRange && !(["c", "x", "v"].includes(e.key.toLowerCase()) && primary && !e.altKey)) {
+        e.preventDefault(); e.stopImmediatePropagation()
+        restoreLinewiseExternalSelection()
+        queueKey({ event: { key: e.key, code: e.code, ctrlKey: e.ctrlKey, altKey: e.altKey,
+            shiftKey: e.shiftKey, metaKey: e.metaKey, keyCode: e.keyCode } })
+        return
+    }
+
+    if (mode === "visualLine" && linewiseState && primary && !e.altKey && ["c", "x", "v"].includes(e.key.toLowerCase())) {
+        e.preventDefault(); e.stopImmediatePropagation()
+        const op = e.key.toLowerCase() === "c" ? "y" : e.key.toLowerCase() === "x" ? "d" : "p"
+        if (linewiseState.externalRange) {
+            restoreLinewiseExternalSelection()
+            queueKey({ key: op })
+        } else if (oracleBusy) queueKey({ key: op })
+        else linewiseOperator(op)
         return
     }
 
@@ -2587,6 +2679,11 @@ function eventHandler(e) {
 // key has already been preventDefault()ed, so it can't fall through to Docs
 // as native typing.
 function handleKey(e) {
+    if (!oracleBusy && linewiseState?.externalRange) {
+        restoreLinewiseExternalSelection()
+        queueKey({ key: e.key })
+        return
+    }
     const arrows = { ArrowLeft: "h", ArrowDown: "j", ArrowUp: "k", ArrowRight: "l", Home: "0", End: "$" }
     const key = arrows[e.key] || translateKey(e.key)
 
@@ -3209,38 +3306,122 @@ waitForElement(
 // the selection behind DocsKeys' back, so the exact models are dropped and
 // motions fall back to Docs' native selection motions.
 let mouseDownPos = null
-if (typeof document.addEventListener === "function") {
-    document.addEventListener("mousedown", (e) => {
-        if (!e.isTrusted || !e.target.closest(".kix-appview-editor")) return
-        if (oracleBusy) abortDocumentRead(false)
-        invalidateTextSnapshot()
-        mouseDownPos = { x: e.clientX, y: e.clientY }
+let preserveMouseClick = null
+let linewiseContextPreparation = null
+let linewiseToolbarGesture = null
+function editorMouseDown(e) {
+    if (!e.isTrusted || !e.target.closest(".kix-appview-editor")) return
+    if (e.button !== undefined && e.button !== 0) {
         if (mode === "visual" || mode === "visualLine") {
-            visualModel = null
-            clearLinewiseSelection()
-            visualAnchorPoint = null
-            mode = "normal"
-            updateModeIndicator(mode)
+            // Docs' right-button mousedown otherwise collapses its selection
+            // before opening the context menu. Keep the menu event itself.
+            e.preventDefault(); e.stopImmediatePropagation()
+            if (mode === "visualLine") linewiseContextPreparation = prepareLinewiseExternalSelection()
         }
-    }, true)
+        return
+    }
+    if (oracleBusy) abortDocumentRead(false)
+    if ((mode === "visual" || mode === "visualLine") && !e.shiftKey && e.detail < 2) {
+        const overlay = cursorBoxOverlay?.getBoundingClientRect?.()
+        if (overlay && e.clientX >= overlay.left - 1 && e.clientX <= overlay.right + 1 &&
+            e.clientY >= overlay.top && e.clientY <= overlay.bottom) {
+            e.preventDefault(); e.stopImmediatePropagation()
+            mouseDownPos = { preserved: true }
+            preserveMouseClick = { target: e.target, until: Date.now() + 1000 }
+            return
+        }
+    }
+    const point = linewiseState?.externalRange?.cursor.point ||
+        (mode === "visual" && (visualModel?.boundaries?.get(visualModel.c) || nativeVisualCursorGeometry?.point)) || cursorDocumentPoint()
+    mouseDownPos = { x: e.clientX, y: e.clientY, point, mode,
+        model: visualModel, linewise: linewiseState }
+}
+
+async function editorMouseUp(e) {
+    if (!e.isTrusted || (e.button !== undefined && e.button !== 0) || !e.target.closest(".kix-appview-editor")) return
+    const down = mouseDownPos
+    mouseDownPos = null
+    if (down?.preserved) { e.preventDefault(); e.stopImmediatePropagation(); return }
+    if (mode === "insert") return
+    await waitForEditorPaint()
+    const dragged = down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 3
+    if (!dragged && !e.shiftKey && e.detail < 2 && down && comparePoints(down.point, cursorDocumentPoint()) === 0) {
+        if (down.mode === "visual" && down.model) {
+            visualModel = down.model
+            // Docs may have collapsed the range at the unchanged focus.
+            visualModel.dA = visualModel.dF
+            visualSetSelection(visualModel.a, visualModel.c)
+        }
+        return
+    }
+    invalidateTextSnapshot()
+    visualModel = null; clearLinewiseSelection(); visualAnchorPoint = null
+    pendingSelectionCheck = null; pendingFindType = null; pendingFindOperator = null
+    multipleMotion.times = 0; searchState = null; hideSearchLine()
+    mode = "normal"; updateModeIndicator(mode)
+    if (dragged || e.shiftKey || e.detail >= 2) markSelectionCheck("user")
+}
+
+function linewiseContextMenu(e) {
+    if (!e.isTrusted || !linewiseState || !e.target.closest(".kix-appview-editor")) return
+    if (linewiseState.externalRange) { linewiseContextPreparation = null; return }
+    e.preventDefault(); e.stopImmediatePropagation()
+    const target = e.target, x = e.clientX, y = e.clientY
+    const preparation = linewiseContextPreparation || prepareLinewiseExternalSelection()
+    linewiseContextPreparation = null
+    preparation.then((ready) => {
+        if (ready && linewiseState?.externalRange) target.dispatchEvent(new MouseEvent("contextmenu", {
+            bubbles: true, cancelable: true, button: 2, clientX: x, clientY: y,
+        }))
+    })
+}
+
+function replayLinewiseToolbarGesture() {
+    const gesture = linewiseToolbarGesture
+    if (!gesture?.clicked || !gesture.ready) return
+    linewiseToolbarGesture = null
+    if (!gesture.ok || !gesture.target.isConnected) return
+    gesture.target.focus?.({ preventScroll: true })
+    simulateClick(gesture.target)
+}
+
+function linewiseToolbarMouseDown(e) {
+    if (!e.isTrusted || (e.button !== undefined && e.button !== 0) || mode !== "visualLine" || !linewiseState ||
+        linewiseState.externalRange || e.target.closest(".kix-appview-editor")) return
+    const target = e.target.closest('button, [role="button"], [role="menuitem"], [role="combobox"], input, select')
+    if (!target) return
+    e.preventDefault(); e.stopImmediatePropagation()
+    const gesture = linewiseToolbarGesture = { target, clicked: false, ready: false }
+    prepareLinewiseExternalSelection(() => {
+        gesture.ok = true; gesture.ready = true
+        replayLinewiseToolbarGesture()
+    }).then((ok) => {
+        if (!ok && linewiseToolbarGesture === gesture) linewiseToolbarGesture = null
+    })
+    setTimeout(() => { if (linewiseToolbarGesture === gesture) linewiseToolbarGesture = null }, 2000)
+}
+
+if (typeof document.addEventListener === "function") {
+    document.addEventListener("mousedown", editorMouseDown, true)
+    document.addEventListener("mouseup", editorMouseUp, true)
+    document.addEventListener("contextmenu", linewiseContextMenu, true)
+    document.addEventListener("mousedown", linewiseToolbarMouseDown, true)
     document.addEventListener("mouseup", (e) => {
-        if (!e.isTrusted || !e.target.closest(".kix-appview-editor")) return
-        const moved = mouseDownPos && Math.hypot(e.clientX - mouseDownPos.x, e.clientY - mouseDownPos.y) > 3
-        mouseDownPos = null
-        if (mode === "insert") return
-        if (moved || e.shiftKey || e.detail >= 2) markSelectionCheck("user")
-        else {
-            pendingSelectionCheck = null
-            pendingFindType = null
-            pendingFindOperator = null
-            multipleMotion.times = 0
-            searchState = null
-            hideSearchLine()
-            visualModel = null
-            clearLinewiseSelection()
-            mode = "normal"
-            updateModeIndicator(mode)
+        if (e.isTrusted && linewiseToolbarGesture) { e.preventDefault(); e.stopImmediatePropagation() }
+    }, true)
+    document.addEventListener("click", (e) => {
+        if (e.isTrusted && preserveMouseClick) {
+            const preserved = preserveMouseClick
+            preserveMouseClick = null
+            if (Date.now() <= preserved.until && (e.target === preserved.target || preserved.target.contains?.(e.target))) {
+                e.preventDefault(); e.stopImmediatePropagation()
+                return
+            }
         }
+        if (!e.isTrusted || !linewiseToolbarGesture) return
+        e.preventDefault(); e.stopImmediatePropagation()
+        linewiseToolbarGesture.clicked = true
+        replayLinewiseToolbarGesture()
     }, true)
 }
 

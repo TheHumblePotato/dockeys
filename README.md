@@ -22,11 +22,14 @@ Settings are saved locally and apply to open documents automatically:
 | Start in insert mode | Off | Choose the initial mode for newly loaded Docs tabs. Changing this does not interrupt an active command. |
 | Word motions | Fast | Both modes use Vim word boundaries across paragraphs. Fast caches reads for up to 2.5 seconds; Precise allows up to 0.5 seconds. Edits and mouse/native navigation invalidate the cache. |
 | Document reads | Auto | Prefer annotated rendered text; fall back to masked clipboard reads. Rendered only disables document probes and declines commands needing unavailable text. Clipboard forces the compatibility reader. |
-| Visual j/k | Displayed rows | Move one displayed row using native selection events, including wrapped paragraphs. Choose Paragraphs for Vim-style logical lines; that option may need a larger text snapshot. |
+| Visual movement and linewise selection | Displayed rows | Charwise Visual `j/k` moves by displayed rows. `V` highlights and operates on those rows too. Choose Paragraphs for logical paragraph movement and linewise ranges. |
+| Wrap search | On | Wrap `/`, `?`, `n/N`, and word searches at document boundaries, like `wrapscan`. |
+| Ignore case / Smart case | Off / Off | Ignore case by default; optional Smart case makes uppercase queries case-sensitive. Per-query `\c/\C` overrides these settings. Word searches `*/#` ignore Smart case, following Vim. |
+| Search match counter | On | Show the result index/count. A suffix-only snapshot explicitly labels its count as “from search start”. |
 
 DVP remains enabled by default for compatibility with this fork. Settings no longer require editing source constants. Both word modes share one motion engine. Fast no longer delegates to native Docs word jumps. Destructive word/search operators refresh their snapshot before selecting text.
 
-After updating to 1.10, reload the extension and fully refresh Docs tabs. The rendered reader requests annotations during document startup. That request is undocumented and may be unavailable in some Docs versions; Auto retains a clipboard fallback. Rendered only can cross adjacent annotated paragraphs when their boundaries are explicit, but still declines unknown/offscreen boundaries, global search, and operators requiring a full snapshot. Native linewise cursor movement remains available without a text read. Explicit yank/paste/register commands can still use the clipboard in that setting.
+After updating to 1.11, reload the extension and fully refresh Docs tabs. The rendered reader requests annotations during document startup. That request is undocumented and may be unavailable in some Docs versions; Auto retains a clipboard fallback. Rendered only can cross adjacent annotated paragraphs when their boundaries are explicit, but still declines unknown/offscreen boundaries, global search, and operators requiring a full snapshot. Native linewise cursor movement remains available without a text read. Explicit yank/paste/register commands can still use the clipboard in that setting.
 
 ## Commands
 
@@ -66,7 +69,7 @@ Charwise Visual mode includes both the anchor and cursor character, even when cr
 
 Entering `v` uses rendered text where the caret can be mapped confidently, otherwise a masked bounded snapshot. Adjacent runs are joined verbatim only inside explicit paragraph groups; neighboring paragraph siblings supply real line breaks. Word/WORD motions use the shared Vim engine across those boundaries. Commands needing more context promote a local model to a full snapshot in Auto/Clipboard mode. The entire collapse/read/reconstruction stays inside one viewport transaction, including delayed layout frames. A failed read restores the original selection.
 
-By default, Visual `j/k` moves one **displayed row**, matching normal movement in Docs. It preserves the existing anchor and uses native Up/Down instead of walking a whole paragraph with character events. Repeated movement across ordinary rows needs no clipboard read; crossing the anchor may require one repair read. Choose **Visual j/k → Paragraphs** for Vim's logical-line behavior instead. Returning to a modeled word/text-object motion after native movement can require a masked snapshot rebuild. Preferred columns and short/empty rows without annotations still need broader live testing.
+By default, Visual `j/k` moves one **displayed row**, matching normal movement in Docs. It preserves the existing anchor and uses native Up/Down instead of walking a whole paragraph with character events. Repeated movement across ordinary rows needs no clipboard read; crossing the anchor may require one repair read. Column corrections wait for painted caret positions, preserve the preferred column through short/empty rows, and use measured glyph advances when available. Choose **Visual movement and linewise selection → Paragraphs** for Vim's logical-line behavior. Returning to a modeled word/text-object motion after native movement can require a masked snapshot rebuild.
 
 Modeled counts, `o`/`O`, line-local `f/F/t/T`, and word text objects use the same snapshot. `$` includes the paragraph break where one exists. EOF can be a virtual Visual cursor position without selecting a neighboring character.
 
@@ -74,9 +77,11 @@ Selection and tile redraws retain the Visual model instead of triggering another
 
 `V` keeps an ordinary native caret at its current column and draws a separate whole-line highlight. `h/j/k/l`, word motions, `0/^/$`, `f/F/t/T`, `gg/G`, searches, and counts move the caret; crossing a paragraph boundary expands the highlighted range. `o/O` swap the cursor and anchor. `v` converts the range to charwise Visual mode; converting back preserves its span. Escape leaves the caret where it is.
 
-Linewise native `j/k` follow Docs' displayed rows; operators use logical paragraph boundaries. Annotated paragraph geometry supplies whole-paragraph highlighting, including wrapped rows; without it the highlight band approximates displayed rows. Entering `V` normally reads one snapshot to remember the anchor. Movement does not rebuild a native selection on every key; supported editing/clipboard commands realize the range when needed. If text access is unavailable, native movement/highlighting still works, while commands needing an exact range decline. Native formatting menus and accessibility selection ranges are not synchronized with the custom highlight.
+`V` uses the configured unit for movement, highlighting, and operators: displayed rows or logical paragraphs. Entering `V` and swapping endpoints need no Copy or whole-document read. Logical anchors are resolved lazily when needed. Annotated text bounds constrain the highlight horizontally; paragraph bounds are the fallback. Without usable annotations, the custom highlight remains approximate.
 
-A plain mouse click that clears a Visual range returns to normal mode without Copy. Dragging, double-clicking, or shift-clicking enters charwise Visual mode. Mouse replacement invalidates pending motion state and cancels a read without moving the newly clicked caret.
+Native formatting shortcuts, toolbar/menu actions, and right-click prepare a real Docs range before applying formatting or comments. The logical cursor and anchor are saved as offsets within that range, then restored before the next Vim command, including after font reflow. While formatting, the native highlight represents the selected range and the box stays at the logical cursor. Restoring validates the range text; an external text edit or replaced selection returns to Normal rather than rebuilding a stale range. Display-row formatting uses range-only clipboard reads; paragraph formatting can require a full snapshot. Preparation preserves the viewport and clipboard. Docs' handling of replayed shortcuts/custom context menus still needs live verification; the operating system's browser menu cannot be opened synthetically.
+
+A primary mouse click that moves the cursor leaves Visual without Copy. Clicking the box, right-clicking, and clicking outside the editor retain the mode; toolbar actions receive the full linewise range. Dragging, double-clicking, or shift-clicking enters charwise Visual mode. Mouse replacement invalidates pending motion state and cancels a read without moving the newly clicked caret. Native Cut/Paste/Undo and unshifted native navigation leave Visual without collapsing the range before Docs handles the action. Explicitly hidden native selection overlays also clear stale charwise Visual state on the next editor key.
 
 Escape cancels a pending Visual argument/count first; another Escape leaves Visual mode. `g` is now a prefix: use `gg`, not a single `g`, to go to the first line. Like Neovim's default `nostartofline`, `gg/G` preserve the column where possible.
 
@@ -88,10 +93,12 @@ Up/Down browse the last 50 submitted queries in this Docs tab. Down past the new
 
 Search keeps viewport protection through its destination move. It restores the intended viewport before measuring the target, then scrolls only enough to show that target. Missing patterns retain the original view. Annotated text can verify a unique nearby match and correct a one/two-character native landing discrepancy, including backward searches.
 
+An ordinary first forward search reads only the suffix after the cursor. A missing suffix match or a backward repeat expands the prefix only when needed. Repeats reuse a revision/position-bound source and a compiled match index; binary search and modular count arithmetic handle large counts without repeating the scan. Destructive searches still refresh the full snapshot before editing. Distant verified destinations can use document-edge keys plus a short remainder instead of thousands of arrows.
+
 - `d/hi` + Enter deletes up to the next `hi`, excluding the match. `c/hi`, `y/hi`, backward searches, `dn`, and counted searches also work.
-- `n/N` repeat in the original/opposite direction. Searches wrap at document boundaries.
+- `n/N` repeat in the original/opposite direction. Searches wrap at document boundaries unless Wrap search is disabled.
 - `*/#` search the word under the cursor, skipping the current occurrence. Keyword searches use whole-word boundaries.
-- Queries are case-sensitive by default; `\c` and `\C` control case, `\n` matches a paragraph break, and an optional `\V` prefix is accepted.
+- Queries are case-sensitive by default. Ignore case and Smart case are configurable; `\c` and `\C` override them. `\n` matches a paragraph break, and an optional `\V` prefix is accepted.
 - This is **literal search**, not a full implementation of Vim regular expressions. Characters such as `.*[]` are literal. Built-in Google Docs Find remains available from Docs' menu.
 
 ### Registers and clipboard
@@ -103,6 +110,8 @@ Search keeps viewport protection through its destination move. It restores the i
 - `"_` discards text without capturing a register.
 
 Named registers persist in local extension storage. Captures, reads, and restores share an input guard so rapid commands cannot race the clipboard. Distinct keys pressed during a read are replayed afterward; held repeats received while busy are dropped to prevent movement continuing after release.
+
+If storage disappears or rejects a write, registers remain usable in this tab and the edit completes normally. A one-time notice explains how to restore persistence. Settings fall back to validated defaults if storage is unavailable during startup. Refresh Docs after reloading the extension so an old content script does not retain an invalid extension context.
 
 Clipboard requests have finite deadlines. Escape/Ctrl+[ cancel an active read ahead of queued keys, clear stale commands/masks, and return to normal mode. Cleanup and clipboard restoration have bounded waits; a stalled promise cannot permanently lock the input queue. Queue overflow and the command watchdog cancel the stalled command instead of leaving input trapped.
 
@@ -119,7 +128,7 @@ See [READING_RESEARCH.md](READING_RESEARCH.md) for sources, alternatives, and th
 ## Limits and compatibility
 
 - Google Docs has no supported content-script buffer API. Snapshots assume plain-text graphemes correspond to arrow-key steps. Large documents, tables, lists, embedded objects, and page wrapping need live Docs testing.
-- Normal/native `j/k`, default Visual `j/k`, linewise cursor `j/k`, and Home/End are display-line based. The Visual Paragraphs option, linewise operator ranges, and `gg/G` use paragraph breaks. Wrapped-line behavior still differs from a fully integrated Vim buffer.
+- Normal/native `j/k` and Home/End use displayed rows. Both Visual modes follow the configured Displayed rows/Paragraphs setting; `V` operators share that unit. Other logical operators and `gg/G` use paragraph breaks. Wrapped-line behavior still differs from a fully integrated Vim buffer.
 - Snapshot invalidation is best effort for collaborative canvas edits. Precise is fresher, while Fast reuses snapshots longer.
 - Search is literal; full Vim regex, incremental highlighting, persistent history, and the search register are not implemented.
 - The box width is estimated when direct boundary geometry is unavailable. Custom `iskeyword` and every Unicode word-class boundary are not implemented.
@@ -143,11 +152,11 @@ npm test
 node test.js
 ~~~
 
-The runner checks JavaScript syntax, motions/operators, registers, graphemes, Visual cursor geometry, scrolling races, wrapped Visual rows and key volume, delayed caret/failed Copy recovery, cache reuse, custom search/history, settings/color, and the keyboard bridge. It also runs seeded selection fuzzing. If Neovim is installed, `vim_differential.js` compares the pure engine and actual extension command sequences to a clean headless editor; set `DOCSKEYS_NVIM` if its executable is not on PATH, or run `npm run test:vim`. Missing Neovim is reported as a skipped comparison.
+The runner checks JavaScript syntax, motions/operators, registers, graphemes, Visual cursor geometry, scrolling races, wrapped Visual rows and key volume, delayed caret/failed Copy recovery, cache reuse, custom search/history/options, settings/color, and the keyboard bridge. Selection integration checks cover formatting/toolbar/context ranges, font reflow, shifted-shortcut queue recovery, and missing storage. It also runs seeded selection fuzzing. If Neovim is installed, `vim_differential.js` compares the pure engine and actual extension command sequences to a clean headless editor; set `DOCSKEYS_NVIM` if its executable is not on PATH, or run `npm run test:vim`. Missing Neovim is reported as a skipped comparison.
 
 `harness.js` loads the actual content scripts in a simulated Docs editor. Differential checks cover the tested rules, not all Vim commands or the live Google Docs UI.
 
-Run `npm run test:browser` separately for a disposable local Chromium fixture (Chrome/Edge, or set `DOCSKEYS_BROWSER`). It verifies real DOM/CSS/canvas glyph sizing, generated-bullet cross-line word motions, independent linewise highlighting/native caret movement, masked Copy, late callback scroll suppression, iframe focus protection, stable Visual redraws, and Escape recovery from a clipboard promise that never resolves. It uses a fresh browser profile and does not access an authenticated document.
+Run `npm run test:browser` separately for a disposable local Chromium fixture (Chrome/Edge, or set `DOCSKEYS_BROWSER`). It verifies real DOM/CSS/canvas glyph sizing, generated-bullet cross-line word motions, text-bounded linewise highlighting/native caret movement, full ranges seen by comment shortcuts/toolbar/context handlers, storage fallback, masked Copy, late callback scroll suppression, iframe focus protection, stable Visual redraws, and Escape recovery from a clipboard promise that never resolves. It uses a fresh browser profile and does not access an authenticated document.
 
 Before a release, check an actual Docs document with multiple collaborators, page wrapping, zoom changes, native mouse selections, an empty final paragraph, and clipboard permissions denied. The simulator and local browser fixture do not verify those live Docs behaviors or guarantee the private annotation/selection selectors remain available.
 
