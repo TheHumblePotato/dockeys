@@ -29,7 +29,7 @@ Settings are saved locally and apply to open documents automatically:
 
 DVP remains enabled by default for compatibility with this fork. Settings no longer require editing source constants. Both word modes share one motion engine. Fast no longer delegates to native Docs word jumps. Destructive word/search operators refresh their snapshot before selecting text.
 
-After updating to 1.11, reload the extension and fully refresh Docs tabs. The rendered reader requests annotations during document startup. That request is undocumented and may be unavailable in some Docs versions; Auto retains a clipboard fallback. Rendered only can cross adjacent annotated paragraphs when their boundaries are explicit, but still declines unknown/offscreen boundaries, global search, and operators requiring a full snapshot. Native linewise cursor movement remains available without a text read. Explicit yank/paste/register commands can still use the clipboard in that setting.
+After updating to 1.12, reload the extension and fully refresh Docs tabs. The pointer guard and rendered annotation request run during document startup; reloading only the extension leaves an old page bridge running. The annotation request is undocumented and may be unavailable in some Docs versions; Auto retains a clipboard fallback. Rendered only can cross adjacent annotated paragraphs when their boundaries are explicit, but still declines unknown/offscreen boundaries, global search, and operators requiring a full snapshot. Native linewise cursor movement remains available without a text read. Explicit yank/paste/register commands can still use the clipboard in that setting.
 
 ## Commands
 
@@ -43,9 +43,12 @@ After updating to 1.11, reload the extension and fully refresh Docs tabs. The re
 | Native display-line movement | `gj`, `gk` |
 | Find on current display line | `f{char}`, `F{char}`, `t{char}`, `T{char}`, `;`, `,` |
 | Insert | `i`, `a`, `I`, `A`, `o`, `O` |
+| Insert at display-column zero | `gI` |
 | Return to normal | Escape or `Ctrl+[` |
 | Temporary normal from insert | `Ctrl+o`, followed by one complete command |
 | Visual / visual line | `v`, `V`; repeat the same key to leave |
+| Linewise formatting | In `V`: native `Ctrl+b/i/u`, `Ctrl+Shift+./,`, `Ctrl+Alt+m`, or toolbar controls (use Cmd/Option on Mac) |
+| Visual context menu | Right-click, the Context Menu key, or `Shift+F10` |
 | Delete / change / yank | `d{motion}`, `c{motion}`, `y{motion}`, doubled operators such as `dd` |
 | Word text objects | `iw`, `aw`, `iW`, `aW`; e.g. `diw`, `d2aw` |
 | Paragraph text objects | `ip`, `ap` (Docs paragraph approximation) |
@@ -80,6 +83,10 @@ Selection and tile redraws retain the Visual model instead of triggering another
 `V` uses the configured unit for movement, highlighting, and operators: displayed rows or logical paragraphs. Entering `V` and swapping endpoints need no Copy or whole-document read. Logical anchors are resolved lazily when needed. Annotated text bounds constrain the highlight horizontally; paragraph bounds are the fallback. Without usable annotations, the custom highlight remains approximate.
 
 Native formatting shortcuts, toolbar/menu actions, and right-click prepare a real Docs range before applying formatting or comments. The logical cursor and anchor are saved as offsets within that range, then restored before the next Vim command, including after font reflow. While formatting, the native highlight represents the selected range and the box stays at the logical cursor. Restoring validates the range text; an external text edit or replaced selection returns to Normal rather than rebuilding a stale range. Display-row formatting uses range-only clipboard reads; paragraph formatting can require a full snapshot. Preparation preserves the viewport and clipboard. Docs' handling of replayed shortcuts/custom context menus still needs live verification; the operating system's browser menu cannot be opened synthetically.
+
+The early page bridge intercepts pointer events before Docs' window listeners can move the caret. Toolbar replay includes pointer events and real control coordinates, including Closure toolbar controls without ARIA roles. Pressing Control/Command starts preparation early; a ready selection keeps the original trusted formatting key. Rapid shortcuts prefer an available toolbar action and otherwise use the keyboard bridge. Empty range prefixes are never Copied, avoiding the disabled Copy menu. In `V`, bold/underline shortcuts take priority over the conflicting Vim Ctrl+b/u scrolling commands; normal-mode scrolling remains available. These shortcuts follow [Google Docs' keyboard reference](https://support.google.com/docs/answer/179738?hl=en-GB).
+
+Formatting/comment actions end the probe scroll guard before their own UI opens. Page-relative bookmarks rebase the anchor and logical box when the comment panel recenters the document. Right-click menus open at the existing selection's logical cursor so Docs cannot hit-test an unselected click location. Native browser/OS menus cannot be opened by synthetic events; Docs' custom context handler is the integration target.
 
 A primary mouse click that moves the cursor leaves Visual without Copy. Clicking the box, right-clicking, and clicking outside the editor retain the mode; toolbar actions receive the full linewise range. Dragging, double-clicking, or shift-clicking enters charwise Visual mode. Mouse replacement invalidates pending motion state and cancels a read without moving the newly clicked caret. Native Cut/Paste/Undo and unshifted native navigation leave Visual without collapsing the range before Docs handles the action. Explicitly hidden native selection overlays also clear stale charwise Visual state on the next editor key.
 
@@ -156,7 +163,7 @@ The runner checks JavaScript syntax, motions/operators, registers, graphemes, Vi
 
 `harness.js` loads the actual content scripts in a simulated Docs editor. Differential checks cover the tested rules, not all Vim commands or the live Google Docs UI.
 
-Run `npm run test:browser` separately for a disposable local Chromium fixture (Chrome/Edge, or set `DOCSKEYS_BROWSER`). It verifies real DOM/CSS/canvas glyph sizing, generated-bullet cross-line word motions, text-bounded linewise highlighting/native caret movement, full ranges seen by comment shortcuts/toolbar/context handlers, storage fallback, masked Copy, late callback scroll suppression, iframe focus protection, stable Visual redraws, and Escape recovery from a clipboard promise that never resolves. It uses a fresh browser profile and does not access an authenticated document.
+Run `npm run test:browser` separately for disposable local Chromium fixtures (Chrome/Edge, or set `DOCSKEYS_BROWSER`). The DOM fixture verifies glyph sizing, generated-bullet words, native linewise ranges, masks, viewport guards, storage fallback, and cancellation. On Node 22+, the CDP fixture also supplies trusted pointer/keyboard input, models early window listeners, applies Bold/font-size effects to every character in the selected range, and checks rapid Ctrl+B, native comments, comment-panel layout shifts, and right-click preservation in both Visual modes. Both use fresh profiles and do not access an authenticated document.
 
 Before a release, check an actual Docs document with multiple collaborators, page wrapping, zoom changes, native mouse selections, an empty final paragraph, and clipboard permissions denied. The simulator and local browser fixture do not verify those live Docs behaviors or guarantee the private annotation/selection selectors remain available.
 

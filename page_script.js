@@ -8,6 +8,45 @@ window.addEventListener("docskeys-annotation-request", (event) => {
         window._docs_annotate_canvas_by_ext = event.detail
     }
 })
+
+// Install before Docs' window capture listeners. A document-level mousedown
+// guard is too late: pointerdown has already moved Docs' canvas caret.
+let visualPointerState = { visual: false, linewise: false, ready: false }
+let pointerGesture = null
+window.addEventListener("doc-keys-visual-pointer-state", (event) => {
+    const value = event.detail || {}
+    visualPointerState = { visual: !!value.visual, linewise: !!value.linewise, ready: !!value.ready }
+    if (!visualPointerState.visual) pointerGesture = null
+})
+const toolbarSelector = 'button, input, select, [role="button"], [role="menuitem"], [role="combobox"], .goog-toolbar-button, .goog-toolbar-toggle-button, .goog-toolbar-menu-button, .goog-toolbar-combo-button, .goog-menuitem'
+for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click", "auxclick", "contextmenu"]) {
+    window.addEventListener(type, (event) => {
+        if (!event.isTrusted || !visualPointerState.visual) return
+        const target = event.target, editor = target?.closest?.(".kix-appview-editor")
+        const right = event.button === 2 && editor
+        const toolbar = event.button === 0 && !editor && visualPointerState.linewise &&
+            !visualPointerState.ready && target?.closest?.(toolbarSelector)
+        if (!right && !toolbar && !pointerGesture) return
+        if (pointerGesture && event.button !== pointerGesture.button) return
+        event.preventDefault(); event.stopImmediatePropagation()
+        const down = type === "pointerdown" || type === "mousedown"
+        if (down && !pointerGesture) {
+            pointerGesture = { target, button: event.button }
+            target.dispatchEvent(new CustomEvent("doc-keys-pointer-intent", { bubbles: true,
+                detail: { phase: "down", button: event.button, x: event.clientX, y: event.clientY } }))
+        }
+        if (type === "click" || type === "contextmenu") {
+            target.dispatchEvent(new CustomEvent("doc-keys-pointer-intent", { bubbles: true,
+                detail: { phase: type, button: event.button, x: event.clientX, y: event.clientY } }))
+            if (type === "click") pointerGesture = null
+        }
+        if (type === "auxclick") pointerGesture = null
+        if (down) {
+            const gesture = pointerGesture
+            setTimeout(() => { if (pointerGesture === gesture) pointerGesture = null }, 2000)
+        }
+    }, true)
+}
 // Runs in the page's world so Docs sees legacy keyCode/which properties.
 // Based on https://github.com/philc/sheetkeys/blob/master/page_scripts/page_script.js
 const simulatedKeys = {

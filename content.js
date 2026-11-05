@@ -491,6 +491,7 @@ function refreshCursorOverlayForCurrentMode() {
 }
 
 function updateModeIndicator(currentMode) {
+    publishVisualPointerState()
     modeIndicator.style.display = settings.modeIndicator ? "block" : "none"
     if (!settings.boxCursor) hideCursorBoxOverlay()
     modeIndicator.textContent = currentMode.toUpperCase()
@@ -2457,15 +2458,34 @@ function leaveVisualSelectionForEscape() {
 // the same Edit-menu clicks DocsKeys uses everywhere else; the rest are
 // dropped (the window is a fraction of a second).
 const HELD_NAMED_KEYS = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "Backspace", "Delete", "Enter"]
+function publishVisualPointerState() {
+    window.dispatchEvent(new CustomEvent("doc-keys-visual-pointer-state", { detail: {
+        visual: mode === "visual" || !!linewiseState,
+        linewise: !!linewiseState,
+        ready: !!linewiseState?.externalRange,
+    } }))
+}
+
 function nativeShortcutArgs(e) {
-    return { key: e.key, code: e.code || "", keyCode: e.keyCode || (e.key.length === 1 ? e.key.toUpperCase().charCodeAt(0) : 0),
+    const punctuation = { ".": ["Period", 190], ">": ["Period", 190], ",": ["Comma", 188], "<": ["Comma", 188] }
+    const fallback = punctuation[e.key] || [e.key.length === 1 ? `Key${e.key.toUpperCase()}` : "", e.key.toUpperCase().charCodeAt(0)]
+    return { key: e.key, code: e.code || fallback[0], keyCode: e.keyCode || fallback[1],
         mods: { control: !!e.ctrlKey, alt: !!e.altKey, shift: !!e.shiftKey, meta: !!e.metaKey } }
 }
 
 async function runLinewiseNativeShortcut(args) {
     if (oracleBusy) { queueKey({ shortcut: args }); return }
     await prepareLinewiseExternalSelection(() => {
-        window.dispatchEvent(new CustomEvent("doc-keys-native-shortcut", { detail: args }))
+        const key = args.key.toLowerCase(), mods = args.mods
+        const action = !mods.alt && !mods.shift && ({ b: "Bold", i: "Italic", u: "Underline" })[key] ||
+            (mods.shift && !mods.alt && (args.code === "Period" ? "Increase font size" : args.code === "Comma" ? "Decrease font size" : null)) ||
+            (mods.alt && key === "m" ? "Add comment" : null)
+        const ids = { Bold: "boldButton", Italic: "italicButton", Underline: "underlineButton" }
+        const button = action && (document.getElementById?.(ids[action]) ||
+            Array.from(document.querySelectorAll('[role="button"][aria-label], .goog-toolbar-button[aria-label], .goog-toolbar-toggle-button[aria-label]'))
+                .find((node) => (node.getAttribute("aria-label") || "").startsWith(action)))
+        if (button && button.getAttribute("aria-disabled") !== "true") simulateClick(button)
+        else window.dispatchEvent(new CustomEvent("doc-keys-native-shortcut", { detail: args }))
     })
 }
 
@@ -2550,6 +2570,16 @@ function eventHandler(e) {
         handleSearchInput(e)
         return
     }
+    if ((e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) && (mode === "visual" || linewiseState)) {
+        e.preventDefault(); e.stopImmediatePropagation()
+        const target = document.querySelector(".kix-appview-editor")
+        if (target) nativePointerIntent({ target, detail: { phase: "contextmenu", button: 2 } })
+        return
+    }
+    // Start on the modifier press so the actual formatting key can remain
+    // trusted when it arrives. Slow reads retain the guarded replay fallback.
+    if ((e.key === "Control" || e.key === "Meta") && mode === "visualLine" && linewiseState &&
+        !linewiseState.externalRange && !oracleBusy) prepareLinewiseExternalSelection()
     if (
         ["Shift","Meta","Control","Alt",""].includes(e.key)
     ) return
@@ -2578,7 +2608,12 @@ function eventHandler(e) {
     // Copy/Cut/Paste retain the explicit linewise operator paths below.
     if (mode === "visualLine" && linewiseState && primary && e.key.length === 1 &&
         !["c", "x", "v", "z", "y"].includes(e.key.toLowerCase()) &&
-        !(e.ctrlKey && !e.altKey && !e.shiftKey && ["d", "u", "f", "b", "e"].includes(key))) {
+        !(e.ctrlKey && !e.altKey && !e.shiftKey && ["d", "f", "e"].includes(key) &&
+            !["b", "i", "u"].includes(e.key.toLowerCase()))) {
+        if (linewiseState.externalRange && !oracleBusy) {
+            finishReadForNativeAction()
+            return // A ready native range can use the original trusted key.
+        }
         e.preventDefault(); e.stopImmediatePropagation()
         runLinewiseNativeShortcut(nativeShortcutArgs(e))
         return
@@ -2632,7 +2667,11 @@ function eventHandler(e) {
         (key == 'd' || key == 'u' || key == 'f' || key == 'b' || key == 'e' || key == 'y')) {
         e.preventDefault()
         e.stopImmediatePropagation()
-        if (oracleBusy) return // scrolling mid-read would move the caret out from under the temporary selection
+        if (oracleBusy) {
+            if (linewiseState && !e.repeat) queueKey({ event: { key: e.key, code: e.code, ctrlKey: e.ctrlKey,
+                altKey: e.altKey, shiftKey: e.shiftKey, metaKey: e.metaKey, keyCode: e.keyCode } })
+            return
+        }
         switch (key) {
             case 'd': halfScreenScroll(true); break
             case 'u': halfScreenScroll(false); break
@@ -3238,8 +3277,20 @@ function findMenuItem(menuItem) {
 
 function simulateClick(el, x = 0, y = 0) {
     if (!el) return
-    const eventSequence = ["mouseover", "mousedown", "mouseup", "click"];
+    if (!x && !y && el.getBoundingClientRect) {
+        const rect = el.getBoundingClientRect()
+        x = rect.left + rect.width / 2; y = rect.top + rect.height / 2
+    }
+    const eventSequence = typeof PointerEvent === "function"
+        ? ["pointerover", "mouseover", "pointerdown", "mousedown", "pointerup", "mouseup", "click"]
+        : ["mouseover", "mousedown", "mouseup", "click"];
     for (const eventName of eventSequence) {
+        if (eventName.startsWith("pointer")) {
+            el.dispatchEvent(new PointerEvent(eventName, { bubbles: true, cancelable: true, view: window,
+                pointerId: 1, pointerType: "mouse", isPrimary: true, button: 0,
+                buttons: eventName === "pointerdown" ? 1 : 0, clientX: x, clientY: y }))
+            continue
+        }
         const event = document.createEvent("MouseEvents");
         event.initMouseEvent(
             eventName,
@@ -3258,6 +3309,8 @@ function simulateClick(el, x = 0, y = 0) {
             0,
             null,
         );
+        Object.defineProperty(event, "buttons", { value: eventName === "mousedown" ? 1 : 0 })
+        Object.defineProperty(event, "which", { value: 1 })
         el.dispatchEvent(event);
     }
 }
@@ -3362,17 +3415,41 @@ async function editorMouseUp(e) {
     if (dragged || e.shiftKey || e.detail >= 2) markSelectionCheck("user")
 }
 
+function visualContextPoint(fallback) {
+    const box = getDocsScrollContainer()?.getBoundingClientRect?.()
+    for (const node of document.querySelectorAll(".kix-selection-overlay")) {
+        if (node.style.display === "none") continue
+        const rect = node.getBoundingClientRect()
+        const left = Math.max(rect.left, box?.left ?? 0), right = Math.min(rect.right, box?.right ?? Infinity)
+        const top = Math.max(rect.top, box?.top ?? 0), bottom = Math.min(rect.bottom, box?.bottom ?? Infinity)
+        if (right > left && bottom > top) return { x: left + Math.min(2, (right - left) / 2), y: top + (bottom - top) / 2 }
+    }
+    return fallback
+}
+
 function linewiseContextMenu(e) {
     if (!e.isTrusted || !linewiseState || !e.target.closest(".kix-appview-editor")) return
-    if (linewiseState.externalRange) { linewiseContextPreparation = null; return }
+    if (linewiseState.externalRange && !e.fromBridge) { linewiseContextPreparation = null; return }
     e.preventDefault(); e.stopImmediatePropagation()
-    const target = e.target, x = e.clientX, y = e.clientY
+    const target = e.target
     const preparation = linewiseContextPreparation || prepareLinewiseExternalSelection()
     linewiseContextPreparation = null
     preparation.then((ready) => {
-        if (ready && linewiseState?.externalRange) target.dispatchEvent(new MouseEvent("contextmenu", {
-            bubbles: true, cancelable: true, button: 2, clientX: x, clientY: y,
-        }))
+        if (ready && linewiseState?.externalRange) {
+            finishReadForNativeAction()
+            rebaseLinewiseLayout()
+            // Docs hit-tests contextmenu coordinates too. Open it inside the
+            // existing range, rather than handing it an unselected location.
+            const point = linewiseState.externalRange.cursor.point, scroller = getDocsScrollContainer()
+            const menuPoint = visualContextPoint({ x: point.x - (scroller?.scrollLeft || 0) + 1,
+                y: point.y - (scroller?.scrollTop || 0) + 1 })
+            const hit = document.elementFromPoint?.(menuPoint.x, menuPoint.y)
+            const menuTarget = hit?.closest?.(".kix-appview-editor") ? hit : target
+            menuTarget.dispatchEvent(new MouseEvent("contextmenu", {
+                bubbles: true, cancelable: true, button: 2,
+                clientX: menuPoint.x, clientY: menuPoint.y,
+            }))
+        }
     })
 }
 
@@ -3381,14 +3458,15 @@ function replayLinewiseToolbarGesture() {
     if (!gesture?.clicked || !gesture.ready) return
     linewiseToolbarGesture = null
     if (!gesture.ok || !gesture.target.isConnected) return
-    gesture.target.focus?.({ preventScroll: true })
+    finishReadForNativeAction()
     simulateClick(gesture.target)
+    if (gesture.target.matches?.('input, select, [contenteditable="true"]')) gesture.target.focus?.({ preventScroll: true })
 }
 
 function linewiseToolbarMouseDown(e) {
     if (!e.isTrusted || (e.button !== undefined && e.button !== 0) || mode !== "visualLine" || !linewiseState ||
         linewiseState.externalRange || e.target.closest(".kix-appview-editor")) return
-    const target = e.target.closest('button, [role="button"], [role="menuitem"], [role="combobox"], input, select')
+    const target = e.target.closest('input, select, button, [role="button"], [role="menuitem"], [role="combobox"], .goog-toolbar-button, .goog-toolbar-toggle-button, .goog-toolbar-menu-button, .goog-toolbar-combo-button, .goog-menuitem')
     if (!target) return
     e.preventDefault(); e.stopImmediatePropagation()
     const gesture = linewiseToolbarGesture = { target, clicked: false, ready: false }
@@ -3401,7 +3479,33 @@ function linewiseToolbarMouseDown(e) {
     setTimeout(() => { if (linewiseToolbarGesture === gesture) linewiseToolbarGesture = null }, 2000)
 }
 
+function nativePointerIntent(event) {
+    const info = event.detail || {}
+    const e = { target: event.target, button: info.button, clientX: info.x, clientY: info.y,
+        isTrusted: true, fromBridge: true, detail: 1, preventDefault() {}, stopImmediatePropagation() {} }
+    if (info.phase === "down") {
+        if (info.button === 2) editorMouseDown(e)
+        else linewiseToolbarMouseDown(e)
+    } else if (info.phase === "contextmenu") {
+        if (linewiseState) linewiseContextMenu(e)
+        else if (mode === "visual") {
+            const rect = cursorBoxOverlay?.getBoundingClientRect?.() || getCursorTop()?.getBoundingClientRect()
+            if (rect) {
+                const point = visualContextPoint({ x: rect.left + 1, y: rect.top + 1 })
+                const hit = document.elementFromPoint?.(point.x, point.y)
+                const target = hit?.closest?.(".kix-appview-editor") ? hit : event.target
+                target.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true,
+                    button: 2, clientX: point.x, clientY: point.y }))
+            }
+        }
+    } else if (info.phase === "click" && linewiseToolbarGesture) {
+        linewiseToolbarGesture.clicked = true
+        replayLinewiseToolbarGesture()
+    }
+}
+
 if (typeof document.addEventListener === "function") {
+    document.addEventListener("doc-keys-pointer-intent", nativePointerIntent, true)
     document.addEventListener("mousedown", editorMouseDown, true)
     document.addEventListener("mouseup", editorMouseUp, true)
     document.addEventListener("contextmenu", linewiseContextMenu, true)

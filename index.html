@@ -194,7 +194,7 @@
                 <div class="description">End of line</div>
             </div>
             <div class="shortcut">
-                <div class="key">g</div>
+                <div class="key">gg</div>
                 <div class="description">Document start</div>
             </div>
             <div class="shortcut">
@@ -233,6 +233,10 @@
                 <div class="description">Insert mode (after cursor)</div>
             </div>
             <div class="shortcut">
+                <div class="key">gI</div>
+                <div class="description">Insert at column zero of the displayed line</div>
+            </div>
+            <div class="shortcut">
                 <div class="key">v</div>
                 <div class="description">Visual mode</div>
             </div>
@@ -262,7 +266,19 @@
             </div>
             <div class="shortcut">
                 <div class="key">Ctrl + d/u/f/b/e/y</div>
-                <div class="description">Scroll half/full screen, or one line (e/y keep the cursor put)</div>
+                <div class="description">Scroll half/full screen, or one line (e/y keep the cursor put). In V, Ctrl+b/u format bold/underline.</div>
+            </div>
+            <div class="shortcut">
+                <div class="key">V + Ctrl+b/i/u</div>
+                <div class="description">Bold, italic, underline the whole line selection</div>
+            </div>
+            <div class="shortcut">
+                <div class="key">V + Ctrl+Alt+m</div>
+                <div class="description">Comment on the whole line selection</div>
+            </div>
+            <div class="shortcut">
+                <div class="key">Shift+F10</div>
+                <div class="description">Open the context menu for a Visual selection</div>
             </div>
             <div class="shortcut">
                 <div class="key">zz / zt / zb</div>
@@ -271,7 +287,7 @@
         </div>
         <div class="tip">
              <div class="tip-title">Visual mode tip</div>
-             <div class="tip-content">Visual mode includes the anchor and cursor characters. <span class="key inline">w</span> lands on the next word’s first character; <span class="key inline">e</span> lands at a word end. <span class="key inline">V</span> keeps a movable cursor and highlights whole paragraphs as motions cross lines. <span class="key inline">o/O</span> swaps endpoints. A plain click clears Visual mode. Escape also cancels an active document read.</div>
+             <div class="tip-content">Visual mode includes the anchor and cursor characters. <span class="key inline">w</span> lands on the next word’s first character; <span class="key inline">e</span> lands at a word end. <span class="key inline">V</span> follows the displayed-row/paragraph setting. <span class="key inline">o/O</span> swaps endpoints. A primary click that moves the cursor leaves Visual; right-click and toolbar actions preserve the selection. Escape also cancels an active document read.</div>
          </div>
     </div>
 

@@ -61,6 +61,15 @@ Live Google Docs testing is still required for paragraph/text extraction, format
 - Added search wrapping, ignore case, smart case, and match-counter preferences. `\c/\C` override case options; `*/#` follow Vim's smart-case exception. Partial counts are labeled explicitly.
 - Added simulator/Chromium coverage for formatting/context/toolbar ranges, storage failure, font reflow, and Visual recovery. Neovim comparisons exercise both linewise settings on unwrapped rows; wrapped semantics are covered separately in the simulator.
 
+## Implemented in 1.12
+
+- A document-start page bridge blocks right pointerdown/mousedown/mouseup before Docs' window listeners. Context-menu hit-testing uses a point inside the original selection; both Visual modes retain their endpoints. Context Menu and Shift+F10 keys are supported too.
+- Toolbar replay now includes pointer events, button state, control-centered coordinates, and Closure toolbar classes without ARIA roles. Native linewise bold/italic/underline/font-size/comment shortcuts prepare the range on modifier press, retain trusted keys when ready, and prefer toolbar actions for rapid fallback.
+- Native formatting has priority over Ctrl+b/u scrolling in `V`. Empty range prefixes skip Copy instead of opening a disabled menu item. Preparing a range no longer focuses a toolbar button before replaying its pointer gesture.
+- Comment/format actions release probe scroll/masking before opening UI. Page-relative geometry translates linewise anchor/cursor bookmarks when the comment panel shifts the paper; cached bounds are invalidated.
+- Added read-free normal-mode `gI` to insert at column zero of the displayed row. Updated the popup reference for `gg`, configured linewise units, native formatting, and context menus.
+- Added a CDP-driven fixture with trusted pointer/key input, actual per-character formatting effects, early-window right-click handlers, role-less toolbar controls, font inputs, rapid Ctrl+B, and comment-layout transitions. This still does not substitute for live Docs verification.
+
 ## Complete remaining backlog
 
 The sections below are the current list of unfinished features, known approximations, and integration work. Live verification is part of the backlog, not evidence that a behavior is already correct in Docs.
@@ -81,7 +90,7 @@ The sections below are the current list of unfinished features, known approximat
 
 - Unify line semantics across operators, text objects, `gg/G`, `V`, and the configurable Visual vertical modes. Displayed rows and logical paragraph lines are explicit options, but not every command shares the same abstraction.
 - Support all column-preservation cases, tabs, variable-width graphemes, and virtual-column behavior. `gg/G` currently choose a grapheme column, not a tab-expanded screen column.
-- Audit remaining aliases and boundaries: `_` counts, counted `$`, `g^/g0/g$`, `gI`, and native `h/l` at paragraph boundaries. `I` currently uses Home rather than first nonblank.
+- Audit remaining aliases and boundaries: `_` counts, counted `$`, `g^/g0/g$`, and native `h/l` at paragraph boundaries. `gI` is implemented; `I` currently uses Home rather than first nonblank.
 - Implement `H/M/L`, counted viewport commands, sentence motions, and reliable blank-line paragraph motions instead of Docs' paragraph shortcuts.
 - Add `%` with bracket nesting and quote/escape handling.
 - Add marks, the jump list, and normal-mode `Ctrl+o/Ctrl+i` with document positions that survive collaborator edits.
@@ -92,7 +101,7 @@ The sections below are the current list of unfinished features, known approximat
 - Eliminate the remaining clipboard repair on native Visual anchor crossings and the snapshot rebuild when resuming modeled words after native vertical movement.
 - Extend live verification of preferred-column retention and EOL/blank-row clamping to styled wraps, tables, tabs, and bidirectional text. Simulator tests include missing annotations and delayed caret paint.
 - Improve linewise highlighting without annotation geometry and preserve paragraph bands across virtualized/page-split paragraphs. Verify disjoint text columns rather than merging unrelated runs at the same Y position.
-- Verify native formatting, comments, and context menus in live Docs. Shortcuts/custom menus are replayed after range preparation; synthetic events cannot open the browser/OS default context menu, and Docs may change its trusted-event requirements.
+- Verify native formatting, comments, and context menus in live Docs, including localization, disabled controls, suggestions, and selected spans across pages. Trusted CDP input and early pointer capture are covered in the local fixture; replay behavior and private selectors remain dependent on Docs.
 - Expose custom linewise ranges to accessibility tools while an ordinary caret is active; the native selection currently exists during explicit formatting/clipboard/edit actions.
 
 ## Editing and register follow-ups

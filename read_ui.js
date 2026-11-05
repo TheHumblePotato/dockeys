@@ -15,6 +15,20 @@ function cancelReadScrollSettlement() {
     window.dispatchEvent(new CustomEvent("doc-keys-read-phase", { detail: { active: false } }))
 }
 
+// A formatting command owns subsequent focus/layout changes. In particular,
+// opening comments must not inherit a probe's horizontal scroll lock.
+function finishReadForNativeAction() {
+    if (readPresentationDepth || viewportRead) return
+    viewportEpoch++
+    readPresentationGeneration++
+    selectionBatchGeneration++
+    readScrollSettling = false
+    setReadAttribute("data-docskeys-reading", false)
+    setReadAttribute("data-docskeys-selection-batch", false)
+    removeSelectionFreeze()
+    window.dispatchEvent(new CustomEvent("doc-keys-read-phase", { detail: { active: false } }))
+}
+
 function setReadAttribute(name, active) {
     const root = document.documentElement
     if (!root || !root.setAttribute) return

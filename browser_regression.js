@@ -14,7 +14,6 @@ const executable = process.env.DOCSKEYS_BROWSER || [
 ].find((file) => fs.existsSync(file))
 if (!executable) { console.log("SKIP browser regression: set DOCSKEYS_BROWSER to Chromium/Chrome/Edge"); process.exit(0) }
 
-const temp = fs.mkdtempSync(path.join(os.tmpdir(), "docskeys-browser-"))
 const scripts = ["page_script.js", ...manifest.content_scripts.find((entry) => entry.js.includes("content.js")).js]
 const source = scripts.map((file) => `<script>${fs.readFileSync(path.join(__dirname, file), "utf8").replace(/<\/script/gi, "<\\/script")}</script>`).join("\n")
 const fixture = String.raw`<!doctype html><meta charset="utf-8">
@@ -25,7 +24,7 @@ const fixture = String.raw`<!doctype html><meta charset="utf-8">
 .kix-selection-overlay { position:absolute; background:rgba(26,115,232,.3); left:40px; top:40px; width:150px; height:24px; }
 .docs-texteventtarget-iframe { position:fixed; left:-10000px; width:10px; height:10px; }
 </style>
-<div class="kix-appview-editor"><div id="paper">
+<div class="kix-appview-editor"><div id="paper" class="kix-page">
 <svg class="kix-canvas-tile-content" width="500" height="1200"></svg>
 <div class="kix-selection-overlay"></div>
 <div class="kix-cursor"><span class="kix-cursor-name"></span><div class="kix-cursor-caret"></div></div>
@@ -199,6 +198,9 @@ ${source}
  }catch(error){document.querySelector('#docskeys-test-result').textContent='FAIL '+error.stack}
 })();
 </script>`
+module.exports = { fixture, executable }
+if (require.main === module) {
+const temp = fs.mkdtempSync(path.join(os.tmpdir(), "docskeys-browser-"))
 const html = path.join(temp, "fixture.html")
 fs.writeFileSync(html, fixture)
 const result = spawnSync(executable, ["--headless", "--disable-gpu", "--in-process-gpu", "--no-first-run", "--no-default-browser-check",
@@ -216,3 +218,4 @@ console.log(match[1])
 const resolved = path.resolve(temp), root = path.resolve(os.tmpdir()) + path.sep
 if (!resolved.startsWith(root) || !path.basename(resolved).startsWith("docskeys-browser-")) throw Error("Unexpected fixture directory")
 try { fs.rmSync(resolved, { recursive: true, force: true }) } catch (err) { /* Chromium may briefly retain a profile file. */ }
+}

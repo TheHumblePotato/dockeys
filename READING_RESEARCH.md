@@ -37,6 +37,14 @@ Auto combines these paths. Rendered only disables automatic clipboard document p
 
 ## Verification and remaining uncertainty
 
+### Changes in 1.12
+
+The earlier fixture tested click handlers but missed pointer handlers registered on `window` before a late content script. The document-start bridge now intercepts trusted right-button pointer/mouse events before Docs can move its canvas caret, and gates unprepared toolbar gestures. Replays include pointer events and control-centered coordinates. A CDP fixture supplies trusted input and checks actual per-character formatting effects rather than only logging event delivery.
+
+Empty prefixes skip disabled Copy actions. Modifier presses pre-arm the native linewise range; ready formatting keys remain trusted, while rapid fallbacks prefer an available toolbar action. Formatting/comment actions explicitly end probe masking and scroll settlement before opening their UI. Otherwise a comment callback could inherit a read's scroll guard. Page-relative bookmarks translate saved coordinates after paper recentering, preventing the custom overlay from staying at its former X position.
+
+The trusted fixture covers role-less Closure toolbar buttons, font inputs, immediate Ctrl+B, right pointerdown/mouseup handlers, both Visual modes, Context Menu keys, comments, and restoring the custom overlay after a horizontal layout change. It remains a local model of Docs, not authenticated live-document evidence.
+
 ### Changes in 1.11
 
 Entering linewise mode now stores geometry without selecting or copying the document. Displayed rows and logical paragraphs use the same configured unit for highlighting, vertical movement, and operators. Paragraph anchors are resolved only when text-indexed operations need them. Horizontal highlighting uses rendered text/paragraph bounds.

@@ -3,6 +3,32 @@
 let linewiseState = null
 let linewiseHighlight = null
 
+function linewiseLayoutReference() {
+    const node = renderedRunAtCaret()?.node
+    return node?.closest?.('.kix-page') || document.querySelector('.kix-page')
+}
+
+function captureLinewiseLayout() {
+    const node = linewiseLayoutReference(), scroller = getDocsScrollContainer()
+    const rect = node?.getBoundingClientRect()
+    return rect && { node, x: rect.left + (scroller?.scrollLeft || 0), y: rect.top + (scroller?.scrollTop || 0) }
+}
+
+function rebaseLinewiseLayout() {
+    const state = linewiseState, layout = state?.layout
+    if (!layout?.node?.isConnected) return
+    const rect = layout.node.getBoundingClientRect(), scroller = getDocsScrollContainer()
+    const x = rect.left + (scroller?.scrollLeft || 0), y = rect.top + (scroller?.scrollTop || 0)
+    const dx = x - layout.x, dy = y - layout.y
+    if (!dx && !dy) return
+    const translate = (point) => point && ({ x: point.x + dx, y: point.y + dy })
+    state.point = translate(state.point)
+    if (state.externalRange) state.externalRange.cursor.point = translate(state.externalRange.cursor.point)
+    if (state.unit === "display" && state.goal !== null && state.goal !== undefined) state.goal += dx
+    state.bands = new Map(); state.textBounds = null
+    state.layout = { node: layout.node, x, y }
+}
+
 function clearLinewiseSelection() {
     linewiseState = null
     if (linewiseHighlight) linewiseHighlight.style.display = "none"
@@ -140,7 +166,7 @@ async function startLinewiseSelection() {
             const row = linewiseCursorRow()
             if (!row) return
             linewiseState = { point: anchorPoint || row.point, height: row.height,
-                anchorIndex, unit: settings.visualVertical, revision: documentRevision }
+                anchorIndex, unit: settings.visualVertical, revision: documentRevision, layout: captureLinewiseLayout() }
             visualModel = null
             mode = "visualLine"
             updateModeIndicator(mode)
@@ -149,6 +175,7 @@ async function startLinewiseSelection() {
 }
 
 function renderLinewiseSelection() {
+    rebaseLinewiseLayout()
     if (!linewiseState || !["visualLine", "multipleMotion", "gPrefix", "waitForFindChar", "search", "waitForRegister"].includes(mode)) {
         if (linewiseHighlight) linewiseHighlight.style.display = "none"
         return
@@ -232,7 +259,7 @@ async function realizeDisplayLinewiseRange(state, op) {
         else sendKeyEvent("home", { shift: true })
     }
     await waitForEditorPaint()
-    return { empty: comparePoints(start, cursorDocumentPoint()) === 0 }
+    return { empty: comparePoints(start, cursorDocumentPoint()) === 0, start }
 }
 
 async function linewiseMoveVertical(down, count = 1) {
@@ -280,9 +307,13 @@ async function linewiseMoveVertical(down, count = 1) {
 // Formatting, comments, and toolbar actions need a real Docs range. Keep
 // offsets inside that range so font reflow cannot lose Vim's logical cursor.
 async function prepareLinewiseExternalSelection(onReady = null) {
+    rebaseLinewiseLayout()
     const state = linewiseState
     if (!state) return false
-    if (state.externalRange) { onReady?.(); return true }
+    if (state.externalRange) {
+        if (onReady) { finishReadForNativeAction(); onReady() }
+        return true
+    }
     if (!beginOracle()) return false
     const cursor = linewiseCursorRow(), anchor = { point: state.point, height: state.height }
     if (cursor) cursor.glyph = cursorGlyphInfo()
@@ -308,9 +339,13 @@ async function prepareLinewiseExternalSelection(onReady = null) {
                 const end = linewiseCursorRow()
                 const offsets = await withClipboardSaved(async (previous) => {
                     if (!await seekLinewisePoint(cursor, true)) return null
-                    const beforeCursor = await copySelectionForOracle(previous)
-                    if (beforeCursor === null || !await seekLinewisePoint(anchor, true)) return null
-                    const beforeAnchor = await copySelectionForOracle(previous)
+                    const beforeCursor = comparePoints(result.start, cursorDocumentPoint()) === 0 ? "" : await copySelectionForOracle(previous)
+                    if (beforeCursor === null) return null
+                    let beforeAnchor = beforeCursor
+                    if (comparePoints(anchor.point, cursor.point) !== 0) {
+                        if (!await seekLinewisePoint(anchor, true)) return null
+                        beforeAnchor = comparePoints(result.start, cursorDocumentPoint()) === 0 ? "" : await copySelectionForOracle(previous)
+                    }
                     if (beforeAnchor === null || !await seekLinewisePoint(end, true)) return null
                     const selected = await copySelectionForOracle(previous)
                     return selected === null ? null : { selected, c: toGraphemes(beforeCursor).length, a: toGraphemes(beforeAnchor).length }
@@ -325,7 +360,10 @@ async function prepareLinewiseExternalSelection(onReady = null) {
         }, 500)
         if (ready) {
             await clipboardRestorePending
-            if (!oracleAbort?.signal.aborted && state === linewiseState) onReady?.()
+            if (!oracleAbort?.signal.aborted && state === linewiseState && onReady) {
+                finishReadForNativeAction()
+                onReady()
+            }
         }
     } catch (err) {
         if (!oracleAbort?.signal.aborted) showSearchLine("Could not prepare the line selection; try again")
@@ -338,12 +376,14 @@ async function prepareLinewiseExternalSelection(onReady = null) {
                 if (cursor) await seekLinewisePoint(cursor)
             }, 500)
         }
+        publishVisualPointerState()
         releaseOracle()
     }
     return ready
 }
 
 async function restoreLinewiseExternalSelection() {
+    rebaseLinewiseLayout()
     const state = linewiseState, saved = state?.externalRange
     if (!saved || !beginOracle()) return false
     let restored = false
@@ -370,9 +410,10 @@ async function restoreLinewiseExternalSelection() {
             state.anchorIndex = undefined
             state.bands = new Map(); state.textBounds = null
             state.revision = documentRevision
+            state.layout = captureLinewiseLayout()
             restored = true
         }, 500)
-    } finally { releaseOracle() }
+    } finally { publishVisualPointerState(); releaseOracle() }
     return restored
 }
 

@@ -21,6 +21,9 @@ for (const text of ["one two.three, four", "a b\nc d", "a\n\nb\n", "  one   two\
     }
 }
 const adapterCases = []
+for (const [text, at] of [["  alpha\n    beta", 14], ["one two", 4], ["", 0]]) {
+    adapterCases.push({ text, at, keys: "gI", kind: "adapter" })
+}
 const adapterText = "one two.three\n\nfour five\nsix"
 for (const at of [0, 14, 20]) {
     for (const keys of ["vwwbb", "v2w", "v2e", "v3wbb", "vkkjj", "v3wge", "v$", "gE", "2ge", "2d2w", "cw", "2cw", "db", "d2e", "gg", "2gg", "G", "g_", "dg_", "$"]) {

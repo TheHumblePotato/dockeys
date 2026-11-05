@@ -1,12 +1,12 @@
 {
   "name": "docskeys",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "private": true,
   "description": "Vim-style keyboard shortcuts for Google Docs",
   "scripts": {
     "test": "node test.js",
     "test:vim": "node vim_differential.js",
-    "test:browser": "node browser_regression.js"
+    "test:browser": "node browser_regression.js && node trusted_browser_regression.js"
   },
   "engines": {
     "node": ">=18"

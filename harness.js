@@ -54,6 +54,7 @@ class DocSim {
         const ctrl = !!(mods.control || mods.alt)
         const names = { 37: "left", 38: "up", 39: "right", 40: "down", 35: "end", 36: "home", 8: "backspace", 46: "delete", 13: "enter", 32: "space" }
         const k = names[keyCode]
+        if (!k) return // Modifiers/formatting keys do not collapse a Docs range.
         this.keyLog.push(k + (shift ? "+S" : ""))
         const vertical = (k === "up" || k === "down")
         if (!vertical) this.goal = null

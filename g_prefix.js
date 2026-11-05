@@ -12,7 +12,10 @@ function handleGPrefix(key) {
     gPrefixState = null
     mode = state.returnMode
     if (mode === "visualLine" && !linewiseState && key !== "g") { updateModeIndicator(mode); return }
-    if (key === "e" || key === "E") {
+    if (key === "I" && !state.operator && state.returnMode === "normal") {
+        sendKeyEvent("home")
+        switchModeToInsert()
+    } else if (key === "e" || key === "E") {
         if (mode === "visual") visualSnapshotWord("ge", key === "E", state.count)
         else snapshotWordMotion("ge", key === "E", state.count, state.operator)
     } else if (key === "g") gotoTextLine(state.count, state.operator, state.returnMode)

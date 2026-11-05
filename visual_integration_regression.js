@@ -66,8 +66,10 @@ async function main() {
         assert.deepEqual(shortcuts, [["m", "alpha beta\ngamma delta\n"]])
         assert.equal(e.get("mode"), "visualLine")
         assert.equal(e.get("linewiseState.externalRange.cursor.point.x"), 66)
-        await e.pressRaw(">", true, { ctrlKey: true, shiftKey: true })
-        assert.equal(shortcuts.length, 2)
+        let prevented = false
+        await e.pressRaw(">", true, { ctrlKey: true, shiftKey: true, preventDefault() { prevented = true } })
+        assert.equal(shortcuts.length, 1, "a ready selection should retain the trusted formatting event")
+        assert.equal(prevented, false)
         assert.equal(e.sim.selText(), "alpha beta\ngamma delta\n")
         await e.pressRaw("h")
         assert.equal(e.sim.focus, cursor - 1, "formatting lost the logical linewise cursor")
@@ -155,6 +157,37 @@ async function main() {
     await e.documentListeners.mouseup(mouse(editor))
     assert.equal(e.get("mode"), "normal")
     assert.equal(e.sim.focus, 15)
+
+    // Do not open Docs' disabled Copy item for zero-length range prefixes.
+    e = makeEnv("alpha beta\ngamma delta", { settings: { dvorak: false } })
+    await e.pressAll("Vj")
+    const menu = e.sim.menu.bind(e.sim)
+    e.sim.menu = (caption) => {
+        if (caption === "Copy") assert.equal(e.sim.hasSel(), true, "preparation opened disabled Copy")
+        menu(caption)
+    }
+    await e.get("prepareLinewiseExternalSelection()")
+    await e.settle()
+    assert.equal(e.sim.copyCalls, 2, "the empty anchor prefix should not be copied")
+
+    e = makeEnv("  alpha\n    beta", { settings: { dvorak: false } })
+    e.sim.setCaret(14)
+    const copies = e.sim.copyCalls
+    await e.pressAll("gI")
+    assert.equal(e.get("mode"), "insert")
+    assert.equal(e.sim.focus, 8)
+    assert.equal(e.sim.copyCalls, copies)
+
+    e = makeEnv("alpha beta\ngamma delta", { settings: { dvorak: true } })
+    await e.press("V"); await e.press("j")
+    const relay = e.ctx.window.dispatchEvent
+    let underline = false
+    e.ctx.window.dispatchEvent = (event) => {
+        if (event.type === "doc-keys-native-shortcut" && event.detail.key === "u") underline = true
+        else relay(event)
+    }
+    await e.pressRaw("u", true, { ctrlKey: true })
+    assert.equal(underline, true, "DVP translation stole native Ctrl+U for page scrolling")
 
     console.log("Storage fallback, Visual shortcut/queue recovery, linewise formatting/context ranges, toolbar and mouse behavior passed")
 }
