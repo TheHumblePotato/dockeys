@@ -51,7 +51,7 @@ function renderedRunAtCaret() {
             const value = { text, at, partial: true, rendered: true, node,
                 char: text[at], glyphWidth: at < text.length ? widths[at + 1] - widths[at] : null,
                 previousChar: text[at - 1], previousWidth: at > 0 ? widths[at] - widths[at - 1] : null,
-                font, point: cursorDocumentPoint(), revision: textRevision, created: Date.now() }
+                font, advances: widths, left: box.left, point: cursorDocumentPoint(), revision: textRevision, created: Date.now() }
             if (!best || error < best.error || (error === best.error && value.char && !best.value.char)) best = { error, value }
         } catch (err) { /* Unknown font/geometry: use the bounded fallback. */ }
     }

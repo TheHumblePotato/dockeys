@@ -43,8 +43,8 @@ async function seekLinewiseRow(target, shift = false) {
     return false
 }
 
-async function seekLinewisePoint(target) {
-    if (!await seekLinewiseRow(target)) return false
+async function seekLinewisePoint(target, shift = false) {
+    if (!await seekLinewiseRow(target, shift)) return false
     const row = linewiseCursorRow()
     for (let n = 0; n < 1000; n++) {
         if (oracleAbort?.signal.aborted) return false
@@ -52,18 +52,18 @@ async function seekLinewisePoint(target) {
         if (!point) return false
         if (Math.abs(point.x - target.point.x) <= 1) return true
         const right = point.x < target.point.x
-        sendKeyEvent(right ? "right" : "left")
+        sendKeyEvent(right ? "right" : "left", { shift })
         await waitForEditorPaint()
         const next = linewiseCursorRow()
         if (!sameDisplayRow(row, next)) {
-            sendKeyEvent(right ? "left" : "right")
-            if (right) sendKeyEvent("end")
+            sendKeyEvent(right ? "left" : "right", { shift })
+            if (right) sendKeyEvent("end", { shift })
             await waitForEditorPaint()
             return comparePoints(cursorDocumentPoint(), target.point) === 0
         }
         if (comparePoints(next.point, point) === 0) return false
         if (Math.abs(next.point.x - target.point.x) > Math.abs(point.x - target.point.x)) {
-            sendKeyEvent(right ? "left" : "right")
+            sendKeyEvent(right ? "left" : "right", { shift })
             return false
         }
     }
@@ -110,7 +110,8 @@ function linewiseParagraphBand(point) {
         const rect = node.getBoundingClientRect()
         if (!rect.height || point.y < rect.top + offsetY - 1 || point.y > rect.bottom + offsetY + 1 ||
             point.x < rect.left + offsetX - 2 || point.x > rect.right + offsetX + 2) continue
-        if (!best || rect.height < best.height) best = { top: rect.top + offsetY, bottom: rect.bottom + offsetY, height: rect.height }
+        if (!best || rect.height < best.height) best = { top: rect.top + offsetY, bottom: rect.bottom + offsetY,
+            left: rect.left + offsetX, right: rect.right + offsetX, height: rect.height }
     }
     if (cache) { if (cache.size > 300) cache.clear(); cache.set(key, best) }
     return best
@@ -152,6 +153,10 @@ function renderLinewiseSelection() {
         if (linewiseHighlight) linewiseHighlight.style.display = "none"
         return
     }
+    if (linewiseState.externalRange) {
+        if (linewiseHighlight) linewiseHighlight.style.display = "none"
+        return
+    }
     if (readPresentationDepth) return
     const point = cursorDocumentPoint(), anchor = linewiseState.point
     if (!point || !anchor) return
@@ -171,8 +176,28 @@ function renderLinewiseSelection() {
             background: "rgba(26,115,232,0.2)" })
         document.body.appendChild(linewiseHighlight)
     }
-    Object.assign(linewiseHighlight.style, { display: bottom > top ? "block" : "none", top: `${top}px`,
-        left: `${box?.left || 0}px`, width: `${box?.width || scroller?.clientWidth || window.innerWidth || 600}px`, height: `${Math.max(0, bottom - top)}px` })
+    const boundsKey = `${top + scrollTop}|${bottom + scrollTop}|${documentRevision}|${logical}`
+    let bounds = linewiseState.textBounds
+    if (bounds?.key !== boundsKey) {
+        let left = Infinity, right = -Infinity
+        for (const node of document.querySelectorAll('.kix-canvas-tile-content rect[aria-label], .kix-canvas-tile-selection rect[aria-label]')) {
+            const rect = node.getBoundingClientRect()
+            if (!rect.width || !rect.height || rect.bottom <= top || rect.top >= bottom) continue
+            if (node.closest?.('[role="listmarker"]')) continue
+            left = Math.min(left, rect.left); right = Math.max(right, rect.right)
+        }
+        if (!Number.isFinite(left)) {
+            const bands = [anchorBand || linewiseParagraphBand(anchor), cursorBand || linewiseParagraphBand(point)].filter(Boolean)
+            const offset = scroller?.scrollLeft || 0
+            left = bands.length ? Math.min(...bands.map((band) => band.left)) - offset : Math.min(anchor.x, point.x) - offset
+            right = bands.length ? Math.max(...bands.map((band) => band.right)) - offset : Math.max(anchor.x, point.x) - offset + 8
+        }
+        bounds = linewiseState.textBounds = { key: boundsKey, left: left + (scroller?.scrollLeft || 0), right: right + (scroller?.scrollLeft || 0) }
+    }
+    const left = Math.max(box?.left || 0, bounds.left - (scroller?.scrollLeft || 0))
+    const right = Math.min(box?.right ?? Infinity, bounds.right - (scroller?.scrollLeft || 0))
+    Object.assign(linewiseHighlight.style, { display: bottom > top && right > left ? "block" : "none", top: `${top}px`,
+        left: `${left}px`, width: `${Math.max(0, right - left)}px`, height: `${Math.max(0, bottom - top)}px` })
 }
 
 function linewiseRange(snapshot, op, anchor, cursor) {
@@ -237,6 +262,95 @@ async function linewiseMoveVertical(down, count = 1) {
             revealReadDestination()
         }, 500)
     } finally { releaseOracle() }
+}
+
+// Formatting, comments, and toolbar actions need a real Docs range. Keep
+// offsets inside that range so font reflow cannot lose Vim's logical cursor.
+async function prepareLinewiseExternalSelection() {
+    const state = linewiseState
+    if (!state || state.externalRange) return !!state
+    if (!beginOracle()) return false
+    const cursor = linewiseCursorRow(), anchor = { point: state.point, height: state.height }
+    let ready = false
+    try {
+        await withViewportPreserved(async () => {
+            if (!cursor || !linewiseStillValid(state)) return
+            let text, cursorOffset, anchorOffset
+            if (linewiseUnit() === "logical") {
+                const snapshot = await getTextSnapshot(true)
+                if (!snapshot || !linewiseStillValid(state)) return
+                const at = snapshot.at, a = await resolveLinewiseAnchor(snapshot)
+                if (a === null) return
+                const range = linewiseRange(snapshot, "y", a, at)
+                moveSnapshotCaret(snapshot, range.start)
+                activeProbeRestore = () => sendKeyEvent("left")
+                repeatMotion(() => sendKeyEvent("right", { shift: true }), range.end - range.start)
+                text = snapshot.text.slice(range.start, range.end).join("")
+                cursorOffset = at - range.start; anchorOffset = a - range.start
+            } else {
+                const result = await realizeDisplayLinewiseRange(state, "y")
+                if (!result || result.empty) return
+                const end = linewiseCursorRow()
+                const offsets = await withClipboardSaved(async (previous) => {
+                    if (!await seekLinewisePoint(cursor, true)) return null
+                    const beforeCursor = await copySelectionForOracle(previous)
+                    if (beforeCursor === null || !await seekLinewisePoint(anchor, true)) return null
+                    const beforeAnchor = await copySelectionForOracle(previous)
+                    if (beforeAnchor === null || !await seekLinewisePoint(end, true)) return null
+                    const selected = await copySelectionForOracle(previous)
+                    return selected === null ? null : { selected, c: toGraphemes(beforeCursor).length, a: toGraphemes(beforeAnchor).length }
+                })
+                if (!offsets) return
+                text = offsets.selected; cursorOffset = offsets.c; anchorOffset = offsets.a
+            }
+            await waitForEditorPaint()
+            if (!linewiseStillValid(state)) return
+            state.externalRange = { text, cursorOffset, anchorOffset, cursor }
+            ready = true
+        }, 500)
+    } catch (err) {
+        if (!oracleAbort?.signal.aborted) showSearchLine("Could not prepare the line selection; try again")
+    } finally {
+        activeProbeRestore = null
+        if (!ready && linewiseState === state && !oracleAbort?.signal.aborted) {
+            sendKeyEvent("left")
+            if (cursor) await seekLinewisePoint(cursor)
+        }
+        releaseOracle()
+    }
+    return ready
+}
+
+async function restoreLinewiseExternalSelection() {
+    const state = linewiseState, saved = state?.externalRange
+    if (!saved || !beginOracle()) return false
+    let restored = false
+    try {
+        await withViewportPreserved(async () => {
+            const text = await withClipboardSaved((previous) => copySelectionForOracle(previous))
+            if (oracleAbort?.signal.aborted || state !== linewiseState) return
+            if (text !== saved.text) {
+                // A native edit or click replaced the range. Never reconstruct
+                // an old selection over new text.
+                clearLinewiseSelection(); mode = "normal"; updateModeIndicator(mode)
+                return
+            }
+            sendKeyEvent("left")
+            repeatMotion(() => sendKeyEvent("right"), saved.anchorOffset)
+            await waitForEditorPaint()
+            state.point = cursorDocumentPoint()
+            state.height = getCursorTop()?.getBoundingClientRect().height || state.height
+            const delta = saved.cursorOffset - saved.anchorOffset
+            repeatMotion(() => sendKeyEvent(delta < 0 ? "left" : "right"), Math.abs(delta))
+            await waitForEditorPaint()
+            state.externalRange = null
+            state.anchorIndex = undefined
+            state.bands = new Map(); state.textBounds = null
+            state.revision = documentRevision
+            restored = true
+        }, 500)
+    } finally { releaseOracle() }
+    return restored
 }
 
 async function linewiseOperator(op) {

@@ -60,9 +60,9 @@ async function fresh(text, off) { const e = makeEnv(text); e.sim.setCaret(off); 
   console.log("     v w on last word (native fallback): sel", JSON.stringify(e.selectedText()), "model", e.get("visualModel"))
   await e.press("h"); eq("h after fallback still visual", e.get("mode"), "visual")
 
-  // V mode: no reads
-  e = await fresh(T, 9 + 3); await e.press("V"); const c0 = e.sim.copyCalls; await e.pressAll("wbeh"); await e.sleep(300)
-  eq("V mode performs no oracle reads", e.sim.copyCalls, c0)
+  // Entering V and native row/character motions require no document read.
+  e = await fresh(T, 9 + 3); const c0 = e.sim.copyCalls; await e.press("V"); await e.pressAll("jkh"); await e.sleep(300)
+  eq("V entry and native rows perform no oracle reads", e.sim.copyCalls, c0)
   // clipboard restored after v
   e = await fresh(T, 9 + 3); e.sim.clipboard = "MINE"; await e.press("v"); await e.sleep(50); eq("clipboard restored after v", e.sim.clipboard, "MINE")
 

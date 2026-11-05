@@ -682,17 +682,64 @@ function visualNativeMotion(forward, nativeFn) {
 }
 
 let nativeVisualGoalX = null
+async function waitForCaretPaint(before, vertical = false) {
+    for (let n = 0; n < 12; n++) {
+        if (oracleAbort?.signal.aborted) return
+        const after = cursorDocumentPoint()
+        if (after && before && (vertical ? Math.abs(after.y - before.y) > 1 : comparePoints(after, before) !== 0)) return
+        if (typeof requestAnimationFrame !== "function") return
+        await waitForEditorPaint()
+    }
+}
+
+async function alignVisualColumn(goalX) {
+    const scroller = getDocsScrollContainer()
+    const run = renderedRunAtCaret()
+    if (run?.advances) {
+        const x = goalX - (scroller?.scrollLeft || 0) - run.left
+        let target = 0
+        for (let i = 1; i < run.text.length; i++) {
+            if (Math.abs(run.advances[i] - x) < Math.abs(run.advances[target] - x)) target = i
+        }
+        const delta = target - run.at, before = cursorDocumentPoint()
+        repeatMotion(() => sendKeyEvent(delta > 0 ? "right" : "left", { shift: true }), Math.abs(delta))
+        if (delta) await waitForCaretPaint(before)
+        return
+    }
+    // Without annotations, inspect only painted positions. A synchronous
+    // correction loop races Docs' caret paint and can undo a real row move.
+    for (let n = 0; n < 128; n++) {
+        const before = cursorDocumentPoint()
+        if (!before || Math.abs(before.x - goalX) <= 1) return
+        const right = before.x < goalX
+        sendKeyEvent(right ? "right" : "left", { shift: true })
+        await waitForCaretPaint(before)
+        const after = cursorDocumentPoint()
+        if (!after || comparePoints(before, after) === 0) return
+        if (Math.abs(after.y - before.y) > 1 || Math.abs(after.x - goalX) >= Math.abs(before.x - goalX)) {
+            sendKeyEvent(right ? "left" : "right", { shift: true })
+            await waitForCaretPaint(after)
+            return
+        }
+    }
+}
+
 async function visualNativeVertical(down, count = 1) {
     if (!beginOracle()) return
     try {
         await withStableSelection(async () => {
+            const beforePrepare = cursorDocumentPoint()
             prepareNativeVisualMotion(down)
-            await waitForEditorPaint()
+            await waitForCaretPaint(beforePrepare)
             if (oracleAbort && oracleAbort.signal.aborted) return
             const point = cursorDocumentPoint()
             if (nativeVisualGoalX === null && point) nativeVisualGoalX = point.x
-            repeatMotion(() => nativeVerticalStep(down, true, nativeVisualGoalX), count)
-            await waitForEditorPaint()
+            for (let n = 0; n < count && !oracleAbort?.signal.aborted; n++) {
+                const before = cursorDocumentPoint()
+                sendKeyEvent(down ? "down" : "up", { shift: true })
+                await waitForCaretPaint(before, true)
+                await alignVisualColumn(nativeVisualGoalX)
+            }
             if (oracleAbort && oracleAbort.signal.aborted) return
             const run = renderedRunAtCaret()
             if (run && run.text.length && run.at === run.text.length) {
@@ -2545,6 +2592,7 @@ function handleKey(e) {
 
     if (e.key == 'Escape') {
         e.preventDefault()
+        pendingSelectionCheck = null
         hideSearchLine()
         const resume = visualModeToResumeOnEscape()
         if (resume) {
