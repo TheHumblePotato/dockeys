@@ -42,6 +42,7 @@ const editor = document.querySelector('.kix-appview-editor');
 const caret = document.querySelector('.kix-cursor-caret');
 const highlight = document.querySelector('.kix-selection-overlay');
 const nativeScrollTop = Object.getOwnPropertyDescriptor(Element.prototype,'scrollTop').set;
+const nativeScrollLeft = Object.getOwnPropertyDescriptor(Element.prototype,'scrollLeft').set;
 const measure = document.createElement('canvas').getContext('2d'); measure.font='20px Arial';
 const svg = document.querySelector('svg');
 for (const [row,text] of sim.text.split('\n').entries()) {
@@ -69,9 +70,21 @@ input.body.addEventListener('keydown',event=>{
   editor.scrollTop=900; editor.scrollTo(0,950); editor.scroll({top:999}); caret.scrollIntoView();
   setTimeout(()=>{editor.scrollTop=900;editor.scrollTo(0,950);caret.scrollIntoView();window.scrollTo(0,950)},180);
  }
+ if(window.fixtureEditAttack&&editViewport){
+  editor.scrollTop=0;editor.scrollLeft=0;caret.scrollIntoView();
+  requestAnimationFrame(()=>{editor.scrollTop=0;editor.scrollLeft=0});
+  setTimeout(()=>{editor.scrollTop=0;editor.scrollLeft=0;window.scrollTo(0,0)},100);
+ }
 });
 for(const item of document.querySelectorAll('.goog-menuitem')) item.addEventListener('click',()=>sim.menu(item.textContent));
 document.querySelector('#fixture-format').addEventListener('click',()=>fixtureToolbarRanges.push(sim.selText()));
+document.querySelectorAll('.goog-menuitem').forEach(item=>item.addEventListener('click',()=>{
+ if(item.textContent==='Copy'&&window.fixtureEditAttack){editor.scrollTop=0;editor.scrollLeft=0}
+ if(item.textContent==='Undo'&&window.fixtureUndo)setTimeout(()=>{
+  sim.anchor=1;sim.focus=4;updateFixture();
+  input.body.dispatchEvent(new input.defaultView.InputEvent('beforeinput',{inputType:'historyUndo',bubbles:true}));
+ },70);
+}));
 editor.addEventListener('contextmenu',event=>{event.preventDefault();fixtureContextRanges.push(sim.selText())});
 Object.defineProperty(navigator,'clipboard',{configurable:true,value:{readText:async()=>sim.clipboard,writeText:async text=>{sim.clipboard=text}}});
 window.chrome={runtime:{getURL:()=> 'data:text/javascript,void%200',lastError:null},storage:{local:{get(key,cb){cb({[key]:{dvorak:false,readStrategy:'auto'}})},set(value,cb){if(cb)cb()}},onChanged:{addListener(){}}}};
@@ -185,6 +198,20 @@ ${source}
   await delay(20);tile.remove();await delay(20);
   assert(visualModel===modelBeforeRedraw&&sim.copyCalls===copiesBeforeRedraw,'tile/selection redraw invalidated Visual state');
   handleKey({key:'Escape',preventDefault(){},stopImmediatePropagation(){}});
+  for(const keys of ['dw','cw','D','C','2D','vld','vlc','Vd','Vc']){
+   sim.text='Wi mi\niiii WWW';sim.setCaret(0);updateFixture();invalidateExternalText();switchModeToNormal();
+   document.querySelector('#paper').style.width='800px';
+   nativeScrollTop.call(editor,300);nativeScrollLeft.call(editor,50);window.fixtureEditAttack=true;
+   for(const key of keys){handleKey({key,preventDefault(){},stopImmediatePropagation(){}});await settle()}
+   await delay(150);
+   assert(editor.scrollTop===300&&editor.scrollLeft===50,keys+' escaped edit viewport protection');
+   assert(sim.text!=='Wi mi\niiii WWW',keys+' did not edit');
+   window.fixtureEditAttack=false;cancelEditViewport();
+  }
+  sim.text='Wi mi\niiii WWW';sim.setCaret(0);updateFixture();invalidateExternalText();switchModeToNormal();
+  window.fixtureUndo=true;handleKeyEventNormal('u');await settle();window.fixtureUndo=false;
+  assert(mode==='normal'&&!sim.hasSel()&&sim.focus===1,'u left a native range labeled Normal');
+  nativeScrollTop.call(editor,0);nativeScrollLeft.call(editor,0);
   settings.readStrategy='clipboard';reset();
   const readClipboard=navigator.clipboard.readText;
   navigator.clipboard.readText=()=>new Promise(()=>{});

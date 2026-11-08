@@ -319,12 +319,12 @@ function noteSelectionGlitch() {
     // itself); the next idle pass will look.
     if (pendingSelectionCheck === null) pendingSelectionCheck = "glitch"
 }
-function handleUnexpectedSelection(reason) {
+function handleUnexpectedSelection(reason, forward = true) {
     if (reason === "user") {
         visualModel = null
         visualAnchorPoint = null
-        nativeVisualFocusAfter = true
-        nativeVisualAnchorAfter = false
+        nativeVisualFocusAfter = forward
+        nativeVisualAnchorAfter = !forward
         mode = "visual"
         updateModeIndicator(mode)
     } else {
@@ -354,7 +354,7 @@ async function runSelectionCheck() {
 }
 
 function overlayFrame() {
-    try { renderOverlay() } catch (err) {}
+    try { reconcileLateHistorySelection(); renderOverlay() } catch (err) {}
 }
 function startOverlayFrameLoop() {
     if (typeof requestAnimationFrame !== "function") return
@@ -444,6 +444,7 @@ function paragraphMods(shift = false) {
 }
 
 function sendKeyEvent(key, mods = {}) {
+    if (key === "backspace" || key === "delete") preserveEditViewport()
     if (!viewportRead) {
         viewportEpoch++
         cancelReadScrollSettlement()
@@ -455,6 +456,7 @@ function sendKeyEvent(key, mods = {}) {
     const defaultMods = { shift: false, control: false, alt: false, meta: false }
     window.dispatchEvent(new CustomEvent("doc-keys-simulate-keypress", { detail: { keyCode, mods: { ...defaultMods, ...mods } } }));
     restoreReadViewport()
+    restoreEditViewport()
 }
 
 const modeIndicator = document.createElement('div')
@@ -925,6 +927,7 @@ function vlGoto(end) { gotoTextLine(end ? null : 1, null, "visualLine") }
 // line and `vh`. Exact charwise visual mode never produces an empty selection,
 // so it stays synchronous.
 function visualOperator(op) {
+    if (op === "d" || op === "c") preserveEditViewport()
     if (visualModel && visualModel.dA === visualModel.dF) {
         pendingRegister = null
         pendingRegisterAppend = false
@@ -1036,8 +1039,96 @@ let oracleDeadline = null
 let activeProbeRestore = null
 let oracleCleanupPending = Promise.resolve()
 let probeCleanupRevision = 0
+let historyRecovery = null
+let historyFollowUp = null
+
+function nativeSelectionEvidence() {
+    const nodes = Array.from(document.querySelectorAll(".kix-selection-overlay"))
+    const rects = []
+    for (const node of nodes) {
+        if (node.style.display === "none" || window.getComputedStyle?.(node).display === "none") continue
+        const rect = node.getBoundingClientRect()
+        if (rect.width > 0 && rect.height > 0) rects.push([rect.left, rect.top, rect.width, rect.height])
+    }
+    const first = rects.reduce((a, b) => !a || b[1] < a[1] || (b[1] === a[1] && b[0] < a[0]) ? b : a, null)
+    return { available: nodes.length > 0, selected: rects.length > 0, signature: JSON.stringify(rects), first }
+}
+
+function adoptHistorySelection() {
+    const first = nativeSelectionEvidence().first, caret = getCursorTop()?.getBoundingClientRect()
+    const backward = first && caret && Math.abs(caret.left - first[0]) <= 2 &&
+        caret.top + caret.height / 2 >= first[1] && caret.top + caret.height / 2 <= first[1] + first[3]
+    handleUnexpectedSelection("user", !backward)
+}
+
+function reconcileLateHistorySelection() {
+    if (!historyFollowUp || oracleBusy || mode !== "normal" || Date.now() > historyFollowUp.until) return
+    const evidence = nativeSelectionEvidence()
+    if (!evidence.selected) { historyFollowUp.cleared = true; return }
+    if (!historyFollowUp.cleared && evidence.signature === historyFollowUp.signature) {
+        return
+    }
+    if (evidence.selected) {
+        historyFollowUp = null
+        adoptHistorySelection()
+    }
+}
+
+async function recoverHistorySelection(action = null) {
+    if (!beginOracle()) return
+    const generation = oracleGeneration, signal = oracleAbort.signal
+    finishReadForNativeAction()
+    const token = historyRecovery = { inputAt: null, initial: nativeSelectionEvidence(), started: Date.now() }
+    historyFollowUp = null
+    pendingFindType = null; pendingFindOperator = null; pendingRegister = null; pendingRegisterAppend = false
+    multipleMotion.times = 0; operatorCount = 0; gPrefixState = null
+    searchState = null; hideSearchLine(); longStringOp = ""
+    switchModeToNormal() // Keep the native range intact until Docs consumes Undo.
+    try {
+        action?.()
+        await waitForEditorPaint()
+        while (!signal.aborted && Date.now() - token.started < 160) {
+            const evidence = nativeSelectionEvidence()
+            if ((token.inputAt !== null && Date.now() - token.inputAt >= 64) ||
+                (evidence.selected && evidence.signature !== token.initial.signature)) break
+            await new Promise((resolve) => setTimeout(resolve, 16))
+        }
+        if (token.inputAt !== null) { await waitForEditorPaint(); await waitForEditorPaint() }
+        if (signal.aborted || historyRecovery !== token) return
+        const evidence = nativeSelectionEvidence()
+        if (evidence.selected) {
+            preserveEditViewport()
+            const selected = await withViewportPreserved(() => withClipboardSaved((previous) => copySelectionForOracle(previous, 120)), 500)
+            if (signal.aborted || historyRecovery !== token) return
+            if (selected && nativeSelectionEvidence().selected) {
+                sendKeyEvent("left")
+            }
+            // Do not mistake stale painted rectangles for a new range, or
+            // move on an empty/failed Copy. If Docs still has a range after
+            // paint settles, keep it and label it Visual rather than guessing.
+            for (let n = 0; n < 6 && nativeSelectionEvidence().selected && !signal.aborted; n++) await waitForEditorPaint()
+            if (signal.aborted || historyRecovery !== token) return
+            if (nativeSelectionEvidence().selected) adoptHistorySelection()
+        }
+        // Very late native history paint must not leave a selected range
+        // mislabeled Normal. This fallback only observes markup; it never reads.
+        const final = nativeSelectionEvidence()
+        historyFollowUp = { until: Date.now() + 1500, cleared: !final.selected, signature: final.signature }
+    } catch (err) {
+        if (!signal.aborted && historyRecovery === token) {
+            if (nativeSelectionEvidence().selected) adoptHistorySelection()
+            showSearchResult("Could not finish undo/redo selection cleanup")
+        }
+    } finally {
+        if (historyRecovery === token) historyRecovery = null
+        if (oracleGeneration === generation) releaseOracle()
+    }
+}
 
 function abortDocumentRead(restoreProbe = true) {
+    cancelEditViewport()
+    historyFollowUp = null
+    historyRecovery = null
     probeCleanupRevision++
     if (activeProbeRestore) {
         const restore = activeProbeRestore
@@ -1275,6 +1366,7 @@ function runClipboardCommand(fn) {
 }
 
 async function deleteOrChangeSelection(reg, append, isChange, linewise) {
+    preserveEditViewport()
     await clipboardRestorePending
     const target = isSystemRegister(reg) || reg === BLACKHOLE_REGISTER ? null : (reg || CUT_REGISTER)
     if (target) {
@@ -2062,6 +2154,7 @@ function addLineBottom() {
 }
 
 function runLongStringOp(operation = longStringOp, linewise = false) {
+    if (operation === "d" || operation === "c") preserveEditViewport()
     const reg = pendingRegister
     const append = pendingRegisterAppend
     pendingRegister = null
@@ -2162,6 +2255,7 @@ function waitForFirstInput(key) {
     operatorCount = 0
     operatorPrefixCount = 1
     const op = longStringOp 
+    if (op === "d" || op === "c") preserveEditViewport()
 
     switch (key) {
         case "/":
@@ -2490,9 +2584,10 @@ async function runLinewiseNativeShortcut(args) {
 }
 
 function handleModifiedKey(e) {
-    if (mode === "insert") return
+    if (mode === "insert") { cancelEditViewport(); return }
     const k = e.key || ""
     if (!oracleBusy) {
+        finishReadForNativeAction()
         const primary = isMac ? e.metaKey : e.ctrlKey
         const edit = primary && !e.altKey && ["x", "v", "z", "y"].includes(k.toLowerCase())
         if (HELD_NAMED_KEYS.includes(k) || edit) invalidateExternalText()
@@ -2546,6 +2641,11 @@ function reconcileVisualSelection() {
 }
 
 function handleNativeInput(event) {
+    if (mode === "insert" && /^insert/.test(event.inputType || "")) cancelEditViewport()
+    if (/^history/.test(event.inputType || "")) {
+        if (historyRecovery) historyRecovery.inputAt = Date.now()
+        else if (mode !== "insert" && !oracleBusy) recoverHistorySelection()
+    }
     invalidateExternalText()
     if (/^(insert|delete|history)/.test(event.inputType || "") && (mode === "visual" || mode === "visualLine")) {
         // Context-menu edits and IME can bypass our key handler. Let Docs
@@ -2557,6 +2657,10 @@ function handleNativeInput(event) {
 
 function eventHandler(e) {
     if (e.isTrusted === false || e.isComposing || e.keyCode === 229) return
+    if (!oracleBusy && historyFollowUp) {
+        reconcileLateHistorySelection()
+        if (!["Shift", "Meta", "Control", "Alt", ""].includes(e.key)) historyFollowUp = null
+    }
     reconcileVisualSelection()
     if (oracleBusy && (e.key === "Escape" || (e.ctrlKey && e.key === "["))) {
         e.preventDefault()
@@ -2604,6 +2708,11 @@ function eventHandler(e) {
     const key = translateKey(e.key)
 
     const primary = isMac ? e.metaKey : e.ctrlKey
+    if (primary && !e.altKey && e.key.toLowerCase() === "z" && mode !== "insert") {
+        if (oracleBusy) handleModifiedKey(e)
+        else recoverHistorySelection() // Preserve the original trusted key.
+        return
+    }
     // Formatting shortcuts use Docs' OS-layout key, never the DVP mapping.
     // Copy/Cut/Paste retain the explicit linewise operator paths below.
     if (mode === "visualLine" && linewiseState && primary && e.key.length === 1 &&
@@ -2672,6 +2781,7 @@ function eventHandler(e) {
                 altKey: e.altKey, shiftKey: e.shiftKey, metaKey: e.metaKey, keyCode: e.keyCode } })
             return
         }
+        cancelEditViewport()
         switch (key) {
             case 'd': halfScreenScroll(true); break
             case 'u': halfScreenScroll(false); break
@@ -2718,6 +2828,15 @@ function eventHandler(e) {
 // key has already been preventDefault()ed, so it can't fall through to Docs
 // as native typing.
 function handleKey(e) {
+    reconcileLateHistorySelection()
+    historyFollowUp = null
+    const editKey = translateKey(e.key)
+    const editing = (mode === "normal" && ["d", "c", "D", "C", "x", "s"].includes(editKey)) ||
+        (mode === "visual" && ["d", "c", "x", "s"].includes(editKey)) ||
+        (["waitForFirstInput", "waitForSecondInput", "waitForFindChar", "gPrefix"].includes(mode) &&
+            [longStringOp, pendingFindOperator, gPrefixState?.operator].some((op) => op === "d" || op === "c"))
+    if (editing) preserveEditViewport()
+    else if (!oracleBusy) cancelEditViewport()
     if (!oracleBusy && linewiseState?.externalRange) {
         restoreLinewiseExternalSelection()
         queueKey({ key: e.key })
@@ -2829,6 +2948,7 @@ function handleKey(e) {
 }
 
 function handleKeyEventNormal(key) {
+    if (["D", "C", "x", "s", "."].includes(key)) preserveEditViewport()
     if (/^[1-9]$/.test(key)) {
         mode = "multipleMotion"
         multipleMotion.mode = "normal"
@@ -3218,6 +3338,14 @@ let menuItems = {
 }
 
 function clickMenu(itemCaption) {
+    if (itemCaption === menuItems.undo || itemCaption === menuItems.redo) {
+        if (oracleBusy) { queueKey({ menu: itemCaption === menuItems.undo ? "undo" : "redo" }); return }
+        return recoverHistorySelection(() => clickMenuNow(itemCaption))
+    }
+    return clickMenuNow(itemCaption)
+}
+
+function clickMenuNow(itemCaption) {
     if ([menuItems.cut, menuItems.paste, menuItems.undo, menuItems.redo].includes(itemCaption)) documentRevision++
     if (itemCaption !== menuItems.copy) invalidateTextSnapshot()
     simulateClick(getMenuItem(itemCaption));
@@ -3363,8 +3491,15 @@ let preserveMouseClick = null
 let linewiseContextPreparation = null
 let linewiseToolbarGesture = null
 function editorMouseDown(e) {
-    if (!e.isTrusted || !e.target.closest(".kix-appview-editor")) return
+    if (!e.isTrusted) return
+    if (!e.target.closest(".kix-appview-editor")) {
+        historyFollowUp = null
+        cancelEditViewport()
+        return
+    }
+    historyFollowUp = null
     if (e.button !== undefined && e.button !== 0) {
+        if (oracleBusy && mode === "normal") abortDocumentRead(false)
         if (mode === "visual" || mode === "visualLine") {
             // Docs' right-button mousedown otherwise collapses its selection
             // before opening the context menu. Keep the menu event itself.
@@ -3374,6 +3509,7 @@ function editorMouseDown(e) {
         return
     }
     if (oracleBusy) abortDocumentRead(false)
+    cancelEditViewport()
     if ((mode === "visual" || mode === "visualLine") && !e.shiftKey && e.detail < 2) {
         const overlay = cursorBoxOverlay?.getBoundingClientRect?.()
         if (overlay && e.clientX >= overlay.left - 1 && e.clientX <= overlay.right + 1 &&

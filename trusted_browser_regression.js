@@ -79,6 +79,10 @@ async function main() {
             });
             input.body.addEventListener('keydown',event=>{
                 if(!event.isTrusted)return;
+                if(event.ctrlKey&&event.key.toLowerCase()==='z')setTimeout(()=>{
+                    sim.anchor=1;sim.focus=4;updateFixture();
+                    input.body.dispatchEvent(new input.defaultView.InputEvent('beforeinput',{inputType:'historyUndo',bubbles:true}));
+                },80);
                 if(event.ctrlKey&&event.key.toLowerCase()==='b')applyFixtureFormat('bold-key');
                 if(event.ctrlKey&&event.altKey&&event.key.toLowerCase()==='m'){
                     applyFixtureFormat('comment');
@@ -183,7 +187,19 @@ async function main() {
         await evaluate("renderOverlay()")
         assert.equal(await evaluate("parseFloat(linewiseHighlight.style.left)"), before - 32,
             "resuming Visual line after comments left the custom highlight shifted")
-        console.log("PASS trusted Chromium input: full-range pointer Bold/font size, early right-click protection, native comments and layout rebasing")
+        await evaluate("clearLinewiseSelection();switchModeToNormal();sim.setCaret(4);updateFixture();input.body.focus()")
+        await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: "z", code: "KeyZ", windowsVirtualKeyCode: 90, modifiers: 2 })
+        await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: "z", code: "KeyZ", windowsVirtualKeyCode: 90, modifiers: 0 })
+        await settle()
+        assert.equal(await evaluate("mode"), "normal")
+        assert.equal(await evaluate("sim.hasSel()"), false, "native Ctrl+Z left a restored selection in Normal mode")
+        assert.equal(await evaluate("sim.focus"), 1)
+        const scrollBefore = await evaluate("editor.scrollTop"), copiesBefore = await evaluate("sim.copyCalls")
+        await cdp("Input.dispatchMouseEvent", { type: "mouseWheel", x: 200, y: 100, deltaX: 0, deltaY: 80 })
+        await evaluate("new Promise(resolve=>setTimeout(resolve,180))")
+        assert.ok(await evaluate("editor.scrollTop") > scrollBefore, "edit/history settlement blocked the user's wheel")
+        assert.equal(await evaluate("sim.copyCalls"), copiesBefore, "free scrolling initiated an idle selection read")
+        console.log("PASS trusted Chromium input: formatting/context/comments, layout rebasing, and delayed native Ctrl+Z selection cleanup")
     } finally {
         socket?.close()
         browser.kill()

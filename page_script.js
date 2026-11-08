@@ -109,11 +109,15 @@ window.addEventListener("doc-keys-native-shortcut", (event) => {
 ;(() => {
     if (typeof Element !== "function" || typeof HTMLElement !== "function") return
     let blockedUntil = 0
+    let editBlockedUntil = 0
     let readCallbackDepth = 0
     window.addEventListener("doc-keys-read-phase", (event) => {
         blockedUntil = event.detail && event.detail.active ? Date.now() + 4000 : 0
     })
-    const active = () => Date.now() < blockedUntil || readCallbackDepth > 0
+    window.addEventListener("doc-keys-edit-phase", (event) => {
+        editBlockedUntil = event.detail?.active ? Date.now() + 9000 : 0
+    })
+    const active = () => Date.now() < blockedUntil || Date.now() < editBlockedUntil || readCallbackDepth > 0
     // A Docs callback scheduled by a probe may reveal its old selection long
     // after the read finished. Keep that callback's scroll/focus suppressed;
     // unrelated later input uses the original viewport methods normally.
@@ -121,7 +125,7 @@ window.addEventListener("doc-keys-native-shortcut", (event) => {
         const original = window[name]
         if (typeof original !== "function") continue
         window[name] = function(callback, ...args) {
-            if (typeof callback !== "function" || Date.now() >= blockedUntil) return original.call(this, callback, ...args)
+            if (typeof callback !== "function" || (Date.now() >= blockedUntil && Date.now() >= editBlockedUntil)) return original.call(this, callback, ...args)
             return original.call(this, function(...values) {
                 readCallbackDepth++
                 try { return callback.apply(this, values) }

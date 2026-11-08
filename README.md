@@ -29,7 +29,7 @@ Settings are saved locally and apply to open documents automatically:
 
 DVP remains enabled by default for compatibility with this fork. Settings no longer require editing source constants. Both word modes share one motion engine. Fast no longer delegates to native Docs word jumps. Destructive word/search operators refresh their snapshot before selecting text.
 
-After updating to 1.12, reload the extension and fully refresh Docs tabs. The pointer guard and rendered annotation request run during document startup; reloading only the extension leaves an old page bridge running. The annotation request is undocumented and may be unavailable in some Docs versions; Auto retains a clipboard fallback. Rendered only can cross adjacent annotated paragraphs when their boundaries are explicit, but still declines unknown/offscreen boundaries, global search, and operators requiring a full snapshot. Native linewise cursor movement remains available without a text read. Explicit yank/paste/register commands can still use the clipboard in that setting.
+After updating to 1.12.1, reload the extension and fully refresh Docs tabs. The pointer and edit-scroll guards run during document startup; reloading only the extension leaves an old page bridge running. The annotation request is undocumented and may be unavailable in some Docs versions; Auto retains a clipboard fallback. Rendered only can cross adjacent annotated paragraphs when their boundaries are explicit, but still declines unknown/offscreen boundaries, global search, and operators requiring a full snapshot. Native linewise cursor movement remains available without a text read. Explicit yank/paste/register commands can still use the clipboard in that setting.
 
 ## Commands
 
@@ -56,7 +56,7 @@ After updating to 1.12, reload the extension and fully refresh Docs tabs. The po
 | Yank to line end | `Y` (`y$`, following Neovim's default); use `yy` for a whole line |
 | Delete / substitute characters | `x`, `s`, with counts |
 | Replace / toggle case | `r{char}`, `~`, counted `~` |
-| Undo / redo | `u`, `Ctrl+r` |
+| Undo / redo | `u` or native `Ctrl+z`; `Ctrl+r` or native `Ctrl+Shift+z` (Cmd on Mac) |
 | Paste / join / repeat change | `p`, `J`, `.` |
 | Literal search | `/{text}` + Enter, `?{text}` + Enter |
 | Repeat / word search | `n`, `N`, `*`, `#`; counts work |
@@ -122,6 +122,8 @@ If storage disappears or rejects a write, registers remain usable in this tab an
 
 Clipboard requests have finite deadlines. Escape/Ctrl+[ cancel an active read ahead of queued keys, clear stale commands/masks, and return to normal mode. Cleanup and clipboard restoration have bounded waits; a stalled promise cannot permanently lock the input queue. Queue overflow and the command watchdog cancel the stalled command instead of leaving input trapped.
 
+Undo/redo watches for the native range Docs may restore asynchronously. A visible restored range is verified through a clipboard-preserving read and collapsed before returning to Normal. Empty Undo results do not trigger Copy or an extra cursor movement. If Copy is denied/unresponsive or the range appears very late, DocsKeys retains the observed range and enters charwise Visual instead of displaying a false Normal badge. Backward restored ranges retain their direction. The late fallback only observes selection markup; it performs no idle clipboard reads. Native undo while Insert is active retains Docs' Insert behavior.
+
 ## Performance and scrolling
 
 The cursor overlay uses caret geometry and annotated glyph widths when available, including proportional fonts and zoom. Otherwise it measures the character known from an existing motion/search snapshot, with an estimated width when no character is known. Native vertical movement may only provide an approximate glyph hint without annotations. Cursor cosmetics never select text or read the clipboard. Mouse-wheel scrolling and `Ctrl+e/y` can move the cursor offscreen without an idle measurement pulling it back into view. The box hides offscreen and follows the caret back into view. Only the local caret is overlaid; collaborator carets retain Docs' appearance.
@@ -129,6 +131,8 @@ The cursor overlay uses caret geometry and annotated glyph widths when available
 Both modes read text on demand and reuse it during motion bursts. Local word/find motions use annotated SVG text without Copy when available. Rendered runs with unexplained gaps, generated list markers, or ambiguous wrapped joins decline the combined context instead of inventing native character steps. Normal word motions wait for the painted caret and rebind to its actual rendered context, preventing a stale cross-line offset from making the next `w` move one character. Fallback word reads start with a two-display-line window on each needed side, expanding only at unknown boundaries. Large counts, global searches, and operators may still require a full snapshot. Visual motions do not read again while their model remains valid.
 
 There are no idle clipboard/selection probes. Explicit probes hide Docs' temporary blue selection layer, suppress editor focus/programmatic scroll calls in the page world, and preserve the viewport throughout the read and late layout frames. The guard covers editor ancestors/window scrolling and scroll/focus calls inside page timers/animation callbacks scheduled during a read, including callbacks that outlive its immediate lease. A wheel gesture takes precedence over an older motion completing asynchronously. Caches are invalidated on edits, clicks, native navigation, and observable document/collaborator changes. Canvas-only remote changes may only become visible on expiry; neither mode promises a synchronized Docs buffer. Ordinary navigation can still scroll to reveal its destination, as in Vim.
+
+Delete/change uses a separate viewport lease covering range construction, register capture/Copy, Backspace, and delayed layout. It preserves both axes of the editor and scrollable ancestors, restores browser anchoring before paint, and guards page callbacks scheduled by the edit. This covers normal/Visual operators, text objects, counts, and dot repeat. A newer wheel/touch gesture, navigation command, mouse action, inserted text, or native formatting action takes ownership and releases the lease. If deleting content shrinks the scrollable document below the saved position, the browser must clamp it to the new end.
 
 See [READING_RESEARCH.md](READING_RESEARCH.md) for sources, alternatives, and the limits of annotated-canvas support.
 

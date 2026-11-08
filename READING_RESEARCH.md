@@ -37,6 +37,12 @@ Auto combines these paths. Rendered only disables automatic clipboard document p
 
 ## Verification and remaining uncertainty
 
+### Changes in 1.12.1
+
+Viewport protection now has a separate edit lease covering selection construction, register Copy, deletion, scrollable ancestors, and browser anchoring. Read restoration honors an active edit viewport so an outer search/read transaction cannot undo its position. Edit-associated page timers/animation callbacks retain their scroll guard, while newer user input cancels content-world restoration. Native formatting/comment UI releases both leases.
+
+History recovery observes Docs' asynchronous restored selection, verifies positive selection evidence with a clipboard-preserving Copy, and collapses only a confirmed nonempty range. It waits for selection paint before deciding whether Normal is valid. Empty/unknown markup never causes an automatic Copy or a guessed Left. If verification fails or a range arrives much later, passive selection observation adopts Visual, including backward focus, without idle clipboard access. Simulator and trusted Chromium tests cover these paths; live Docs history timing and private selection markup still require verification.
+
 ### Changes in 1.12
 
 The earlier fixture tested click handlers but missed pointer handlers registered on `window` before a late content script. The document-start bridge now intercepts trusted right-button pointer/mouse events before Docs can move its canvas caret, and gates unprepared toolbar gestures. Replays include pointer events and control-centered coordinates. A CDP fixture supplies trusted input and checks actual per-character formatting effects rather than only logging event delivery.

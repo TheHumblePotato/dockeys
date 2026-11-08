@@ -7,6 +7,56 @@ let managedTextMotion = 0
 let viewportRead = null
 let viewportEpoch = 0
 let scrollIntentRevision = 0
+let editViewport = null
+let editViewportTimer = null
+
+// Editing has its own viewport lease: it must cover native selection, Copy,
+// Backspace, browser anchoring, and delayed Docs layout without hiding text.
+function cancelEditViewport() {
+    if (!editViewport && !editViewportTimer) return
+    editViewport = null
+    clearTimeout(editViewportTimer)
+    editViewportTimer = null
+    window.dispatchEvent(new CustomEvent("doc-keys-edit-phase", { detail: { active: false } }))
+}
+
+function restoreEditViewport() {
+    if (!editViewport) return
+    for (const saved of editViewport.positions) {
+        saved.el.scrollTop = saved.top
+        saved.el.scrollLeft = saved.left
+    }
+}
+
+function preserveEditViewport() {
+    if (editViewport) { editViewport.until = Date.now() + 500; return }
+    const el = getDocsScrollContainer()
+    if (!el) return
+    const nodes = new Set([el])
+    for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+        if (parent.scrollHeight > parent.clientHeight || parent.scrollWidth > parent.clientWidth) nodes.add(parent)
+    }
+    if (document.scrollingElement) nodes.add(document.scrollingElement)
+    const token = editViewport = { until: Date.now() + 500, deadline: Date.now() + 8500,
+        positions: Array.from(nodes, (node) => ({ el: node,
+            top: node === viewportRead?.el ? viewportRead.top : node.scrollTop || 0,
+            left: node === viewportRead?.el ? viewportRead.left : node.scrollLeft || 0 })) }
+    window.dispatchEvent(new CustomEvent("doc-keys-edit-phase", { detail: { active: true } }))
+    const tick = () => {
+        if (editViewport !== token) return
+        if (Date.now() >= token.deadline || (!oracleBusy && Date.now() >= token.until)) { cancelEditViewport(); return }
+        if (oracleBusy) token.until = Date.now() + 500
+        restoreEditViewport()
+        if (typeof requestAnimationFrame !== "function") editViewportTimer = setTimeout(tick, 16)
+        else {
+            let done = false
+            const next = () => { if (!done) { done = true; clearTimeout(timer); tick() } }
+            const timer = editViewportTimer = setTimeout(next, 32)
+            requestAnimationFrame(next)
+        }
+    }
+    tick()
+}
 
 function invalidateTextSnapshot() {
     textSnapshot = null
@@ -54,8 +104,9 @@ function trackDocumentChanges() {
 
 function restoreReadViewport(token = viewportRead) {
     if (!token || !token.el) return
-    token.el.scrollTop = token.top
-    token.el.scrollLeft = token.left
+    const edited = editViewport?.positions.find((saved) => saved.el === token.el)
+    token.el.scrollTop = edited?.top ?? token.top
+    token.el.scrollLeft = edited?.left ?? token.left
 }
 
 async function withViewportPreserved(fn, settleMs = 80) {
@@ -270,6 +321,7 @@ function moveSnapshotCaret(snapshot, target) {
 }
 
 async function applySnapshotRange(snapshot, range, operator) {
+    if (operator === "d" || operator === "c") preserveEditViewport()
     if (range.end <= range.start) {
         pendingRegister = null
         pendingRegisterAppend = false
@@ -401,6 +453,7 @@ async function visualLogicalVertical(down, count) {
 if (typeof document.addEventListener === "function") {
     document.addEventListener("wheel", (event) => {
         if (event.isTrusted === false || event.ctrlKey || event.metaKey) return
+        cancelEditViewport()
         if (!viewportRead) cancelReadScrollSettlement()
         scrollIntentRevision++
         viewportEpoch++
@@ -413,6 +466,7 @@ if (typeof document.addEventListener === "function") {
     }, { passive: true, capture: true })
     let touchY = null
     document.addEventListener("touchstart", (event) => {
+        cancelEditViewport()
         touchY = event.touches && event.touches[0] ? event.touches[0].clientY : null
         if (!viewportRead) { viewportEpoch++; cancelReadScrollSettlement() }
     }, { passive: true, capture: true })

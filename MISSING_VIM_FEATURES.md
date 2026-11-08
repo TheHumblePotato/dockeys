@@ -70,6 +70,13 @@ Live Google Docs testing is still required for paragraph/text extraction, format
 - Added read-free normal-mode `gI` to insert at column zero of the displayed row. Updated the popup reference for `gg`, configured linewise units, native formatting, and context menus.
 - Added a CDP-driven fixture with trusted pointer/key input, actual per-character formatting effects, early-window right-click handlers, role-less toolbar controls, font inputs, rapid Ctrl+B, and comment-layout transitions. This still does not substitute for live Docs verification.
 
+## Fixed in 1.12.1
+
+- Undo/redo selection recovery covers Vim `u`/Ctrl+r, native Ctrl+z/Ctrl+Shift+z, and native history beforeinput signals. Restored ranges are verified before collapse; empty results never move the cursor. Denied/unresponsive Copy and unusually late native ranges are labeled Visual, preserving direction, instead of leaving a false Normal badge. Insert-mode native history remains native.
+- Delete/change preserves viewport position through range construction, Copy/register capture, Backspace, and delayed layout, including both editor axes and scrollable ancestors. A separate page-world lease covers edit-associated focus/scroll callbacks; content-world restoration runs before paint with a timeout fallback for throttled frames.
+- New user navigation, wheel/touch, mouse actions, inserted text, and native formatting take priority over an older edit lease. History cleanup also avoids moving again when a Copy integration has already collapsed its selection.
+- Added adapter cases for normal/Visual d/c, counts, black-hole registers, dot repeat, ancestor shifts, delayed history selection, reverse ranges, clipboard denial, empty/unresponsive Copy, and late passive recovery. Chromium fixtures exercise delayed edit scrolling, trusted Ctrl+z, and wheel priority without idle Copy.
+
 ## Complete remaining backlog
 
 The sections below are the current list of unfinished features, known approximations, and integration work. Live verification is part of the backlog, not evidence that a behavior is already correct in Docs.

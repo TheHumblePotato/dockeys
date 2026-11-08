@@ -418,6 +418,7 @@ async function restoreLinewiseExternalSelection() {
 }
 
 async function linewiseOperator(op) {
+    if (op === "d" || op === "c") preserveEditViewport()
     if (!linewiseState || !beginOracle()) return
     const original = linewiseCursorRow()
     let realized = false

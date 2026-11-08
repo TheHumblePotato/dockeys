@@ -19,6 +19,7 @@ function cancelReadScrollSettlement() {
 // opening comments must not inherit a probe's horizontal scroll lock.
 function finishReadForNativeAction() {
     if (readPresentationDepth || viewportRead) return
+    cancelEditViewport()
     viewportEpoch++
     readPresentationGeneration++
     selectionBatchGeneration++
